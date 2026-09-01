@@ -1,0 +1,205 @@
+[package]
+name = "sp-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Shannon Prime L3 HTTP/SSE daemon — wraps the frozen L1 C ABI in a long-lived process (lat-phase-2-l3-core)"
+
+[[bin]]
+name = "sp-daemon"
+path = "src/main.rs"
+
+[lib]
+name = "sp_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sp-console"
+path = "src/bin/sp_console.rs"
+
+# Trick #8 finale — two-process decode-over-peer showpiece: --serve runs the
+# QUIC Ring-2 peer store; --decode drives the CANONICAL math-core two-ring
+# decode (qwen3_generate_kv via the linked L1 libs) with the fusion array on
+# and the peer registered as THE backend; compares vs in-process baseline.
+[[bin]]
+name = "sp_ring2_showpiece"
+path = "src/bin/sp_ring2_showpiece.rs"
+
+[[bin]]
+name = "spec_validate"
+path = "src/bin/spec_validate.rs"
+
+# §4-MeMo Sprint M.1 — dual-load budget audit + concurrent invoke smoke
+[[bin]]
+name = "sp_memo_m1_smoke"
+path = "src/bin/sp_memo_m1_smoke.rs"
+
+# §4-MeMo Sprint M.2 — zero-copy dialogue loop (Grounding -> Entity ID ->
+# Synthesis) + Spinor receipt envelope smoke
+[[bin]]
+name = "sp_memo_m2_dialogue_smoke"
+path = "src/bin/sp_memo_m2_dialogue_smoke.rs"
+
+# §4-MeMo Sprint M.5 — KSTE-routed sparse Memory activation smoke
+[[bin]]
+name = "sp_memo_m5_routing_smoke"
+path = "src/bin/sp_memo_m5_routing_smoke.rs"
+
+# §4-MeMo Sprint M.4 — pouw ledger smoke (append + read + replay-determinism
+# + cross-device replay simulation). Host-buildable; android binary runs on
+# Sam's S22U via adb push.
+[[bin]]
+name = "sp_memo_m4_ledger_smoke"
+path = "src/bin/sp_memo_m4_ledger_smoke.rs"
+
+# Chat-integration — MeMo dialogue endpoint smoke harness for POST /v1/dialogue
+[[bin]]
+name = "sp_chat_dialogue_smoke"
+path = "src/bin/sp_chat_dialogue_smoke.rs"
+
+# §4-mesh-canonical-order — u16 rank in _reserved[0..2] + Ledger
+# canonical_sort + replay_canonical_into; cross-device byte-identity
+# smoke harness. Three gates (T_MESH_RANK_PROTOCOL,
+# T_MESH_CANONICAL_SORT_DETERMINISTIC, T_MESH_CROSS_DEVICE_BYTE_IDENTITY).
+[[bin]]
+name = "sp_memo_m4_canonical_replay_smoke"
+path = "src/bin/sp_memo_m4_canonical_replay_smoke.rs"
+
+# Sprint ledger-autowire — /v1/dialogue + PoUW ledger autowire smoke harness
+[[bin]]
+name = "sp_chat_ledger_autowire_smoke"
+path = "src/bin/sp_chat_ledger_autowire_smoke.rs"
+
+# §4-NTT Sprint NTT.5c — forward.c activation smoke. Loads the Memory model,
+# creates a session with optional Hex compute backend, runs prefill with
+# SP_ENGINE_NTT_ATTN=1, validates SP_OK + dispatch-counter > 0 when
+# SP_ENGINE_NTT_ATTN_HEX=1 is also set. Android-only on Sam's S22U; host
+# stub prints "android-only".
+[[bin]]
+name = "sp_ntt_5c_forward_smoke"
+path = "src/bin/sp_ntt_5c_forward_smoke.rs"
+
+# §4-NTT Sprint NTT-bench — tokens/sec measurement on S22U. Per-cell harness
+# invoked 6 times (2 models × 3 configs) by ntt_bench_toks_run.ps1; emits
+# JSON line per cell with prefill_toks_per_sec + decode_toks_per_sec across
+# 3 reps. Host stub prints "android-only".
+[[bin]]
+name = "sp_ntt_bench_toks"
+path = "src/bin/sp_ntt_bench_toks.rs"
+
+# Sprint WIRE-CUDA-DECODE-GEMMA4 — the persistent-KV decode verb gate.
+# Drives a real dense Gemma-4 model token-by-token through sp_decode_step -> the L1
+# kvdecode verb -> the CUDA glue -> gemma4_kv_decode_logits, asserting the
+# stream is bit-identical to the null-floor gemma4_kv_decode oracle. Requires
+# the CUDA backend lib (gemma4_kv_*); gated behind wire_cuda_backend.
+[[bin]]
+name = "sp_wire_cuda_decode_gate"
+path = "src/bin/sp_wire_cuda_decode_gate.rs"
+required-features = ["wire_cuda_backend"]
+
+[dependencies]
+axum        = { version = "0.7", features = ["macros", "ws"] }
+tokio       = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures     = "0.3"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+tower-http  = { version = "0.5", features = ["trace", "fs", "cors"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap        = { version = "4", features = ["derive", "env"] }
+tokenizers      = "0.21"
+ahash           = "0.8"
+ed25519-dalek   = { version = "2", features = ["rand_core"] }
+rand            = "0.8"
+# §4-MeMo Sprint M.2 — SHA-256 for the per-turn Spinor receipt input/output
+# hashes. Already in the dependency graph transitively via ed25519-dalek;
+# direct registration here keeps `dialogue.rs` independent of that
+# transitive path (resilient to future ed25519-dalek refactors).
+sha2            = "0.10"
+hex             = "0.4"
+quinn   = { version = "0.11", features = ["rustls"] }
+rustls  = { version = "0.23", default-features = false, features = ["ring"] }
+rcgen   = { version = "0.13", default-features = false, features = ["ring"] }
+dashmap = "6"
+# SP-SWARM private memory mesh (L0-L3), optional — pulled in only by `--features swarm`.
+# Shares the quinn/rustls/ed25519 deps already above; default-off = zero effect on the build.
+sp-swarm = { path = "../sp_swarm", features = ["transport"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# §3-HX Sprint A: dynamic FastRPC bridge (libcdsprpc.so on the device).
+# Android-only — host x86 builds skip the dsp_rpc module via cfg.
+[target.'cfg(target_os = "android")'.dependencies]
+libloading = "0.8"
+
+[build-dependencies]
+bindgen = "0.70"
+# Issue #115: compile the engine's proven C gemma4 BPE tokenizer
+# (src/tokenizer/{tokenizer,gemma4_bpe}.c) and link it into the daemon so
+# tokenizer.rs can FFI sp_tokenizer_* instead of reimplementing the encoder.
+cc = "1"
+
+# ── Sprint WIRE-HEX / WIRE-CPU features ─────────────────────────────────────
+# `wire_hex_backend`: links libsp_hex_daemon_backend.a (built by
+#   tools/sp_daemon/build-android-hex-backend.bat) and compiles the
+#   `hex_forward_dispatch` module. Off by default — the daemon binary stays
+#   identical to pre-WIRE-HEX when this feature is unset. Turn ON via
+#   `cargo build --features wire_hex_backend` after running the bat. Android only.
+#
+# `wire_cpu_backend`: links libsp_cpu_daemon_backend.lib (built by
+#   tools/sp_daemon/build-host-cpu-backend.bat) and compiles the
+#   `cpu_forward_dispatch` module. Off by default. Turn ON via
+#   `cargo build --features wire_cpu_backend --release` after running the bat.
+#   HOST target — works on Windows MSVC, Linux GCC/Clang. Activates the
+#   engine's CPU AVX-512 backend forward (Phase 2-CPU.AVX) behind the
+#   SP_DAEMON_BACKEND=cpu runtime env gate.
+#
+# `wire_cuda_backend`: links libsp_cuda_daemon_backend.lib (built by
+#   tools/sp_daemon/build-host-cuda-backend.bat) and compiles the
+#   `cuda_forward_dispatch` module. Off by default -- the daemon binary
+#   stays identical to pre-WIRE-CUDA when this feature is unset. Turn ON
+#   via `cargo build --features wire_cuda_backend` after running the bat.
+#   Symmetric to wire_hex_backend (host x86_64 instead of android aarch64;
+#   CUDA::cudart/cublas instead of FastRPC).
+#
+# `wire_vulkan_backend` (Sprint WIRE-VULKAN, host-side): links
+#   libsp_vulkan_daemon_backend.{a,lib} (built by
+#   tools/sp_daemon/build-host-vulkan-backend.bat) and compiles the
+#   `vulkan_forward_dispatch` module. Off by default. Activates the
+#   gemma3_forward_vulkan / qwen3_forward_vulkan whole-forward dispatchers
+#   when SP_DAEMON_BACKEND=vulkan is set at daemon startup. Symmetric to
+#   wire_hex_backend (Hexagon V69 cDSP, android-only) but Vulkan is host
+#   GPU compute — Windows / Linux / macOS where vulkan-1.{dll,so} resolves.
+#
+# `kairos` (KAI-1, host-side): compiles the `kairos` control-plane module
+#   (papers/CONTRACT-KAIROS-K0-K1.md §2.5/§2a/§2b — the heartbeat-null
+#   scheduler over the resident daemon). Off by default — the daemon binary
+#   stays byte-identical to pre-KAI-1 when unset (the null-floor invariant,
+#   kernel edition). Pure host-safe Rust (no extra link deps); the §2b event
+#   tape + tokio heartbeat loop. With the feature built, the loop still only
+#   runs when SP_KERNEL=1 is set at startup. Test via
+#   `cargo test --features kairos kairos::`.
+[features]
+# `exact` (DEFAULT-ON): compiles + links the integer memory-ring math-core (ntt_crt / poly_ring /
+# ok_arith / frobenius) and the Rust NTT FFI (ntt_ffi / ntt_hex_dispatch). Drop it for the
+# standard-FP profile: `cargo build --no-default-features --features wire_cuda_backend`
+# (DESIGN-NO-EXACT-PROFILE §4b — host-side footprint + cl.exe-clean CPU build). The CUDA byte-exact
+# kernels are NOT gated here (no __int128, zero runtime cost when d_bx_flag=0).
+# `legacy_policy` (DEFAULT-ON, HINDSIGHT P1b): the routes.rs research/dead policy
+# lanes (SP_SPINE in-kernel recall, B3 judge/disposer/W_c/qdump/jaccard, INT2,
+# FM steering, F3 capture, COCONUT, telepathy-chat). ON = byte-identical
+# today-behavior. OFF = those lanes fold to compile-time-false (kernel verbs +
+# the PROVEN one-config stack: L5+attr-gate recall, B4 nightshift, spectest veto).
+# The lanes stay in staging as research; receipts in MIGRATION-MAP.md.
+default = ["exact", "legacy_policy"]
+exact = []
+legacy_policy = []
+wire_hex_backend = []
+wire_cpu_backend = []
+wire_cuda_backend = []
+wire_vulkan_backend = []
+kairos = []
+# SP-SWARM mesh integration: compiles src/swarm.rs + links the sp-swarm crate. Runtime-gated
+# further by SP_SWARM=1 (default-off => spawn_if_enabled is a no-op).
+swarm = ["dep:sp-swarm"]

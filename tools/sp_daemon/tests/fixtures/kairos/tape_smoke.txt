@@ -1,0 +1,33 @@
+# KAI-1 deterministic event tape (CONTRACT-KAIROS-K0-K1.md §2b)
+# A scripted, replayable tape so G-KAIROS-1 is deterministic (no live sensors —
+# that's KAI-4). One event per line; the tick reads the next line each tick.
+# Columns: tick_idx  kind  payload  salience  expect
+#   salience -> the router-tier score; expect -> the gate oracle (NOOP|ACTION)
+#   for the false-action / missed-event counters.
+# N salient events sparse among M idle ticks (N << M): here N=3, M=24.
+#
+# tick_idx   kind            payload                    salience   expect
+0            IDLE            -                          0.00       NOOP
+1            IDLE            -                          0.00       NOOP
+2            IDLE            -                          0.00       NOOP
+3            IDLE            -                          0.05       NOOP
+4            EVENT.timer     "build finished"           0.80       ACTION
+5            IDLE            -                          0.00       NOOP
+6            IDLE            -                          0.00       NOOP
+7            IDLE            -                          0.10       NOOP
+8            IDLE            -                          0.00       NOOP
+9            IDLE            -                          0.00       NOOP
+10           IDLE            -                          0.00       NOOP
+11           IDLE            -                          0.15       NOOP
+12           EVENT.alert     "disk 95 percent"          0.90       ACTION
+13           IDLE            -                          0.00       NOOP
+14           IDLE            -                          0.00       NOOP
+15           IDLE            -                          0.00       NOOP
+16           IDLE            -                          0.05       NOOP
+17           IDLE            -                          0.00       NOOP
+18           IDLE            -                          0.00       NOOP
+19           IDLE            -                          0.20       NOOP
+20           EVENT.deadline  "ttl expiring"             0.75       ACTION
+21           IDLE            -                          0.00       NOOP
+22           IDLE            -                          0.00       NOOP
+23           IDLE            -                          0.00       NOOP

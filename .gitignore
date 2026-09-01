@@ -1,0 +1,28 @@
+# build output
+target/
+target-*/
+build/
+*.o
+*.obj
+*.pdb
+*.exp
+*.lib
+*.dll
+*.exe
+
+# weights, and anything that looks like them. A GGUF does not belong in git; the README
+# says bring your own, and this is the line that keeps that true by accident as well as
+# on purpose.
+*.gguf
+*.safetensors
+*.bin
+models/
+
+# the math core is a SUBMODULE, not a copy — clone with --recurse-submodules
+lib/shannon-prime-system/
+
+# local scratch
+.vscode/
+.idea/
+*.log
+__pycache__/

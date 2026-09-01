@@ -1,0 +1,21 @@
+[target.aarch64-linux-android]
+linker = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android21-clang.cmd"
+ar     = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
+
+# §3-HX Sprint J.5 — cc-rs deps (ring via rustls/quinn, esaxx-rs via tokenizers)
+# need the NDK clang/clang++/ar resolved per-target. Setting these via [env]
+# (not PATH) is what unblocks the aarch64-android cross-compile.
+# NOTE: cargo discovers this config by walking UP from the CWD, so cargo must
+# run with tools/sp_daemon as the working dir (see build-android.bat). bindgen
+# is NOT needed on android — build.rs early-returns sp_no_link before it.
+[env]
+CC_aarch64_linux_android  = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android21-clang.cmd"
+CXX_aarch64_linux_android = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android21-clang++.cmd"
+AR_aarch64_linux_android  = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
+# Phase 2-L3.FG — bindgen runs on the host but must parse sp_l1.h's <stdint.h>/
+# <stddef.h> against the android sysroot for the aarch64 target. bindgen auto-
+# reads BINDGEN_EXTRA_CLANG_ARGS_<triple>; this supplies the target + sysroot.
+# -isystem points at clang's builtin headers (stddef.h etc.) which live in the
+# NDK clang resource dir, NOT the sysroot — the host libclang doesn't know the
+# NDK's resource path, so stdint.h's #include <stddef.h> fails without this.
+BINDGEN_EXTRA_CLANG_ARGS_aarch64-linux-android = "--target=aarch64-linux-android21 --sysroot=D:/Files/Android/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/sysroot -isystem D:/Files/Android/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/lib/clang/18/include"
