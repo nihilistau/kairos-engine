@@ -9,7 +9,7 @@ and supported path is any OpenAI-compatible endpoint — and nothing here is req
 companion.
 
 > **This is a curated export.** The source of truth is a private research tree; this repo is
-> the 173-file subset that actually builds the daemon, cut with fresh history and scrubbed.
+> the curated subset that actually builds the daemon, cut with fresh history and scrubbed.
 > `ENGINE-SOURCE.txt` names the upstream commit. Fixes are welcome as PRs; they get carried
 > back upstream by hand.
 
@@ -44,7 +44,7 @@ tools/sp_daemon/          the Rust daemon — routes, sampler, KV, the HTTP/SSE 
 src/backends/cuda/        the kernels
   cuda_forward.cu         the MoE forward and the decode loop — the big one
 include/sp_engine/        the C ABI the daemon links against
-core/                     SUBMODULE -> shannon-prime-system (the math core)
+lib/shannon-prime-system  SUBMODULE -> the math core (clone --recurse-submodules)
 build-wirecuda.bat        the build that produces the binary the harness expects
 ```
 
@@ -93,8 +93,22 @@ own.
 
 ## 5. THE OTHER REPOS
 
-| repo | what |
-|---|---|
-| [Kairos](https://github.com/nihilistau/Kairos) | the harness, the room, the memory architecture, the gates |
-| [shannon-prime-system](https://github.com/nihilistau/shannon-prime-system) | the math core — the `core/` submodule here |
-| `shannon-prime-engine`, `shannon-prime-system-engine` | earlier, larger snapshots. Not maintained; this is the curated source in use |
+**Two families, deliberately separate.** This repo is in the COMPANION one; the lattice family
+is not its ancestor and this repo does not supersede any of it.
+
+| repo | family / class | what |
+|---|---|---|
+| [Kairos](https://github.com/nihilistau/Kairos) | companion | the harness, the room, the memory architecture, the gates |
+| **this repo** | companion | the optional native CUDA backend |
+| [shannon-prime-system](https://github.com/nihilistau/shannon-prime-system) | lattice, `STANDING` | the math core — the `lib/` submodule here |
+| [shannon-prime-system-engine](https://github.com/nihilistau/shannon-prime-system-engine) | lattice, **`STANDING`** | **NOT superseded by this repo.** Holds unique substrate: SP-SWARM / DHT (QUIC, Ed25519, C2 discovery), the byte-exact exact-integer forward (`SP_BYTEEXACT`), the NTT/CRT kernels, the frozen L1 C ABI |
+| [shannon-prime-lattice](https://github.com/nihilistau/shannon-prime-lattice) | lattice | umbrella: papers, KEYSTONE, ADRs, SP-OKF / MEM-OKF, SWARM design |
+| [shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine) | lattice, `HISTORICAL` | the FIRST reference engine — the PPT-ARM line (Friedman sieve, CRT-NTT). A different codebase: no `sp_daemon`, no kernels shared with this tree |
+
+── DO NOT COLLAPSE THE LATTICE FAMILY INTO A COMPANION HARNESS ─────────────────────────
+That is rule 2 of the project's own repo map,
+[`JOURNEY.md`](https://github.com/nihilistau/Position_Is_Arithmetic/blob/main/JOURNEY.md),
+and it is aimed at exactly the agent reading this. Each tree carries a `STATUS.md` tombstone
+naming its class; **read it before treating a README as current.** An earlier draft of this
+file called the lattice engine an "earlier, larger snapshot" of this repo. It is not: it is
+`STANDING`, it holds work this repo does not have, and the two lines are not a succession.

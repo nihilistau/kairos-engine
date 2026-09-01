@@ -98,17 +98,37 @@ compiled.
 
 ---
 
-## Relationship to the other repos
+## Where this sits, and what it is NOT
 
-- **[Kairos](https://github.com/nihilistau/Kairos)** — the harness, the room, the memory
-  architecture, the gates. Talks to any OpenAI-compatible endpoint. Does not need this.
-- **[shannon-prime-system](https://github.com/nihilistau/shannon-prime-system)** — the math
-  core, the `core/` submodule here.
-- **this repo** — the optional native backend.
+There are two families here and they are deliberately separate. This repo belongs to the
+**companion** one.
 
-`shannon-prime-engine` and `shannon-prime-system-engine` are earlier, larger snapshots of this
-work and are not maintained. This is the curated source that actually builds the daemon in
-use.
+| repo | class | what |
+|---|---|---|
+| [Kairos](https://github.com/nihilistau/Kairos) | companion | the harness, the room, the memory architecture, the gates. Talks to any OpenAI-compatible endpoint and **does not need this** |
+| **this repo** | companion | the optional native CUDA backend for that harness |
+| [shannon-prime-system](https://github.com/nihilistau/shannon-prime-system) | lattice, `STANDING` | the exact-integer math core and the frozen L1 C ABI — carried here as the `lib/` submodule |
+| [shannon-prime-system-engine](https://github.com/nihilistau/shannon-prime-system-engine) | lattice, **`STANDING`** | **not superseded by this repo.** See below |
+| [shannon-prime-lattice](https://github.com/nihilistau/shannon-prime-lattice) | lattice | umbrella: papers, KEYSTONE, ADRs, SP-OKF / MEM-OKF, SWARM design |
+
+### `shannon-prime-system-engine` is STANDING, not an ancestor
+
+This repo is a **curated cut of the daemon source** that the companion stack runs. It is not a
+replacement for the lattice engine, and it does not own that work. The lattice tree holds
+unique substrate that is not here and is not a companion feature:
+
+- **SP-SWARM / DHT** — L0 QUIC, L1 content addressing, L2 have/want replication, L3 Ed25519
+  provenance, L4 C2-SimHash discovery.
+- **The byte-exact exact-integer forward** — `O_K = Z[(1+√−163)/2]`, dual-prime negacyclic
+  CRT-NTT, the four exact islands, `SP_BYTEEXACT`. Auditability and cross-machine determinism.
+- **NTT / CRT / Frobenius / ARM / Ring-3 VSA** kernels and contracts, and the frozen L1 C ABI
+  every backend gates to.
+
+The project keeps a map of which epoch each repo belongs to —
+[`JOURNEY.md`](https://github.com/nihilistau/Position_Is_Arithmetic/blob/main/JOURNEY.md) —
+and a `STATUS.md` tombstone in each tree. Its first rule is *"do not collapse the lattice
+family into a companion harness."* **Read a repo's `STATUS.md` before treating its README as
+current**, this one included.
 
 ---
 
