@@ -1,16 +1,40 @@
 # kairos-engine
 
-**A from-scratch CUDA inference engine and HTTP daemon, built for one 12 GB card.**
+**A from-scratch CUDA inference engine and HTTP daemon — built, and measured, on one 12 GB card.**
 
 This is the optional native backend for [Kairos](https://github.com/nihilistau/Kairos). It is
 a Rust daemon (`sp-daemon`) wrapping hand-written CUDA kernels — the KV cache and its ring,
 prefill, fp16 KV, an MoE forward pass — behind an HTTP/SSE surface the harness talks to.
 
-> **You almost certainly do not need this.** Kairos runs against any OpenAI-compatible
-> `/v1/chat/completions` endpoint — LM Studio, `llama-server`, vLLM, a cloud provider — and
-> that is its default and its supported path. This repo exists because the companion it was
-> written for runs on a single RTX 2060, where the difference between a general runtime and a
-> purpose-built one is the difference between a four-second reply and a forty-second one.
+> **You may well not need this — but here is exactly what you give up.** Kairos's default
+> and supported path is any OpenAI-compatible `/v1/chat/completions` endpoint (LM Studio,
+> `llama-server`, vLLM, a cloud), and on one of those she is *most* of herself. The list below
+> is measured, not estimated, and the harness degrades to it deliberately: every seam asks the
+> backend what it `supports` and states its loss rather than failing or pretending.
+
+## What actually needs this daemon
+
+| what goes dark on a foreign endpoint | why |
+|---|---|
+| **She picks a severed sentence back up** (`CONTINUE`), and **finishes, then adds the thing she thought of on the way to the kettle** (`EXPAND`) | Both are driven by `eot_margin` — the raw stop-vs-continue logit gap, emitted on a named `event: kairos` SSE frame. It is the *forward's own* report that she had more to say, and no `/v1/chat/completions` server exposes it. Calibrated on the 26B: finished turns cluster at **+13.10**, guillotined ones at **-28.43**, threshold **-18.50** |
+| **Sight through her own vision tower** | Residual frame injection into the model's own residual stream. Falls back with `SP_ENGINE_VISION=1` to an ordinary `image_url` part on multimodal endpoints — a different thing, honestly labelled |
+| **Voice-in through the native ear** | Residual *audio* frames. There is no fallback; the voice service says so as a reply |
+| **The L5 embedding space** (`/v1/embed`) | Her semantic index in the engine's own space. Falls back to a sidecar `/v1/embeddings` or a hash floor — same-space only, the seam never compares across spaces |
+| **Prefill once, then extend** — the warm gate and the persisted-KV persona prefix | The persona + tools prefix is captured on ONE cold prefill (~5 minutes) and every later turn extends it. A foreign server owns its own cache discipline, so there is nothing to warm |
+| `eot_bias`, `raw_logits`, byte-exact decoding, engine-enforced tool grammar, pre-tokenized input, `/v1/events`, engine-side tokens/sec, and the harness owning start / restart / watchdog | No wire field on a generic endpoint. Each is a declared capability; the room shows the chip on knobs that are moot without it |
+
+**What does *not* need it — and this is most of what people mean by "her":** she still speaks
+unprompted (`CHECK_IN`, `MUSE`, `REMIND`) and still does things in her own time (`SOLO`) —
+those lanes take `eot_margin=None` and are decided before it is ever consulted. So is the
+entire turn epilogue: the day row, memory admission, supersede, the identity firewall,
+self-stances, the presence ledger, the journal. One `_settle_turn`, both mouths.
+
+> One honest caveat on `/v1/capture`: the engine-side episode mint is a daemon capability, but
+> it does **not** run on the 26B MoE — the route refuses it (ADR-013) and rows have carried
+> `npos=0` since that model landed. It is not a reason to want this repo today.
+
+The other reason it exists is the one it was built for: a companion living on a single RTX
+2060, where a purpose-built runtime and a general one are not the same experience.
 
 ---
 
@@ -105,7 +129,7 @@ There are two families here and they are deliberately separate. This repo belong
 
 | repo | class | what |
 |---|---|---|
-| [Kairos](https://github.com/nihilistau/Kairos) | companion | the harness, the room, the memory architecture, the gates. Talks to any OpenAI-compatible endpoint and **does not need this** |
+| [Kairos](https://github.com/nihilistau/Kairos) | companion | the harness, the room, the memory architecture, the gates. Runs against any OpenAI-compatible endpoint; **this repo is what its continuation lanes, its vision tower and its warm prefix are built on** |
 | **this repo** | companion | the optional native CUDA backend for that harness |
 | [shannon-prime-system](https://github.com/nihilistau/shannon-prime-system) | lattice, `STANDING` | the exact-integer math core and the frozen L1 C ABI — carried here as the `lib/` submodule |
 | [shannon-prime-system-engine](https://github.com/nihilistau/shannon-prime-system-engine) | lattice, **`STANDING`** | **not superseded by this repo.** See below |

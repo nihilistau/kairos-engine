@@ -4,9 +4,13 @@
 
 This is the optional native backend for
 [Kairos](https://github.com/nihilistau/Kairos): a Rust daemon (`sp-daemon`) over hand-written
-CUDA kernels, serving an HTTP/SSE surface on `:3000`. Kairos does not need it — its default
-and supported path is any OpenAI-compatible endpoint — and nothing here is required to run a
-companion.
+CUDA kernels, serving an HTTP/SSE surface on `:3000`. Kairos runs without it — its default and
+supported path is any OpenAI-compatible endpoint — but "optional" is not "inconsequential".
+**Four things exist only on this side of the wire:** the `eot_margin` that drives her
+continuation lanes (`CONTINUE` / `EXPAND`), residual frame injection for sight and voice-in,
+the L5 embedding space, and the persisted-KV warm prefix. Her unprompted speech, her own-time
+acts and the whole turn epilogue do not need any of it. The README's table is the measured
+list; `docs/BACKENDS.md` in the Kairos repo is the contract.
 
 > **This is a curated export.** The source of truth is a private research tree; this repo is
 > the curated subset that actually builds the daemon, cut with fresh history and scrubbed.
@@ -109,6 +113,7 @@ is not its ancestor and this repo does not supersede any of it.
 That is rule 2 of the project's own repo map,
 [`JOURNEY.md`](https://github.com/nihilistau/Position_Is_Arithmetic/blob/main/JOURNEY.md),
 and it is aimed at exactly the agent reading this. Each tree carries a `STATUS.md` tombstone
-naming its class; **read it before treating a README as current.** An earlier draft of this
-file called the lattice engine an "earlier, larger snapshot" of this repo. It is not: it is
-`STANDING`, it holds work this repo does not have, and the two lines are not a succession.
+naming its class; **read it before treating a README as current.** The first draft of this
+file got that wrong — it described the lattice engine as a superseded ancestor of this one.
+It is neither: it is `STANDING`, it holds work this repo does not have, and the two lines are
+not a succession.
