@@ -105,7 +105,7 @@ is not its ancestor and this repo does not supersede any of it.
 | [Kairos](https://github.com/nihilistau/Kairos) | companion | the harness, the room, the memory architecture, the gates |
 | **this repo** | companion | the optional native CUDA backend |
 | [shannon-prime-system](https://github.com/nihilistau/shannon-prime-system) | lattice, `STANDING` | the math core — the `lib/` submodule here |
-| [shannon-prime-system-engine](https://github.com/nihilistau/shannon-prime-system-engine) | lattice, **`STANDING`** | **NOT superseded by this repo.** Holds unique substrate: SP-SWARM / DHT (QUIC, Ed25519, C2 discovery), the byte-exact exact-integer forward (`SP_BYTEEXACT`), the NTT/CRT kernels, the frozen L1 C ABI |
+| [shannon-prime-system-engine](https://github.com/nihilistau/shannon-prime-system-engine) | lattice, **`STANDING`** | **NOT superseded by this repo.** 2095 files to this cut's 152: where SP-SWARM / DHT, the byte-exact forward, the NTT/CRT matrix and the L1 ABI are *developed*. This tree links that substrate; it does not own it |
 | [shannon-prime-lattice](https://github.com/nihilistau/shannon-prime-lattice) | lattice | umbrella: papers, KEYSTONE, ADRs, SP-OKF / MEM-OKF, SWARM design |
 | [shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine) | lattice, `HISTORICAL` | the FIRST reference engine — the PPT-ARM line (Friedman sieve, CRT-NTT). A different codebase: no `sp_daemon`, no kernels shared with this tree |
 
@@ -114,6 +114,11 @@ That is rule 2 of the project's own repo map,
 [`JOURNEY.md`](https://github.com/nihilistau/Position_Is_Arithmetic/blob/main/JOURNEY.md),
 and it is aimed at exactly the agent reading this. Each tree carries a `STATUS.md` tombstone
 naming its class; **read it before treating a README as current.** The first draft of this
-file got that wrong — it described the lattice engine as a superseded ancestor of this one.
-It is neither: it is `STANDING`, it holds work this repo does not have, and the two lines are
-not a succession.
+file got that wrong twice over. It described the lattice engine as a superseded ancestor of
+this one — it is `STANDING`, and the two lines are not a succession. The correction then
+overshot and said that tree's substrate "is not here", which is also false: this is the
+daemon's own source, so `SP_BYTEEXACT`, `ptx_ntt.cuh`, `sieve_ffi.rs`, the `sp_l1` bindings and
+an optional `sp-swarm` crate all ship in it. **The real line is ownership, not presence** — a
+152-file cut that links the substrate is not the 2095-file tree where it is developed, and it
+does not replace it. `G-ENGINE-EXPORT` §8 now checks any absence claim against the shipped
+file list, because prose was twice the wrong place to keep this.

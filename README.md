@@ -137,16 +137,26 @@ There are two families here and they are deliberately separate. This repo belong
 
 ### `shannon-prime-system-engine` is STANDING, not an ancestor
 
-This repo is a **curated cut of the daemon source** that the companion stack runs. It is not a
-replacement for the lattice engine, and it does not own that work. The lattice tree holds
-unique substrate that is not here and is not a companion feature:
+This repo is a **curated cut of the daemon source** that the companion stack runs — 152
+files, just enough to build the binary. The distinction from the lattice engine is **scope and
+ownership, not contents.**
 
-- **SP-SWARM / DHT** — L0 QUIC, L1 content addressing, L2 have/want replication, L3 Ed25519
-  provenance, L4 C2-SimHash discovery.
-- **The byte-exact exact-integer forward** — `O_K = Z[(1+√−163)/2]`, dual-prime negacyclic
-  CRT-NTT, the four exact islands, `SP_BYTEEXACT`. Auditability and cross-machine determinism.
-- **NTT / CRT / Frobenius / ARM / Ring-3 VSA** kernels and contracts, and the frozen L1 C ABI
-  every backend gates to.
+Being the daemon's source, this tree naturally *contains* lattice substrate: `SP_BYTEEXACT` in
+the CUDA forward, `ptx_ntt.cuh` and `ntt_ffi.rs`, `sieve_ffi.rs` (the KSTE / PoUW bindings),
+the `sp_l1` ABI, and an optional `sp-swarm` crate — default-off, and `build-wirecuda.bat` does
+not enable it. **Using that work is not owning it.** It is developed in the lattice tree, 2095
+files, where these live and this cut does not:
+
+- **SP-SWARM / DHT as a system** — L0 QUIC, L1 content addressing, L2 have/want replication,
+  L3 Ed25519 provenance, L4 C2-SimHash discovery, with its own gates and its design papers.
+  What ships here is the transport crate the daemon can optionally link.
+- **The byte-exact exact-integer forward as a research line** — `O_K = Z[(1+√−163)/2]`,
+  dual-prime negacyclic CRT-NTT, the four exact islands. Auditability and cross-machine
+  determinism, measured there.
+- **The full NTT / CRT / Frobenius / ARM / Ring-3 VSA kernel matrix** and the contracts every
+  backend gates to. One CUDA backend's worth of it reaches this cut.
+
+**A downstream cut does not replace the tree it was cut from.**
 
 The project keeps a map of which epoch each repo belongs to —
 [`JOURNEY.md`](https://github.com/nihilistau/Position_Is_Arithmetic/blob/main/JOURNEY.md) —

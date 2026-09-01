@@ -19,11 +19,18 @@ What lives here:
 
 **This repo does not supersede
 [shannon-prime-system-engine](https://github.com/nihilistau/shannon-prime-system-engine),
-which is `STANDING`.** That tree holds unique lattice substrate that is not here and is not a
-companion feature: SP-SWARM / DHT (QUIC, content addressing, Ed25519 provenance, C2
-discovery), the byte-exact exact-integer forward (`SP_BYTEEXACT`), the NTT / CRT / Frobenius
-kernels, and the frozen L1 C ABI. JOURNEY.md rule 2: *do not collapse the lattice family into
-a companion harness.*
+which is `STANDING`** — and the reason is scope, not contents.
+
+This is a **narrow cut**: 152 files, just enough to build the daemon the companion runs. It is
+built ON the lattice substrate and therefore *contains* plenty of it — `SP_BYTEEXACT` in the
+CUDA forward, `ptx_ntt.cuh` and `ntt_ffi.rs`, `sieve_ffi.rs` (KSTE / PoUW), the `sp_l1` ABI
+bindings, and an optional `sp-swarm` crate (default-off; `build-wirecuda.bat` does not enable
+it). What it is not is the place that work *lives*. That is the lattice tree — **2095 files**:
+the full backend matrix, SP-SWARM's L0-L4 with its own gates, the memory agency, NIGHTSHIFT,
+EAGLE / MTP, and the research history that produced all of it.
+
+**A downstream cut does not replace the tree it was cut from.** JOURNEY.md rule 2: *do not
+collapse the lattice family into a companion harness.*
 
 **No weights.** A GGUF does not belong in git; `.gitignore` refuses `*.gguf`, `*.safetensors`
 and `*.bin`. Bring your own.
