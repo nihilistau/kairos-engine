@@ -7251,6 +7251,70 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
      * commit_pos=n here desynced the persist-KV reuse math on the NEXT turn (a second request
      * reusing this cache returned empty). Matching the per-token path fixes the multi-turn
      * persist interaction; the cold single-turn win is unaffected. */
+    /* ── KAI-5 ON THE BATCHED PATH (2026-09-09) ──────────────────────────────────────
+     * THE TAP COULD NOT BE REACHED. `gemma4_kv_prefill` opens g_hd_f and g4_kv_step writes
+     * through it, so the dump only ever existed on the PER-TOKEN prefill floor — and the
+     * daemon has since learned to avoid that floor (26 ms/tok batched against 80-99
+     * per-token). Both /v1/chat and /v1/oneshot batch, so SP_HIDDEN_DUMP produced an empty
+     * file on every fast path, and the only capture in the tree was a July prefill from a
+     * different model that turned out to be 97% one 11-token loop.
+     * Receipt: docs/PHASE-SPACE-2026-09-09.md.
+     *
+     * `dx` is already the [n x E] residual for every position in this chunk — the same
+     * quantity the per-token path taps, one position at a time — so the tap is one batched
+     * rmsnorm and one D2H, taken AFTER the layer loop and after the sync above so `dx` is
+     * complete and settled.
+     *
+     * TRUNCATE ON P==0, APPEND OTHERWISE. `gemma4_kv_prefill_batched` chunks this function,
+     * so truncating per call would leave only the final chunk; and the suffix arm calls it
+     * with P>0 against a live prefix, where the earlier positions are already on disk.
+     * P==0 is exactly "this is the start of a prefill", which is what the per-token path
+     * means by opening with "wb".
+     *
+     * Byte-identical when the env is unset: every line below is inside the getenv guard,
+     * writes only to host memory and the file, and touches no tensor the forward reads. */
+    { const char *hdp = getenv("SP_HIDDEN_DUMP");
+      if (hdp && *hdp) {
+        if (P == 0) { if (g_hd_f) fclose(g_hd_f); g_hd_f = fopen(hdp, "wb"); g_hd_pos = 0; }
+        else if (!g_hd_f) { g_hd_f = fopen(hdp, "ab"); }
+        /* THE DECODE BRANCH GUARDS ON g_hd_dev, NOT JUST g_hd_f. g4_kv_step opens with
+         * `if (g_hd_f && g_hd_dev)` and streams out of g_hd_host, and BOTH were allocated
+         * only inside the per-token prefill's open block — so opening the file here and
+         * stopping would have produced a tap that captured the prefill and then silently
+         * dropped every decode step, which is the same class of half-wired instrument this
+         * whole fix exists to remove. Allocated exactly as the per-token path does. */
+        if (g_hd_f && !g_hd_dev) {
+            g_hd_cap = (int)s->Pmax;
+            if (cudaMalloc(&g_hd_dev, (size_t)g_hd_cap * (size_t)E * sizeof(float)) != cudaSuccess)
+                g_hd_dev = NULL;
+            g_hd_host = (float *)malloc((size_t)g_hd_cap * (size_t)E * sizeof(float));
+        }
+        if (g_hd_f) {
+            /* out_norm over all n rows, into the scratch the forward has already finished
+             * with. n blocks, one per position — the n-wide form of the per-token tap.
+             * Staged through g_hd_host, which is already Pmax*E and so always >= n*E. */
+            k_rmsnorm<<<n, 256, 0, st>>>(dx, g_w.out_norm, E, eps, dnx);
+            if (g_hd_host && cudaStreamSynchronize(st) == cudaSuccess
+                && cudaMemcpy(g_hd_host, dnx, (size_t)n * (size_t)E * sizeof(float),
+                              cudaMemcpyDeviceToHost) == cudaSuccess) {
+                fwrite(g_hd_host, sizeof(float), (size_t)n * (size_t)E, g_hd_f);
+                g_hd_pos += n;
+            }
+            fflush(g_hd_f);
+            /* Same hand-off as the per-token path: keep the file open so g4_kv_step can
+             * stream the decode steps, or close it here if only prefill was asked for. */
+            { const char *hdd = getenv("SP_HIDDEN_DUMP_DECODE");
+              if (hdd && *hdd && *hdd != '0') {
+                  g_hd_stream = 1;
+                  fprintf(stderr, "[g4-kv] hidden dump (batched): %d positions at P=%d, "
+                                  "streaming decode...\n", n, P);
+              } else {
+                  /* Closing per chunk is safe: `gemma4_kv_prefill_batched` calls this
+                   * function again with P>0, which reopens in append mode above. */
+                  fclose(g_hd_f); g_hd_f = NULL;
+              } }
+        }
+      } }
     rc = g4_ck("prefill_batched:end");
 bdone:
     if (dx)cudaFree(dx); if(dnx)cudaFree(dnx); if(dq)cudaFree(dq); if(dk)cudaFree(dk); if(dv)cudaFree(dv);
