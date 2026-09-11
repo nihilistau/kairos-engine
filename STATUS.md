@@ -43,11 +43,29 @@ fp32 reduction-order noise, ~√256·eps.
 
 `SP_G4_ATTN_V2`: `0` the previous kernels, `1` the new ones, `2` parity. Disarming is one value.
 
-**Still open, and it is not a loop:** `volta_sgemm_128x64_tn` is now the largest single line at
-24.2%, beside `k_dequant_arena_q4b` — this engine dequantises Q4 to fp32 and runs cuBLAS
-**fp32** SGEMM (no tensor cores; TF32 is Ampere and later), where llama.cpp's hottest kernel
-`mul_mat_vec_q<Q4_0>` multiplies the Q4 bytes directly against q8_1 activations. That is a
-weight-format and matmul-path decision, and it is most of the remaining gap.
+**Still open:** `volta_sgemm_128x64_tn` is the largest single line at 24.2%, beside
+`k_dequant_arena_q4b` — this engine dequantises Q4 to fp32 and runs cuBLAS **fp32** SGEMM,
+where llama.cpp's hottest kernel `mul_mat_vec_q<Q4_0>` multiplies the Q4 bytes directly
+against q8_1 activations.
+
+**I first wrote that this was most of the remaining gap. It is not — tested 2026-09-12.** The
+direct path is already in this tree: `gemm_q4b_dp4a_batched` + `k_gemm_q4b_dp4a`, wired into
+the batched prefill behind `SP_KV_PREFILL_DP4A`, complete and with a clean decline. Measured
+over three pairs on a 3,750-token prefill it is **~18% SLOWER** than dequant + SGEMM (every
+"on" run above every "off" run), and because it quantises activations to int8 it **changes the
+output text** at temperature 0 — a real precision reduction, not the reduction-order noise the
+attention change produced. The knob being off is correct.
+
+Quantised matmul is not inherently faster than fp32 SGEMM here. `volta_sgemm_128x64_tn` is
+hand-tuned cuBLAS assembly; `k_gemm_q4b_dp4a` is a custom kernel. llama.cpp's advantage is not
+the weight format, it is that `mul_mat_vec_q` is a very good kernel — swapping format without
+matching the tuning loses.
+
+**The untested option is fp16 with tensor cores**: dequantise to `__half` rather than `float`
+and run `cublasGemmEx(CUDA_R_16F, …, CUBLAS_COMPUTE_32F)`. Turing sm_75 has tensor cores for
+fp16 and none for fp32, so the engine currently uses none of them; this would halve the
+dequant write bandwidth and put the GEMM on hardware that is idle today. That is the next
+experiment, and unlike the one above it has not been tried.
 
 **Zoo map:** [JOURNEY.md](https://github.com/nihilistau/Position_Is_Arithmetic/blob/main/JOURNEY.md)
 
