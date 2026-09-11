@@ -1,7 +1,53 @@
 # STATUS — kairos-engine
 
-**Date:** 2026-09-02  
+**Date:** 2026-09-12  
 **Class:** `LIVE` — the optional native CUDA backend for the **companion** stack.
+
+## Recent — the attention kernels, 2026-09-12
+
+Three kernels carried the same defect and it was worth about half the engine's GPU time. An
+`nsys` trace against `llama.cpp` on the same card, same weights (Gemma-4-26B-A4B Q4_0 QAT,
+RTX 2060 12 GB), same ~4k-prefill workload put **75% of GPU time in attention** here against
+**0.8%** there. `ncu` then said the hot one was **L1/TEX-bound at 98.81% while doing 9.83% of
+peak compute**, at 99.87% occupancy — so not a parallelism problem.
+
+The cause, in each of `k_attn_from_tiled_T`, `k_attn` and `k_attn_decode_win_tiled_T`:
+
+```c
+for (int u = threadIdx.x; u < n; u += blockDim.x)      /* one thread per KEY */
+    for (int i = 0; i < HD; i++) a += qh[i] * kv_ld(kh, i);   /* a whole 256-dot, alone */
+```
+
+A warp's 32 lanes sat on 32 *different* keys and stepped `i` together, so every load became 32
+transactions instead of 1–4; and `qh` — identical across the block — was re-read from global
+by every thread on every iteration. The fix is the same three times: **one warp per key** with
+the lanes splitting the head dim and a `__shfl_down_sync` reduction, and the **query staged in
+shared memory once**. Tiling, the online-softmax recurrence and the AV loop are untouched.
+
+| | before | after |
+|---|---:|---:|
+| `k_attn_from_tiled_T`, per layer (ncu, same launch) | 280 ms | **42.85 ms** |
+| its profile | L1 99.1% / compute 9.9% | **L1 83.7% / compute 78.6%** |
+| prefill, 3,750 tokens | 36,573 ms | **18,205 ms** (2.01×) |
+| decode, live stack, same prompt | 16.6 tok/s | **21.1 tok/s** (1.27×) |
+| total GPU, traced workload | 30,937 ms | 13,466 ms |
+
+It is compute-bound now instead of L1-bound, which is the shape the diagnosis predicted.
+
+**Numerics.** Not bit-identical and cannot be: a tree reduction over 32 lanes is not the
+sequential sum it replaces. `SP_G4_ATTN_V2=2` is a **parity mode** that runs both kernels every
+layer and *serves the old one*, so the difference is measured on real weights during a real
+prefill without the new path ever reaching output. Worst relative L2 over all layers:
+**8.15e-07** (tiled prefill), **9.86e-07** (flat prefill), **2.86e-06** (decode, ring armed) —
+fp32 reduction-order noise, ~√256·eps.
+
+`SP_G4_ATTN_V2`: `0` the previous kernels, `1` the new ones, `2` parity. Disarming is one value.
+
+**Still open, and it is not a loop:** `volta_sgemm_128x64_tn` is now the largest single line at
+24.2%, beside `k_dequant_arena_q4b` — this engine dequantises Q4 to fp32 and runs cuBLAS
+**fp32** SGEMM (no tensor cores; TF32 is Ampere and later), where llama.cpp's hottest kernel
+`mul_mat_vec_q<Q4_0>` multiplies the Q4 bytes directly against q8_1 activations. That is a
+weight-format and matmul-path decision, and it is most of the remaining gap.
 
 **Zoo map:** [JOURNEY.md](https://github.com/nihilistau/Position_Is_Arithmetic/blob/main/JOURNEY.md)
 

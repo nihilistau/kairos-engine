@@ -1106,6 +1106,74 @@ __global__ void k_attn(const float *Q, const float *K, const float *V,
     }
 }
 
+/* k_attn's twin, with the loads done properly — the SAME fix as k_attn_from_tiled_v2_T and
+ * for the same measured reason (2026-09-11). This is the `P == 0` path: the first prefill
+ * chunk, where there is no prior cache to attend to. nsys put it at 8,995 ms across 30 calls
+ * — 300 ms PER LAYER, the second-hottest kernel in the engine after its tiled sibling, and
+ * the 9 s that the tiled fix did not touch.
+ *
+ * Identical defect, line for line: `for (s = s0 + threadIdx.x; ...)` gave each thread a whole
+ * 256-element dot, so a warp's 32 lanes sat on 32 DIFFERENT keys and stepped `i` together —
+ * every load 32 transactions instead of 1-4 — and `qh[i]` was re-read from global by every
+ * thread on every iteration.
+ *
+ * v2: ONE WARP PER KEY (lanes split the head dim, coalesced, `__shfl_down_sync` reduces), and
+ * the query staged in shared once. The softmax, the AV loop and the single-pass structure are
+ * untouched — this kernel has no tiling and does not gain any here.
+ *
+ * Shared grows by HD floats for the staged query, so the launcher sizes it (n_tok + HD).
+ * blockDim MUST be a multiple of 32 for the full-mask shuffle: all 32 lanes of a warp share
+ * one `s` (warp = threadIdx.x >> 5), so a warp enters an iteration whole or not at all, which
+ * is what makes 0xffffffff the correct mask — but only if no warp is partial. The launcher
+ * rounds up; v1's `max(hd, n_tok)` could be any integer. */
+__global__ void k_attn_v2(const float *Q, const float *K, const float *V,
+                          int n_tok, int QD, int KVD, int HD, int group,
+                          float ascale, int win, float *AO) {
+    extern __shared__ float shm[];
+    float *sc = shm;                 /* [n_tok] scores, indexed by ABSOLUTE s (as v1) */
+    float *qs = shm + n_tok;         /* [HD]    the query, staged ONCE */
+    int n_heads = QD / HD;
+    int b = blockIdx.x, t = b / n_heads, h = b % n_heads, kvh = h / group;
+    const float *qh = Q + (size_t)t * QD + (size_t)h * HD;
+    int s0 = (win >= 0 && t - win + 1 > 0) ? t - win + 1 : 0;
+
+    for (int i = threadIdx.x; i < HD; i += blockDim.x) qs[i] = qh[i];
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const int warp = (int)(threadIdx.x >> 5);
+    const int nwarps = (int)(blockDim.x >> 5);
+
+    for (int s = s0 + warp; s <= t; s += nwarps) {
+        const float *kh = K + (size_t)s * KVD + (size_t)kvh * HD;
+        float acc = 0.0f;
+        for (int i = lane; i < HD; i += 32) acc += qs[i] * kh[i];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) sc[s] = acc * ascale;
+    }
+    __syncthreads();
+
+    __shared__ float g_sum;
+    if (threadIdx.x == 0) {
+        float m = sc[s0];
+        for (int s = s0 + 1; s <= t; s++) if (sc[s] > m) m = sc[s];
+        float sum = 0.0f;
+        for (int s = s0; s <= t; s++) { float e = expf(sc[s] - m); sc[s] = e; sum += e; }
+        g_sum = sum;
+    }
+    __syncthreads();
+
+    float inv = 1.0f / g_sum;
+    for (int i = threadIdx.x; i < HD; i += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = s0; s <= t; s++)
+            acc += sc[s] * V[(size_t)s * KVD + (size_t)kvh * HD + i];
+        AO[(size_t)t * QD + (size_t)h * HD + i] = acc * inv;
+    }
+}
+
 /* NTT-attention (E_CU_5): the score <q,k> is computed EXACTLY in integers — the
  * head vectors are quantized to int32 (x qscale=2^16) and the inner product is
  * accumulated in int64, which is bit-identical to the CPU poly-ring sp_pr_inner
@@ -2817,10 +2885,17 @@ __global__ void k_attn_decode_win_dyn_T(const float *q, const KV *Kc, const KV *
 template <typename KV>
 __global__ void k_attn_decode_win_tiled_T(const float *q, const KV *Kc, const KV *Vc,
                                           const int *dpos, int KVD, int HD, int group,
-                                          float ascale, int win, float *ao, int TILE) {
+                                          float ascale, int win, float *ao, int TILE,
+                                          int Wring) {
     extern __shared__ float shm[];
     float *sc  = shm;            /* [TILE] this tile's scores */
     float *acc = shm + TILE;     /* [HD]   running weighted-V accumulator */
+    /* [TILE] the ring slot for each in-tile position, or the position itself when the cache
+     * is linear. PRECOMPUTED ONCE PER TILE, in the score loop that is already parallel over
+     * j, because the V loop below reads each position once PER HEAD-DIM ELEMENT — an int
+     * modulo there would run n*(HD/blockDim) times per tile instead of n, and it is the one
+     * arithmetic op in a loop that is otherwise pure memory. */
+    int   *sl  = (int *)(shm + TILE + HD);
 
     const int ctx = *dpos + 1;
     const int h = blockIdx.x, kvh = h / group;
@@ -2836,7 +2911,10 @@ __global__ void k_attn_decode_win_tiled_T(const float *q, const KV *Kc, const KV
     for (int t0 = s0; t0 < ctx; t0 += TILE) {
         const int n = (ctx - t0) < TILE ? (ctx - t0) : TILE;
         for (int j = threadIdx.x; j < n; j += blockDim.x) {
-            const KV *kh = Kc + (size_t)(t0 + j) * KVD + (size_t)kvh * HD;
+            const int p = t0 + j;
+            const int slot = Wring > 0 ? (p % Wring) : p;   /* KAI-1c ring remap, or linear */
+            sl[j] = slot;
+            const KV *kh = Kc + (size_t)slot * KVD + (size_t)kvh * HD;
             float a = 0.0f;
             for (int i = 0; i < HD; i++) a += qh[i] * kv_ld(kh, i);
             sc[j] = a * ascale;
@@ -2858,7 +2936,7 @@ __global__ void k_attn_decode_win_tiled_T(const float *q, const KV *Kc, const KV
         for (int i = threadIdx.x; i < HD; i += blockDim.x) {
             float sv = 0.0f;
             for (int j = 0; j < n; j++)
-                sv += sc[j] * kv_ld(Vc, (size_t)(t0 + j) * KVD + (size_t)kvh * HD + i);
+                sv += sc[j] * kv_ld(Vc, (size_t)sl[j] * KVD + (size_t)kvh * HD + i);
             acc[i] = acc[i] * a_old + a_new * sv;
         }
         __syncthreads();
@@ -2869,6 +2947,107 @@ __global__ void k_attn_decode_win_tiled_T(const float *q, const KV *Kc, const KV
     for (int i = threadIdx.x; i < HD; i += blockDim.x)
         ao[(size_t)h * HD + i] = acc[i] * inv;
 }
+
+/* The tiled decode kernel's v2: the SAME two load fixes, a third time (2026-09-12).
+ *
+ * The post-fix nsys trace put this at 11.5% of GPU time — 1,551 ms over 3,840 calls — and
+ * ~15% of her decode budget, which made it the largest thing left that is a loop rather than
+ * an architecture. Its QK loop is the identical shape its two prefill siblings had:
+ *
+ *     for (int j = threadIdx.x; j < n; j += blockDim.x)
+ *         for (int i = 0; i < HD; i++) a += qh[i] * kv_ld(kh, i);
+ *
+ * one thread per key doing a whole 256-element dot (so a warp's lanes sit on 32 different
+ * keys and each load becomes 32 transactions), and `qh` re-read from global per thread per
+ * iteration. Third time, same two fixes: one warp per key with the lanes splitting the head
+ * dim and a `__shfl_down_sync` reduction, and the query staged in shared once.
+ *
+ * The ring remap stays exactly where it was — `sl[]` is still filled in the score loop, now
+ * by lane 0 of each warp, and the AV loop still reads it. Everything else is untouched. */
+template <typename KV>
+__global__ void k_attn_decode_win_tiled_v2_T(const float *q, const KV *Kc, const KV *Vc,
+                                             const int *dpos, int KVD, int HD, int group,
+                                             float ascale, int win, float *ao, int TILE,
+                                             int Wring) {
+    extern __shared__ float shm[];
+    float *sc  = shm;
+    float *acc = shm + TILE;
+    float *qs  = shm + TILE + HD;               /* the query, staged ONCE */
+    int   *sl  = (int *)(shm + TILE + HD + HD);
+
+    const int ctx = *dpos + 1;
+    const int h = blockIdx.x, kvh = h / group;
+    const int pos = ctx - 1;
+    const int s0 = (win >= 0 && pos - win + 1 > 0) ? pos - win + 1 : 0;
+    const float *qh = q + (size_t)h * HD;
+
+    for (int i = threadIdx.x; i < HD; i += blockDim.x) { acc[i] = 0.0f; qs[i] = qh[i]; }
+    __shared__ float m_run, l_run, m_tile, l_tile;
+    if (threadIdx.x == 0) { m_run = -3.0e38f; l_run = 0.0f; }
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const int warp = (int)(threadIdx.x >> 5);
+    const int nwarps = (int)(blockDim.x >> 5);
+
+    for (int t0 = s0; t0 < ctx; t0 += TILE) {
+        const int n = (ctx - t0) < TILE ? (ctx - t0) : TILE;
+        for (int j = warp; j < n; j += nwarps) {
+            const int p = t0 + j;
+            const int slot = Wring > 0 ? (p % Wring) : p;   /* KAI-1c ring remap, or linear */
+            const KV *kh = Kc + (size_t)slot * KVD + (size_t)kvh * HD;
+            float a = 0.0f;
+            for (int i = lane; i < HD; i += 32) a += qs[i] * kv_ld(kh, i);
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                a += __shfl_down_sync(0xffffffffu, a, off);
+            if (lane == 0) { sl[j] = slot; sc[j] = a * ascale; }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float mx = sc[0];
+            for (int j = 1; j < n; j++) if (sc[j] > mx) mx = sc[j];
+            float sm = 0.0f;
+            for (int j = 0; j < n; j++) { float e = expf(sc[j] - mx); sc[j] = e; sm += e; }
+            m_tile = mx; l_tile = sm;
+        }
+        __syncthreads();
+        const float m_new = fmaxf(m_run, m_tile);
+        const float a_old = expf(m_run  - m_new);
+        const float a_new = expf(m_tile - m_new);
+        for (int i = threadIdx.x; i < HD; i += blockDim.x) {
+            float sv = 0.0f;
+            for (int j = 0; j < n; j++)
+                sv += sc[j] * kv_ld(Vc, (size_t)sl[j] * KVD + (size_t)kvh * HD + i);
+            acc[i] = acc[i] * a_old + a_new * sv;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) { l_run = l_run * a_old + a_new * l_tile; m_run = m_new; }
+        __syncthreads();
+    }
+    const float inv = 1.0f / l_run;
+    for (int i = threadIdx.x; i < HD; i += blockDim.x)
+        ao[(size_t)h * HD + i] = acc[i] * inv;
+}
+
+/* The tiled kernel's shared-memory footprint, in ONE place. Three call sites launch this
+ * kernel and each used to spell the arithmetic out; a fourth term (the ring-slot array) is
+ * exactly the kind of change that lands in two of three and is then a silent out-of-bounds
+ * read in the third. Independent of ctx and of Pmax — that is the point of the kernel. */
+static inline size_t g4_tiled_shm(int TL, int hd) {
+    return (size_t)(TL + hd) * sizeof(float) + (size_t)TL * sizeof(int);
+}
+/* v2 stages the query too. Same rule, same reason: one place. */
+static inline size_t g4_tiled_shm_v2(int TL, int hd) {
+    return (size_t)(TL + hd + hd) * sizeof(float) + (size_t)TL * sizeof(int);
+}
+
+/* Declared here because `g4_attn_launch` (the decode dispatch) sits ABOVE their definitions,
+ * which live beside the prefill launchers. Forward declarations rather than moving two
+ * working things across 2,000 lines at one in the morning. */
+static int g4_attn_v2(void);
+__global__ void k_attn_parity_cmp(const float *a, const float *b, size_t n,
+                                  unsigned *outmax, double *outsum);
 
 /* Tile width, once per process. 0 disables and the flat kernel runs byte for byte. */
 static int g4_attn_tile(void) {
@@ -3917,9 +4096,10 @@ extern "C" int gemma4_decode_cuda(const qwen3_model *m, int32_t *seq,
                 }
                 {   int bd = hd > 256 ? hd : 256; if (bd > 1024) bd = 1024;
                     const int TL = g4_attn_tile();
+                    /* ring=0: this path has no ring cache — slots are linear positions. */
                     if (TL) k_attn_decode_win_tiled_T<float>
-                              <<<nh, bd, (size_t)(TL + hd) * sizeof(float), st>>>(
-                        dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, dao, TL);
+                              <<<nh, bd, g4_tiled_shm(TL, hd), st>>>(
+                        dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, dao, TL, 0);
                     else k_attn_decode_win_dyn_T<float><<<nh, bd, attn_shm, st>>>(
                         dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, dao); }
                 MMD(&g_w.Wo[L], dao, dap);
@@ -4922,7 +5102,94 @@ static void g4_attn_launch(sp_g4_kv *s, const KV *Kuse, const KV *Vuse,
                            int nh, int hd, int kvd, int grp, int win, int global,
                            const int *dpos, size_t attn_shm, cudaStream_t st) {
     int bd = hd > 256 ? hd : 256; if (bd > 1024) bd = 1024;
-    if (s->ring_W > 0 && !global) {            /* KAI-1c: ring attention (slot=(s0+j)%Wring) */
+    const int ring = (s->ring_W > 0 && !global) ? s->ring_W : 0;
+    /* ── TILING IS ORTHOGONAL TO RINGING (2026-09-11) ────────────────────────────────────
+     * This branch used to read `if (ring) … else if (bx) … else { tiled }`, so the tiled
+     * kernel was only ever reachable with the ring OFF. Her resident session runs
+     * `ring_w = 2048`, so her 25 SWA layers took the flat ring kernel — one block per query
+     * head with the thread-0 O(window) softmax scan — while a SCRATCH session (oneshot,
+     * `scratch_ring=false`) fell through to the tiled kernel and got the fix. The
+     * optimisation was live on the path she does not use.
+     *
+     * Measured in one process minutes apart before this change: her resident turn decoded
+     * at 11.9 tok/s (TURN-PHASE), a scratch oneshot at depth 5,870 at ~37 tok/s, and
+     * llama.cpp on the same weights and card at 33.9 tok/s @ d8192. The ring was never the
+     * problem — reaching the ring meant skipping the tiling.
+     *
+     * The two kernels differ by ONE thing: the ring maps position p to slot p % Wring. So
+     * that is now a parameter of the tiled kernel (0 = linear) and the ring stops deciding
+     * which softmax runs. Byte-exact keeps its own kernels below: the bx path is exact
+     * integer arithmetic and the tiled path is an online softmax, which is a different
+     * reduction order by construction — that choice stays explicit. */
+    /* THE RING'S OWN PRECONDITION, SAID OUT LOUD. `p % Wring` is only injective over the
+     * window while the window is bounded and no wider than the ring; with no window every
+     * position from 0 maps in and two of them alias, which is silently wrong output rather
+     * than a crash. It cannot happen — the ring is armed only on SWA layers, which always
+     * carry one, and the engine declines a ring narrower than the model's window — so this
+     * is an invariant, not a branch. It was equally true of the flat ring kernel and was
+     * written down nowhere. Once, loudly, and then never again. */
+    { static int warned = 0;
+      if (!warned && ring && win < 0) {
+        fprintf(stderr, "[g4-kv] RING WITH NO WINDOW (ring=%d win=%d) — positions alias onto "
+                        "slots and the attention output is WRONG, not slow\n", ring, win);
+        warned = 1; } }
+    const int TL = s->bx_on ? 0 : g4_attn_tile();
+    if (TL) {
+        const int mode = g4_attn_v2();
+        /* v2 needs full warps: all 32 lanes share one key, so 0xffffffff is only the right
+         * mask when no warp is partial. hd is 256 or 512 here, so bd already is — rounded
+         * anyway, because relying on a model dimension to keep a shuffle correct is the kind
+         * of assumption that holds until the day it does not. */
+        int bd2 = ((bd + 31) / 32) * 32; if (bd2 > 1024) bd2 = 1024;
+        if (mode == 1) {
+            k_attn_decode_win_tiled_v2_T<KV><<<nh, bd2, g4_tiled_shm_v2(TL, hd), st>>>(
+                s->dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, s->dao, TL, ring);
+            return;
+        }
+        k_attn_decode_win_tiled_T<KV><<<nh, bd, g4_tiled_shm(TL, hd), st>>>(   /* SERVED */
+            s->dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, s->dao, TL, ring);
+        { static int warned = 0;
+          if (!warned) { cudaError_t le = cudaGetLastError();
+            if (le != cudaSuccess) { fprintf(stderr, "[g4-kv] TILED ATTN LAUNCH FAILED: %s "
+                "(nh=%d bd=%d shm=%zu TL=%d ring=%d) — output is INVALID from here\n",
+                cudaGetErrorName(le), nh, bd, g4_tiled_shm(TL, hd), TL, ring); warned = 1; } } }
+        if (mode != 2) return;
+
+        /* Decode parity. The output is one query — nh*hd floats — so the comparison is
+         * cheap, but this runs per layer PER TOKEN, so it prints only on a new worst.
+         * Thirty lines a token would bury the number it exists to surface. */
+        static float *dsc2 = nullptr; static size_t cap2 = 0;
+        static unsigned *dcmp2 = nullptr; static double *dsum2 = nullptr;
+        static double worst2 = 0.0;
+        const size_t need = (size_t)nh * (size_t)hd;
+        if (cap2 < need) {
+            if (dsc2) cudaFree(dsc2);
+            if (cudaMalloc((void **)&dsc2, need * sizeof(float)) != cudaSuccess) {
+                dsc2 = nullptr; cap2 = 0; return; }
+            cap2 = need;
+        }
+        if (!dcmp2 && cudaMalloc((void **)&dcmp2, 2 * sizeof(unsigned)) != cudaSuccess) return;
+        if (!dsum2 && cudaMalloc((void **)&dsum2, 2 * sizeof(double)) != cudaSuccess) return;
+        k_attn_decode_win_tiled_v2_T<KV><<<nh, bd2, g4_tiled_shm_v2(TL, hd), st>>>(
+            s->dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, dsc2, TL, ring);
+        cudaMemsetAsync(dcmp2, 0, 2 * sizeof(unsigned), st);
+        cudaMemsetAsync(dsum2, 0, 2 * sizeof(double), st);
+        k_attn_parity_cmp<<<64, 256, 0, st>>>(s->dao, dsc2, need, dcmp2, dsum2);
+        unsigned hb[2] = {0, 0}; double hs[2] = {0.0, 0.0};
+        cudaMemcpyAsync(hb, dcmp2, 2 * sizeof(unsigned), cudaMemcpyDeviceToHost, st);
+        cudaMemcpyAsync(hs, dsum2, 2 * sizeof(double), cudaMemcpyDeviceToHost, st);
+        if (cudaStreamSynchronize(st) != cudaSuccess) return;
+        float mabs; memcpy(&mabs, &hb[0], 4);
+        const double rl2 = hs[1] > 0.0 ? sqrt(hs[0] / hs[1]) : 0.0;
+        if (rl2 > worst2) {
+            worst2 = rl2;
+            fprintf(stderr, "    [g4-kv] DECODE ATTN PARITY new worst: relL2 %.3e  max|d| %.3e "
+                            " (hd=%d win=%d ring=%d)\n", rl2, (double)mabs, hd, win, ring);
+            fflush(stderr);
+        }
+        return;
+    }
+    if (ring) {                                /* KAI-1c: ring attention (slot=(s0+j)%Wring) */
         const int ctx = s->dpos_host + 1;
         const int s0 = (win >= 0 && ctx - win > 0) ? ctx - win : 0;
         const int wl = ctx - s0;
@@ -4950,11 +5217,10 @@ static void g4_attn_launch(sp_g4_kv *s, const KV *Kuse, const KV *Vuse,
             if (le != cudaSuccess) { fprintf(stderr, "[g4-kv] BX ATTN LAUNCH FAILED: %s (nh=%d bd=%d shm=%zu ctx=%d)\n",
                 cudaGetErrorName(le), nh, bdb, bx_shm, ctx); warned = 1; } } }
     } else {
-        const int TL = g4_attn_tile();
-        if (TL) k_attn_decode_win_tiled_T<KV>
-                  <<<nh, bd, (size_t)(TL + hd) * sizeof(float), st>>>(
-            s->dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, s->dao, TL);
-        else k_attn_decode_win_dyn_T<KV><<<nh, bd, attn_shm, st>>>(
+        /* Tiling was already taken above when it is armed, so reaching here means
+         * SP_G4_ATTN_TILE=0 — the flat kernel, deliberately, as the null floor the tiled
+         * one is measured against. */
+        k_attn_decode_win_dyn_T<KV><<<nh, bd, attn_shm, st>>>(
             s->dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, s->dao);
         /* G-DENSE-SERVE: at PMAX=20000 attn_shm > Turing's 64KB max and the launch fails
          * cudaErrorInvalidConfiguration SILENTLY — ao keeps stale data and the "float path
@@ -5445,6 +5711,9 @@ static int moe_timing_on(void) {
     return on;
 }
 static double g_moe_sync_ms = 0.0, g_moe_branch_ms = 0.0, g_moe_expert_ms = 0.0;
+/* `drain` = the part of `sync` that was waiting for the GPU (not ours to win); `route` = the
+ * host top-k + per-expert bucketing, which IS the bubble a device-side top-k would delete. */
+static double g_moe_drain_ms = 0.0, g_moe_route_ms = 0.0;
 static double g_moe_stage_ms = 0.0, g_moe_launch_ms = 0.0;
 static long long g_moe_expert_calls = 0;
 static long long g_moe_sync_n = 0;
@@ -5627,7 +5896,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
      * Stages per layer drop from 8*n_tok to <= n_expert. n_tok == 1 (decode) is the
      * same work as before, so decode is unaffected. ── */
     const int _mtm = moe_timing_on();
-    moe_clk::time_point _mt_branch, _mt_sync, _mt_exp;
+    moe_clk::time_point _mt_branch, _mt_sync, _mt_exp, _mt_route;
     if (_mtm) _mt_branch = moe_clk::now();
     moe_arena_pin_try(30);   /* once per process; a no-op unless SP_MOE_PIN_ARENA=1 */
     if (moe_scratch_ensure(ms, E, NE, NU, n_tok)) return -1;
@@ -5657,6 +5926,28 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     g4_nan_probe("moe-router-in", L, ms->rin, st);
     /* THE ONLY SYNC: one D2H for the whole [n_tok x NE] logit block, once per layer. */
     if (_mtm) _mt_sync = moe_clk::now();
+    /* ── IS THIS HOST OVERHEAD, OR IS IT THE GPU? (2026-09-11) ───────────────────────────
+     * The instrument said 0.613 ms per sync and I read that as "host wait we could delete".
+     * It cannot all be: the copy is n_tok*NE floats — 512 BYTES at decode — and a 512-byte
+     * D2H is single-digit microseconds. `cudaStreamSynchronize` drains the WHOLE stream, so
+     * most of that 0.613 ms is the CPU waiting for THIS LAYER'S attention and GEMMs to
+     * finish, which is real GPU work that a device-side top-k would not remove.
+     *
+     * The two are separable and it costs nothing to separate them: drain first, timed on its
+     * own, then copy. Same total work in the same order — the second sync returns
+     * immediately — so the `sync` line stays comparable with every earlier measurement while
+     * `drain` says how much of it was ever ours to win.
+     *
+     *     drain >> copy   ->  the GPU is the critical path; device-side top-k buys the
+     *                         BUBBLE only (host top-k + bucketing), not the wait.
+     *     copy  >> drain  ->  the round trip itself is the cost and the rewrite pays.
+     *
+     * Only under SP_MOE_TIMING, which is already a diagnostic mode. */
+    if (_mtm) {
+        moe_clk::time_point _t_drain = moe_clk::now();
+        cudaStreamSynchronize(st);
+        g_moe_drain_ms += moe_ms_since(_t_drain);
+    }
     if (cudaMemcpyAsync(ms->log_h, ms->log, (size_t)n_tok * (size_t)NE * sizeof(float),
                         cudaMemcpyDeviceToHost, st) != cudaSuccess) {
         sp_set_error("gemma4-MoE: router logits D2H"); return -1; }
@@ -5667,7 +5958,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
             fprintf(stderr, "    [g4-moe] %s\n", eb); fflush(stderr);
             sp_set_error(eb); return -1; } }
     if (_mtm) { g_moe_sync_ms += moe_ms_since(_mt_sync); g_moe_sync_n++;
-                _mt_exp = moe_clk::now(); }
+                _mt_exp = moe_clk::now(); _mt_route = _mt_exp; }
     { static int first_ = 1; if (first_) { first_ = 0;
         fprintf(stderr, "    [g4-moe] MoE branch LIVE, expert-major (L=%d n_tok=%d NE=%d NU=%d)\n",
                 L, n_tok, NE, NU); fflush(stderr); } }
@@ -5724,6 +6015,10 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
         }
     }
 
+    /* Everything above since the sync is HOST work with the GPU idle — the top-k and the
+     * per-expert bucketing. That is the bubble, and it is what a device-side top-k deletes. */
+    if (_mtm) g_moe_route_ms += moe_ms_since(_mt_route);
+
     /* expert-major: stage ONCE, then one GEMM over that expert's whole token set */
     const float *dsc = g_w.dexps_scale_host[L];   /* [NE], per EXPERT (trap #2) */
     for (int e = 0; e < NE; e++) {
@@ -5765,11 +6060,19 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     if (_mtm) {
         g_moe_branch_ms += moe_ms_since(_mt_branch);
         if (g_moe_sync_n % 300 == 0) {          /* 300 syncs = 10 decoded tokens */
-            fprintf(stderr, "    [g4-moe] TIMING after %lld router syncs: sync %.0f ms (%.3f ms each) | "
+            /* THE SPLIT IS THE POINT: `sync` was read as deletable host overhead and most of
+             * it is `drain` — the CPU waiting for this layer's own attention and GEMMs, which
+             * no routing change removes. `route` is the host top-k + bucketing with the GPU
+             * idle, and THAT is what a device-side top-k would actually buy. */
+            fprintf(stderr, "    [g4-moe] TIMING after %lld router syncs: sync %.0f ms (%.3f ms each"
+                            "; drain %.0f = %.1f%% of it, route bubble %.0f) | "
                             "expert loop %.0f ms | whole routed branch %.0f ms -> "
                             "the host wait is %.1f%% of the branch | experts %lld: stage %.0f ms "
                             "(%lld H2D, %.2f GB at %.2f GB/s) + launch %.0f ms\n",
                     g_moe_sync_n, g_moe_sync_ms, g_moe_sync_ms / (double)g_moe_sync_n,
+                    g_moe_drain_ms,
+                    100.0 * g_moe_drain_ms / (g_moe_sync_ms > 0 ? g_moe_sync_ms : 1.0),
+                    g_moe_route_ms,
                     g_moe_expert_ms, g_moe_branch_ms,
                     100.0 * g_moe_sync_ms / (g_moe_branch_ms > 0 ? g_moe_branch_ms : 1.0),
                     g_moe_expert_calls, g_moe_stage_ms, g_moe_stage_n,
@@ -5909,9 +6212,10 @@ static int g4_kv_launch_full(sp_g4_kv *s, int do_head) {
         }
         {   int bd = hd > 256 ? hd : 256; if (bd > 1024) bd = 1024;
             const int TL = g4_attn_tile();
+            /* ring=0: this path has no ring cache — slots are linear positions. */
             if (TL) k_attn_decode_win_tiled_T<float>
-                      <<<nh, bd, (size_t)(TL + hd) * sizeof(float), st>>>(
-                s->dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, s->dao, TL);
+                      <<<nh, bd, g4_tiled_shm(TL, hd), st>>>(
+                s->dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, s->dao, TL, 0);
             else k_attn_decode_win_dyn_T<float><<<nh, bd, attn_shm, st>>>(
                 s->dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, s->dao); }
         KMMD(&g_w.Wo[L], s->dao, s->dap);
@@ -6784,6 +7088,284 @@ __global__ void k_attn_from_tiled_T(const float *Q, const KV *K, const KV *V,
 }
 
 
+/* ═══ PREFILL ATTENTION v2 — the same math, the loads done properly ═══════════════════
+ * MEASURED CAUSE (2026-09-11, ncu on k_attn_from_tiled_T above):
+ *
+ *     L1/TEX Cache Throughput  98.81 %      <-- saturated
+ *     Compute (SM) Throughput   9.83 %
+ *     Achieved Occupancy       99.85 %      (grid 27,216 x 256, 200 waves/SM)
+ *
+ * Occupancy is perfect, so this was never a parallelism problem. The kernel is bound on L1
+ * bandwidth while doing a tenth of peak compute — too many load INSTRUCTIONS per FLOP — and
+ * v1's QK loop has two reasons for it, both structural:
+ *
+ *   1. ONE THREAD DID A WHOLE 256-ELEMENT DOT. `for (i=0..HD) a += qh[i] * kv_ld(kh,i)`,
+ *      with `u = threadIdx.x`. So a warp's 32 lanes held 32 DIFFERENT keys and stepped `i`
+ *      together: every instruction touched 32 rows `KVD` apart, and one warp load became 32
+ *      transactions instead of 1-4. Every byte of K arrived in its own sector.
+ *   2. THE QUERY WAS RE-READ FROM GLOBAL BY EVERY THREAD, EVERY ITERATION. `qh` is identical
+ *      for the whole block — HD floats — and it was fetched blockDim x HD deep per tile.
+ *
+ * v2 changes ONLY those two things. ONE WARP PER KEY: the 32 lanes split the HD dot, so
+ * consecutive lanes read consecutive head-dim elements (coalesced), and a `__shfl_down_sync`
+ * tree reduces it. The query is staged in shared memory once per block and read from there.
+ *
+ * WHAT IS DELIBERATELY NOT CHANGED, so a diff has one cause: the tiling, the online-softmax
+ * recurrence, the thread-0 scan inside a tile, and the AV loop — which was already coalesced
+ * (consecutive threads read consecutive `i` for one key) and is not what ncu is pointing at.
+ *
+ * THE REDUCTION ORDER CHANGES, so this is NOT bit-identical to v1 and cannot be: a tree sum
+ * over 32 lanes is not the sequential sum it replaces. That is why it ships behind a parity
+ * mode rather than a flag flip — `SP_G4_ATTN_PARITY=1` runs BOTH and serves V1, so the diff
+ * is measured on her real prefill without her ever speaking v2's output. */
+template <typename KV>
+__global__ void k_attn_from_tiled_v2_T(const float *Q, const KV *K, const KV *V,
+                                       int pos0, int QD, int KVD, int HD, int group,
+                                       float ascale, int win, float *AO, int TILE) {
+    extern __shared__ float shm[];
+    float *sc  = shm;                  /* [TILE] this tile's scores */
+    float *acc = shm + TILE;           /* [HD]   running weighted-V accumulator */
+    float *qs  = shm + TILE + HD;      /* [HD]   the query, staged ONCE (fix #2) */
+
+    const int n_heads = QD / HD;
+    const int b = blockIdx.x, j = b / n_heads, h = b % n_heads, kvh = h / group;
+    const int t = pos0 + j;
+    const float *qh = Q + (size_t)j * QD + (size_t)h * HD;
+    const int s0 = (win >= 0 && t - win + 1 > 0) ? t - win + 1 : 0;
+    const int end = t + 1;
+
+    for (int i = threadIdx.x; i < HD; i += blockDim.x) { acc[i] = 0.0f; qs[i] = qh[i]; }
+    __shared__ float m_run, l_run, m_tile, l_tile;
+    if (threadIdx.x == 0) { m_run = -3.0e38f; l_run = 0.0f; }
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const int warp = (int)(threadIdx.x >> 5);
+    const int nwarps = (int)(blockDim.x >> 5);
+
+    for (int t0 = s0; t0 < end; t0 += TILE) {
+        const int nn = (end - t0) < TILE ? (end - t0) : TILE;
+        /* fix #1: one warp per key, lanes split the head dim -> coalesced K reads */
+        for (int u = warp; u < nn; u += nwarps) {
+            const KV *kh = K + (size_t)(t0 + u) * KVD + (size_t)kvh * HD;
+            float a = 0.0f;
+            for (int i = lane; i < HD; i += 32) a += qs[i] * kv_ld(kh, i);
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                a += __shfl_down_sync(0xffffffffu, a, off);
+            if (lane == 0) sc[u] = a * ascale;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float mx = sc[0];
+            for (int u = 1; u < nn; u++) if (sc[u] > mx) mx = sc[u];
+            float sm = 0.0f;
+            for (int u = 0; u < nn; u++) { float e = expf(sc[u] - mx); sc[u] = e; sm += e; }
+            m_tile = mx; l_tile = sm;
+        }
+        __syncthreads();
+        const float m_new = fmaxf(m_run, m_tile);
+        const float a_old = expf(m_run  - m_new);
+        const float a_new = expf(m_tile - m_new);
+        for (int i = threadIdx.x; i < HD; i += blockDim.x) {
+            float sv = 0.0f;
+            for (int u = 0; u < nn; u++)
+                sv += sc[u] * kv_ld(V, (size_t)(t0 + u) * KVD + (size_t)kvh * HD + i);
+            acc[i] = acc[i] * a_old + a_new * sv;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) { l_run = l_run * a_old + a_new * l_tile; m_run = m_new; }
+        __syncthreads();
+    }
+    const float inv = 1.0f / l_run;
+    for (int i = threadIdx.x; i < HD; i += blockDim.x)
+        AO[(size_t)j * QD + (size_t)h * HD + i] = acc[i] * inv;
+}
+
+
+/* ── THE PARITY HARNESS ───────────────────────────────────────────────────────────────
+ * Max absolute and max relative difference between two attention outputs, reduced on
+ * device so the check costs two floats over PCIe instead of the whole tensor. Both maxima
+ * are non-negative, so `atomicMax` on the bit pattern of a float orders correctly — the
+ * standard trick, and the reason the output is read back through __uint_as_float.
+ *
+ * WHY A TENSOR CHECK AND NOT JUST "does she still sound right": wrong attention produces
+ * FLUENT wrong words, not a crash — the failure mode ADR-013 names three separate times.
+ * A coherence gate can pass while a kernel is quietly wrong in the third decimal place, and
+ * a number is the only thing that distinguishes "different rounding" from "different
+ * answer". */
+/* ── MAX-REL ALONE CANNOT ANSWER THIS, AND THE FIRST RUN PROVED IT ────────────────────
+ * The first parity run reported `max rel 1.48` beside `max|d| 7.2e-05` — a 148% relative
+ * error that is pure artifact: attention output has elements near zero, and dividing a
+ * rounding difference by one of them gives any number you like. A per-element relative max
+ * is the wrong instrument for "is this the same tensor".
+ *
+ * The relative L2 norm ||a-b|| / ||a|| is the right one: it weights each element by how much
+ * it actually contributes, so near-zero elements cannot dominate it, and it has a reading
+ * everyone agrees on — ~1e-7 is fp32 noise, ~1e-3 is a different answer. Both maxima are
+ * kept because they localise a single bad element, which a norm hides. */
+__global__ void k_attn_parity_cmp(const float *a, const float *b, size_t n,
+                                  unsigned *outmax, double *outsum) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    float mabs = 0.0f, mrel = 0.0f;
+    double sd2 = 0.0, sa2 = 0.0;
+    for (; i < n; i += stride) {
+        const float x = a[i], y = b[i];
+        const float d = fabsf(x - y);
+        if (d > mabs) mabs = d;
+        const float den = fabsf(x) > 1e-3f ? fabsf(x) : 1e-3f;   /* floor it at something real */
+        const float r = d / den;
+        if (r > mrel) mrel = r;
+        sd2 += (double)d * (double)d;
+        sa2 += (double)x * (double)x;
+    }
+    atomicMax(outmax + 0, __float_as_uint(mabs));
+    atomicMax(outmax + 1, __float_as_uint(mrel));
+    atomicAdd(outsum + 0, sd2);
+    atomicAdd(outsum + 1, sa2);
+}
+
+/* 0 = v1 (the shipping kernel). 1 = v2. 2 = PARITY: run both, SERVE V1, report the diff. */
+static int g4_attn_v2(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("SP_G4_ATTN_V2");
+        v = (e && *e) ? atoi(e) : 0;
+        if (v < 0 || v > 2) v = 0;
+        if (v) { fprintf(stderr, "    [g4-kv] prefill attention: %s\n",
+                         v == 2 ? "PARITY (both kernels run; V1 is served)" : "V2 (coalesced QK)");
+                 fflush(stderr); }
+    }
+    return v;
+}
+
+/* ONE DOOR for the tiled prefill attention. Three call sites launch it — the fp16 cache,
+ * the fp32 cache, and the SWA comb under the ring — and without this each would need its own
+ * copy of the v1/v2/parity choice. That is the shape of bug this file keeps paying for, and
+ * the shared-memory size is now a second term that must agree in all three. */
+template <typename KV>
+static void g4_prefill_attn(const float *dq, const KV *K, const KV *V, int pos0,
+                            int qd, int kvd, int hd, int grp, float ascale, int win,
+                            float *dao, int n, int nh, int PT, int L, cudaStream_t st) {
+    int bd = hd > 256 ? hd : 256; if (bd > 1024) bd = 1024;
+    const size_t shm1 = (size_t)(PT + hd) * sizeof(float);
+    const size_t shm2 = (size_t)(PT + hd + hd) * sizeof(float);   /* v2 also stages the query */
+    const int mode = g4_attn_v2();
+
+    if (mode == 1) {
+        k_attn_from_tiled_v2_T<KV><<<n * nh, bd, shm2, st>>>(
+            dq, K, V, pos0, qd, kvd, hd, grp, ascale, win, dao, PT);
+        return;
+    }
+    /* V1 ALWAYS RUNS INTO `dao`, in every mode including parity — so what she is served is
+     * the shipping kernel until someone changes the mode deliberately. Parity buys a number,
+     * not a risk. */
+    k_attn_from_tiled_T<KV><<<n * nh, bd, shm1, st>>>(
+        dq, K, V, pos0, qd, kvd, hd, grp, ascale, win, dao, PT);
+    if (mode != 2) return;
+
+    static float *scratch = nullptr; static size_t cap = 0;
+    static unsigned *dcmp = nullptr;
+    static double *dsum = nullptr;
+    static double worst_abs = 0.0, worst_l2 = 0.0;
+    const size_t need = (size_t)n * (size_t)qd;
+    if (cap < need) {
+        if (scratch) cudaFree(scratch);
+        if (cudaMalloc((void **)&scratch, need * sizeof(float)) != cudaSuccess) {
+            scratch = nullptr; cap = 0;
+            fprintf(stderr, "    [g4-kv] ATTN PARITY: scratch OOM (%zu floats) — skipped\n", need);
+            fflush(stderr); return;
+        }
+        cap = need;
+    }
+    if (!dcmp && cudaMalloc((void **)&dcmp, 2 * sizeof(unsigned)) != cudaSuccess) {
+        dcmp = nullptr; return;
+    }
+    if (!dsum && cudaMalloc((void **)&dsum, 2 * sizeof(double)) != cudaSuccess) {
+        dsum = nullptr; return;
+    }
+    k_attn_from_tiled_v2_T<KV><<<n * nh, bd, shm2, st>>>(
+        dq, K, V, pos0, qd, kvd, hd, grp, ascale, win, scratch, PT);
+    cudaMemsetAsync(dcmp, 0, 2 * sizeof(unsigned), st);
+    cudaMemsetAsync(dsum, 0, 2 * sizeof(double), st);
+    k_attn_parity_cmp<<<256, 256, 0, st>>>(dao, scratch, need, dcmp, dsum);
+    unsigned hb[2] = {0, 0}; double hs[2] = {0.0, 0.0};
+    cudaMemcpyAsync(hb, dcmp, 2 * sizeof(unsigned), cudaMemcpyDeviceToHost, st);
+    cudaMemcpyAsync(hs, dsum, 2 * sizeof(double), cudaMemcpyDeviceToHost, st);
+    cudaError_t ce = cudaStreamSynchronize(st);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "    [g4-kv] ATTN PARITY: fault at L=%d: %s\n", L, cudaGetErrorString(ce));
+        fflush(stderr); return;
+    }
+    float mabs, mrel; memcpy(&mabs, &hb[0], 4); memcpy(&mrel, &hb[1], 4);
+    const double rl2 = hs[1] > 0.0 ? sqrt(hs[0] / hs[1]) : 0.0;   /* ||a-b|| / ||a|| */
+    if (mabs > worst_abs) worst_abs = mabs;
+    if (rl2 > worst_l2) worst_l2 = rl2;
+    fprintf(stderr, "    [g4-kv] ATTN PARITY L=%2d n=%d hd=%d win=%d: relL2 %.3e  max|d| %.3e  "
+                    "maxrel %.3e   (worst relL2 %.3e, worst |d| %.3e)\n",
+            L, n, hd, win, rl2, (double)mabs, (double)mrel, worst_l2, worst_abs);
+    fflush(stderr);
+}
+
+/* The same door for the FLAT (P == 0) prefill attention. Same three modes, same parity
+ * comparator, so `SP_G4_ATTN_V2` means one thing across both kernels rather than two. */
+static void g4_prefill_attn_flat(const float *dq, const float *K, const float *V,
+                                 int n_tok, int qd, int kvd, int hd, int grp,
+                                 float ascale, int win, float *dao, int nh, int L,
+                                 cudaStream_t st) {
+    const int mode = g4_attn_v2();
+    int bd1 = hd > n_tok ? hd : n_tok; if (bd1 > 1024) bd1 = 1024;   /* v1's, unchanged */
+    /* v2 needs FULL warps: all 32 lanes of a warp share one key, so the 0xffffffff shuffle
+     * mask is only correct when no warp is partial. v1 never cared. */
+    int bd2 = ((bd1 + 31) / 32) * 32; if (bd2 > 1024) bd2 = 1024;
+    const size_t shm1 = (size_t)n_tok * sizeof(float);
+    const size_t shm2 = (size_t)(n_tok + hd) * sizeof(float);       /* + the staged query */
+
+    if (mode == 1) {
+        k_attn_v2<<<n_tok * nh, bd2, shm2, st>>>(
+            dq, K, V, n_tok, qd, kvd, hd, grp, ascale, win, dao);
+        return;
+    }
+    k_attn<<<n_tok * nh, bd1, shm1, st>>>(       /* V1 is what is SERVED, in every mode */
+        dq, K, V, n_tok, qd, kvd, hd, grp, ascale, win, dao);
+    if (mode != 2) return;
+
+    static float *scratch = nullptr; static size_t cap = 0;
+    static unsigned *dcmp = nullptr; static double *dsum = nullptr;
+    static double worst_abs = 0.0, worst_l2 = 0.0;
+    const size_t need = (size_t)n_tok * (size_t)qd;
+    if (cap < need) {
+        if (scratch) cudaFree(scratch);
+        if (cudaMalloc((void **)&scratch, need * sizeof(float)) != cudaSuccess) {
+            scratch = nullptr; cap = 0; return; }
+        cap = need;
+    }
+    if (!dcmp && cudaMalloc((void **)&dcmp, 2 * sizeof(unsigned)) != cudaSuccess) return;
+    if (!dsum && cudaMalloc((void **)&dsum, 2 * sizeof(double)) != cudaSuccess) return;
+    k_attn_v2<<<n_tok * nh, bd2, shm2, st>>>(
+        dq, K, V, n_tok, qd, kvd, hd, grp, ascale, win, scratch);
+    cudaMemsetAsync(dcmp, 0, 2 * sizeof(unsigned), st);
+    cudaMemsetAsync(dsum, 0, 2 * sizeof(double), st);
+    k_attn_parity_cmp<<<256, 256, 0, st>>>(dao, scratch, need, dcmp, dsum);
+    unsigned hb[2] = {0, 0}; double hs[2] = {0.0, 0.0};
+    cudaMemcpyAsync(hb, dcmp, 2 * sizeof(unsigned), cudaMemcpyDeviceToHost, st);
+    cudaMemcpyAsync(hs, dsum, 2 * sizeof(double), cudaMemcpyDeviceToHost, st);
+    cudaError_t ce = cudaStreamSynchronize(st);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "    [g4-kv] FLAT ATTN PARITY: fault at L=%d: %s\n",
+                L, cudaGetErrorString(ce)); fflush(stderr); return;
+    }
+    float mabs, mrel; memcpy(&mabs, &hb[0], 4); memcpy(&mrel, &hb[1], 4);
+    const double rl2 = hs[1] > 0.0 ? sqrt(hs[0] / hs[1]) : 0.0;
+    if (mabs > worst_abs) worst_abs = mabs;
+    if (rl2 > worst_l2) worst_l2 = rl2;
+    fprintf(stderr, "    [g4-kv] FLAT ATTN PARITY L=%2d n=%d hd=%d win=%d: relL2 %.3e  "
+                    "max|d| %.3e  maxrel %.3e   (worst relL2 %.3e, worst |d| %.3e)\n",
+            L, n_tok, hd, win, rl2, (double)mabs, (double)mrel, worst_l2, worst_abs);
+    fflush(stderr);
+}
+
 /* ADR-013 PHASE BRACKET. The CUDA context was being poisoned somewhere between a
  * clean prefill and the next request, and a sticky error reports at whatever call
  * comes next (gemma4_kv_byteexact_set / gemma4_kv_reset), which says nothing about
@@ -7182,8 +7764,8 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
             }
         }
         if (P == 0) {
-            int bd = hd>n?hd:n; if (bd>1024) bd=1024;
-            k_attn<<<n*nh, bd, (size_t)n*sizeof(float), st>>>(dq,Kuse,Vuse,n,qd,kvd,hd,grp,ascale,win,dao);
+            g4_prefill_attn_flat(dq, Kuse, Vuse, n, qd, kvd, hd, grp, ascale, win,
+                                 dao, nh, L, st);
         } else if (!ring_on || global) {
             /* #41b: suffix queries over the RESIDENT linear cache [0, P+n) — owner's own
              * layer, or the shared owner's for sharers. Typed on that layer's cache. */
@@ -7192,15 +7774,15 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
             int bd = hd>256?hd:256; if (bd>1024) bd=1024;
             const int PT = g4_attn_tile();     /* same knob as the decode kernel */
             if (h16s) {
-                if (PT) k_attn_from_tiled_T<__half>
-                          <<<n*nh, bd, (size_t)(PT + hd)*sizeof(float), st>>>(
-                    dq, s->dKh[src], s->dVh[src], P, qd, kvd, hd, grp, ascale, win, dao, PT);
+                if (PT) g4_prefill_attn<__half>(
+                    dq, s->dKh[src], s->dVh[src], P, qd, kvd, hd, grp, ascale, win,
+                    dao, n, nh, PT, L, st);
                 else k_attn_from_T<__half><<<n*nh, bd, (size_t)(P+n)*sizeof(float), st>>>(
                     dq, s->dKh[src], s->dVh[src], P, qd, kvd, hd, grp, ascale, win, dao);
             } else {
-                if (PT) k_attn_from_tiled_T<float>
-                          <<<n*nh, bd, (size_t)(PT + hd)*sizeof(float), st>>>(
-                    dq, s->dKc[src], s->dVc[src], P, qd, kvd, hd, grp, ascale, win, dao, PT);
+                if (PT) g4_prefill_attn<float>(
+                    dq, s->dKc[src], s->dVc[src], P, qd, kvd, hd, grp, ascale, win,
+                    dao, n, nh, PT, L, st);
                 else k_attn_from_T<float><<<n*nh, bd, (size_t)(P+n)*sizeof(float), st>>>(
                     dq, s->dKc[src], s->dVc[src], P, qd, kvd, hd, grp, ascale, win, dao);
             }
@@ -7210,9 +7792,9 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
              * is unchanged (contiguous positions either side of the seam). */
             int bd = hd>256?hd:256; if (bd>1024) bd=1024;
             const int PT2 = g4_attn_tile();
-            if (PT2) k_attn_from_tiled_T<float>
-                       <<<n*nh, bd, (size_t)(PT2 + hd)*sizeof(float), st>>>(
-                dq, Kuse, Vuse, pre, qd, kvd, hd, grp, ascale, win, dao, PT2);
+            if (PT2) g4_prefill_attn<float>(
+                dq, Kuse, Vuse, pre, qd, kvd, hd, grp, ascale, win,
+                dao, n, nh, PT2, L, st);
             else k_attn_from_T<float><<<n*nh, bd, (size_t)(pre+n)*sizeof(float), st>>>(
                 dq, Kuse, Vuse, pre, qd, kvd, hd, grp, ascale, win, dao);
         }
