@@ -1405,6 +1405,44 @@ __global__ void k_dequant_arena_q4b(const unsigned char *codes, const unsigned l
     out[(size_t)j * cols + i] = (float)code * s;
 }
 
+/* ── THE SAME DEQUANT, WRITING __half (2026-09-12) ────────────────────────────────────
+ * Turing sm_75 has tensor cores for fp16 and NONE for fp32 (TF32 is Ampere and later), so
+ * `cublasSgemm` — `volta_sgemm_128x64_tn`, 24.2% of GPU time in the post-attention trace —
+ * runs on the FP32 pipes while the tensor cores sit idle. Feeding cuBLAS fp16 operands with
+ * an fp32 accumulator moves that GEMM onto hardware this engine has never used.
+ *
+ * Dequanting STRAIGHT to half rather than converting afterwards: the point is bandwidth, and
+ * a second full in*out pass to convert would spend most of what the format saves. The write
+ * is halved (2 B/weight instead of 4) and so is the read cuBLAS then does.
+ *
+ * PRECISION. The value written is `code * scale` where `code` is a 4-bit integer in [-8, 7]
+ * and `scale` is ALREADY an fp16 in the arena (`__ushort_as_half`), so the product is exact
+ * in fp16 to within one rounding of a value that was fp16 to begin with — this is a far
+ * smaller change than the int8-activation path measured earlier tonight. The activations are
+ * the real question, and they are what the parity mode exists to answer. */
+__global__ void k_dequant_arena_q4b_h(const unsigned char *codes, const unsigned long long *row_off,
+                                      const unsigned short *bscale, int bs_nblk,
+                                      int rows, int cols, __half *out) {
+    int j = blockIdx.x;
+    int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (j >= rows || i >= cols) return;
+    const unsigned char *rc = codes + row_off[j];
+    unsigned char byte = rc[i >> 1];
+    int nib  = (i & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+    int code = (nib ^ 8) - 8;
+    float s = __half2float(__ushort_as_half(bscale[(size_t)j * bs_nblk + (i >> 5)]));
+    out[(size_t)j * cols + i] = __float2half((float)code * s);
+}
+
+/* fp32 -> fp16, elementwise. The activation side: `in * n_tok` values, which is small beside
+ * the weights (2,816 x 2,048 against 2,816 x 2,112 for one FFN matrix) and is the only extra
+ * pass this path adds. */
+__global__ void k_f32_to_f16(const float *src, __half *dst, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) dst[i] = __float2half(src[i]);
+}
+
 /* ═══════════════ BETA.3a: fused INT8 GEMV for decode (dp4a) ═══════════════
  * The decode path is M=1 (single-token GEMV), so the m8n8k16 tensor-core tile
  * (ptx_mma.cuh) can't help — a 1-row query fills 1/8 of the MMA_M tile. The
@@ -9724,16 +9762,140 @@ static int gemv_t(cublasHandle_t h, const float *dW, const float *dX, float *dY,
 
 /* matmul through a DevTensor: f32 weights go straight to SGEMM; packed weights
  * are decoded to `scratch` first (decode-on-demand). */
+/* 0 = fp32 SGEMM (shipping). 1 = fp16 tensor-core GEMM. 2 = PARITY: run both, SERVE FP32. */
+static int g4_gemm_f16(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("SP_G4_GEMM_F16");
+        v = (e && *e) ? atoi(e) : 0;
+        if (v < 0 || v > 2) v = 0;
+        if (v) { fprintf(stderr, "    [g4-gemm] weight GEMM: %s\n",
+                         v == 2 ? "PARITY (fp16 and fp32 both run; fp32 is served)"
+                                : "FP16 tensor-core (cublasGemmEx, fp32 accumulate)");
+                 fflush(stderr); }
+    }
+    return v;
+}
+
+/* The fp16 twin of `gemm`. Operands fp16, accumulator and output fp32 — `CUBLAS_COMPUTE_32F`
+ * with `CUDA_R_16F` inputs is the tensor-core path on sm_75, and keeping C in fp32 means the
+ * only precision change is in the operands, not in the sum over `in`. */
+static int gemm_h16(cublasHandle_t h, const __half *dW, const __half *dX, float *dY,
+                    int n_tok, int in, int out) {
+    const float a = 1.0f, b = 0.0f;
+    cublasStatus_t st_ = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, out, n_tok, in,
+                                      &a, dW, CUDA_R_16F, in, dX, CUDA_R_16F, in,
+                                      &b, dY, CUDA_R_32F, out,
+                                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st_ != CUBLAS_STATUS_SUCCESS) {
+        static int warned = 0;
+        if (!warned) { fprintf(stderr, "    [g4-gemm] cublasGemmEx(fp16) FAILED status=%d "
+                                       "m=%d n=%d k=%d — falling back to fp32\n",
+                               (int)st_, out, n_tok, in); fflush(stderr); warned = 1; }
+        return 1;
+    }
+    return 0;
+}
+
+/* Device scratch for the fp16 path, grown on demand. STRICTLY SMALLER than the fp32 scratch
+ * the caller already owns for the same matrix (2 B/weight against 4), so a matrix whose fp32
+ * dequant fits cannot fail to fit here. */
+static __half *g_f16_w = NULL; static size_t g_f16_w_cap = 0;
+static __half *g_f16_x = NULL; static size_t g_f16_x_cap = 0;
+static int f16_scratch(size_t nw, size_t nx) {
+    if (g_f16_w_cap < nw) {
+        if (g_f16_w) cudaFree(g_f16_w);
+        if (cudaMalloc((void **)&g_f16_w, nw * sizeof(__half)) != cudaSuccess) {
+            g_f16_w = NULL; g_f16_w_cap = 0; return 1; }
+        g_f16_w_cap = nw;
+    }
+    if (g_f16_x_cap < nx) {
+        if (g_f16_x) cudaFree(g_f16_x);
+        if (cudaMalloc((void **)&g_f16_x, nx * sizeof(__half)) != cudaSuccess) {
+            g_f16_x = NULL; g_f16_x_cap = 0; return 1; }
+        g_f16_x_cap = nx;
+    }
+    return 0;
+}
+
+/* Declared here because the comparator is defined beside the attention launchers, far below.
+ * Same reduction, same two floats back over PCIe. */
+__global__ void k_attn_parity_cmp(const float *a, const float *b, size_t n,
+                                  unsigned *outmax, double *outsum);
+
+/* PARITY for the weight GEMM: run the fp16 path into a scratch Y and compare against the
+ * fp32 Y that was ALREADY COMPUTED AND SERVED. Same contract as the attention parity — the
+ * shipping path is what reaches her; this only buys a number.
+ *
+ * Prints on a new worst only. This runs on every weight matmul of every layer, which is
+ * thousands of calls per prefill; a line each would bury the one that matters. */
+static void g4_gemm_parity(cublasHandle_t h, cudaStream_t st, const DevTensor *W,
+                           const float *dX, const float *dY_ref, int n_tok) {
+    static float *dY16 = NULL; static size_t capY = 0;
+    static unsigned *dcmp = NULL; static double *dsum = NULL;
+    static double worst = 0.0;
+    const size_t ny = (size_t)W->out * (size_t)n_tok;
+    if (f16_scratch((size_t)W->out * (size_t)W->in, (size_t)W->in * (size_t)n_tok)) return;
+    if (capY < ny) {
+        if (dY16) cudaFree(dY16);
+        if (cudaMalloc((void **)&dY16, ny * sizeof(float)) != cudaSuccess) {
+            dY16 = NULL; capY = 0; return; }
+        capY = ny;
+    }
+    if (!dcmp && cudaMalloc((void **)&dcmp, 2 * sizeof(unsigned)) != cudaSuccess) return;
+    if (!dsum && cudaMalloc((void **)&dsum, 2 * sizeof(double)) != cudaSuccess) return;
+
+    dim3 grid(W->out, (W->in + 255) / 256);
+    k_dequant_arena_q4b_h<<<grid, 256, 0, st>>>(W->codes, W->row_off, W->bscale,
+                                                W->bs_nblk, W->out, W->in, g_f16_w);
+    const size_t nx = (size_t)W->in * (size_t)n_tok;
+    unsigned xb = (unsigned)((nx + 255) / 256); if (xb > 1024u) xb = 1024u;
+    k_f32_to_f16<<<xb, 256, 0, st>>>(dX, g_f16_x, nx);
+    if (cudaGetLastError() != cudaSuccess) return;
+    if (gemm_h16(h, g_f16_w, g_f16_x, dY16, n_tok, W->in, W->out)) return;
+
+    cudaMemsetAsync(dcmp, 0, 2 * sizeof(unsigned), st);
+    cudaMemsetAsync(dsum, 0, 2 * sizeof(double), st);
+    k_attn_parity_cmp<<<128, 256, 0, st>>>(dY_ref, dY16, ny, dcmp, dsum);
+    unsigned hb[2] = {0, 0}; double hs[2] = {0.0, 0.0};
+    cudaMemcpyAsync(hb, dcmp, 2 * sizeof(unsigned), cudaMemcpyDeviceToHost, st);
+    cudaMemcpyAsync(hs, dsum, 2 * sizeof(double), cudaMemcpyDeviceToHost, st);
+    if (cudaStreamSynchronize(st) != cudaSuccess) return;
+    float mabs; memcpy(&mabs, &hb[0], 4);
+    const double rl2 = hs[1] > 0.0 ? sqrt(hs[0] / hs[1]) : 0.0;
+    if (rl2 > worst) {
+        worst = rl2;
+        fprintf(stderr, "    [g4-gemm] FP16 GEMM PARITY new worst: relL2 %.3e  max|d| %.3e "
+                        " (in=%d out=%d n_tok=%d)\n", rl2, (double)mabs, W->in, W->out, n_tok);
+        fflush(stderr);
+    }
+}
+
 static int gemm_w(cublasHandle_t h, cudaStream_t st, const DevTensor *W,
                   const float *dX, float *dY, int n_tok, float *scratch) {
     if (W->f32) return gemm(h, W->f32, dX, dY, n_tok, W->in, W->out);
     dim3 grid(W->out, (W->in + 255) / 256);   /* rows on grid.x (V can exceed 65535) */
     if (W->bscale) {                          /* OK_Q4B: exact dequant, no post-lift */
+        const int f16 = g4_gemm_f16();
+        if (f16 == 1 &&
+            !f16_scratch((size_t)W->out * (size_t)W->in, (size_t)W->in * (size_t)n_tok)) {
+            k_dequant_arena_q4b_h<<<grid, 256, 0, st>>>(W->codes, W->row_off, W->bscale,
+                                                        W->bs_nblk, W->out, W->in, g_f16_w);
+            const size_t nx = (size_t)W->in * (size_t)n_tok;
+            k_f32_to_f16<<<(unsigned)((nx + 255) / 256 > 1024 ? 1024 : (nx + 255) / 256),
+                           256, 0, st>>>(dX, g_f16_x, nx);
+            if (cudaGetLastError() == cudaSuccess &&
+                !gemm_h16(h, g_f16_w, g_f16_x, dY, n_tok, W->in, W->out))
+                return 0;
+            /* anything above went wrong: fall through to the fp32 path, which is intact */
+        }
         k_dequant_arena_q4b<<<grid, 256, 0, st>>>(W->codes, W->row_off, W->bscale,
                                                   W->bs_nblk, W->out, W->in, scratch);
         cudaError_t lq = cudaGetLastError();
         if (lq != cudaSuccess) return fail_cuda(lq, "k_dequant_arena_q4b launch");
-        return gemm(h, scratch, dX, dY, n_tok, W->in, W->out);
+        if (gemm(h, scratch, dX, dY, n_tok, W->in, W->out)) return 1;
+        if (f16 == 2) g4_gemm_parity(h, st, W, dX, dY, n_tok);
+        return 0;
     }
     k_dequant_arena<<<grid, 256, 0, st>>>(W->codes, W->row_off, W->row_scale, W->row_prec,
                                           W->out, W->in, scratch);

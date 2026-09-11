@@ -61,11 +61,23 @@ hand-tuned cuBLAS assembly; `k_gemm_q4b_dp4a` is a custom kernel. llama.cpp's ad
 the weight format, it is that `mul_mat_vec_q` is a very good kernel — swapping format without
 matching the tuning loses.
 
-**The untested option is fp16 with tensor cores**: dequantise to `__half` rather than `float`
-and run `cublasGemmEx(CUDA_R_16F, …, CUBLAS_COMPUTE_32F)`. Turing sm_75 has tensor cores for
-fp16 and none for fp32, so the engine currently uses none of them; this would halve the
-dequant write bandwidth and put the GEMM on hardware that is idle today. That is the next
-experiment, and unlike the one above it has not been tried.
+**fp16 with tensor cores WAS the lever — tested and armed 2026-09-12.** Turing sm_75 has
+tensor cores for fp16 and none for fp32, so `cublasSgemm` ran on the fp32 pipes while they sat
+idle. `k_dequant_arena_q4b_h` writes `__half` and `cublasGemmEx(CUDA_R_16F, …,
+CUBLAS_COMPUTE_32F)` does the GEMM; **the accumulator stays fp32**, so only the operands change
+precision, and the dequant emits half directly rather than converting afterwards (a second
+`in*out` pass would spend most of what the format saves).
+
+| 3,750-token prefill | fp32 | fp16 |
+|---|---:|---:|
+| | 15,750 / 17,815 ms | **13,021 / 13,650 ms** |
+
+**~1.26×, with byte-identical output text** over four runs at temperature 0 — the distinction
+from the int8 path above, which was slower *and* changed what the model said. Parity worst
+**relL2 4.5e-04**, which is fp16 operand precision and is recorded as a real numerical change
+rather than noise.
+
+`SP_G4_GEMM_F16`: `0` fp32, `1` fp16 tensor-core, `2` parity (both run, fp32 served).
 
 **Zoo map:** [JOURNEY.md](https://github.com/nihilistau/Position_Is_Arithmetic/blob/main/JOURNEY.md)
 
