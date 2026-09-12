@@ -300,15 +300,57 @@ runs at depth 0 and reports 41.19 tok/s, which would have flattered this engine 
 cold-context decode against a 3,720-token one. Measuring it at `-d 3720` is what makes the
 number mean anything.
 
-So the next piece of work is **decode**, and the suspects are named rather than picked: per-step
-launch overhead across 30 layers, the expert stage and its host sync, and WDDM. That is a
-hypothesis with an instrument attached, not a third claim about where the time goes — the last
-two such claims were both wrong, and both were killed by a trace rather than by argument.
+So the next piece of work is **decode** — and it has since been traced. See *inside decode*
+below: it is host→device expert traffic, not the kernels.
 
 **What this comparison is not.** `llama.cpp` with `-ncmoe 8` keeps eight layers' experts on the
 CPU and computes them there; this engine streams experts from a pinned host arena to the GPU.
 Different strategies for the same shortage of VRAM, compared on wall-clock for the same job,
 which is the only axis a user experiences.
+
+### inside decode: it is the bus, not the kernels (nsys, 2026-09-12)
+
+The table above says decode is the whole remaining gap. It does not say what decode spends it
+on, so this is a trace rather than a fourth theory. One call — 3,723-token prefill then **384
+generated tokens**, armed kernels, expert cache warmed first — captured in a 75 s window sized
+to hold exactly that call.
+
+| | |
+|---|---:|
+| the traced call, wall | **38,358 ms** |
+| GPU **kernel** time, all 46 kernels | 15,137 ms |
+| **host→device memcpy** time | **13,535 ms** |
+| bytes host→device | **81.4 GB**, in **295,952 copies** |
+| `cudaMemcpyAsync` | 27,917 ms of API time, 309,827 calls — **75.7% of all CUDA API time** |
+| `cudaLaunchKernel` | 8,127 ms, **1,121,051 launches** |
+
+**81.4 GB across the bus for one answer.** The copies are small and numerous — mean 275 KB,
+median near zero — so the transfer runs at about **6.0 GB/s against the 9.33 GB/s this link
+measures at**. The engine is not waiting on arithmetic; it is waiting on expert weights.
+
+The kernel profile says the same thing from the other side:
+
+    k_gemv_q4b_dp4a_v2          2,724 ms   262,613 calls    10.4 us each
+    k_attn_decode_win_tiled_v2  2,114 ms    11,502 calls   183.8 us
+    k_dequant_arena_q4b_h       1,176 ms    14,728 calls
+    k_quant_act_int8              725 ms   262,996 calls     2.8 us
+
+262,613 expert GEMVs for 384 tokens is **684 per token, ~23 per layer** — eight experts times
+gate/up/down, launched one at a time. Each one runs for **10.4 µs**. At that size the kernel is
+not the unit of work that matters; the launch and the copy that feeds it are.
+
+**Why `llama.cpp` wins decode, concretely.** `-ncmoe 8` does not have a better expert kernel —
+it keeps eight layers' experts **on the CPU and computes them there**, so those weights never
+cross PCIe at all. Its decode advantage is traffic it does not generate. That is the same
+mechanism established here on 2026-09-11, now measured from this side.
+
+**Three candidates, and this file is not picking one.** Coalescing the 295,952 copies into
+fewer larger ones (the gap between 6.0 and 9.33 GB/s is real and addressable); batching the
+per-expert GEMVs so one launch covers all eight; or computing some layers' experts host-side
+the way `llama.cpp` does. A bigger device cache was measured on 2026-09-11 and bought 3–4%,
+which is evidence against the simplest of the three. The last three confident answers about
+"where the remaining time goes" were each wrong and each died to an instrument, so these stay
+candidates until one of them is a pair of runs.
 
 ## Against `llama.cpp`, honestly
 

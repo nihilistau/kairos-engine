@@ -25,10 +25,11 @@ operator's experience of it: nothing here publishes an uptime receipt.
 
 The kernels are worth **2.12× end to end** — *not* the ~2.7× that appeared here previously,
 which was two speedups measured on different prompts at different times and added together.
-Prefill is a **1.16× lead**; decode is a **2.37× deficit**, depth-matched. **Decode is the whole
-remaining gap and the next piece of work**, and the suspects (per-step launch overhead over 30
-layers, the expert stage and its host sync, WDDM) are named as suspects, not as a diagnosis.
-The last two confident claims about "most of the remaining gap" were both wrong.
+Prefill is a **1.16× lead**; decode is a **2.37× deficit**, depth-matched. **Decode is the whole remaining gap**, and it has been traced: in one 38.4 s call the GPU spent
+15.1 s in kernels and **13.5 s receiving 81.4 GB of expert weights across PCIe** in 295,952
+copies, at ~6.0 GB/s against a 9.33 GB/s link. It is the bus, not the kernels — which is also
+exactly why `llama.cpp -ncmoe 8` wins decode: it computes those experts on the CPU and never
+sends them. Candidates are in the README; none is claimed as *the* answer yet.
 
 ## CI (2026-09-12)
 
