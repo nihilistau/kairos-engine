@@ -344,13 +344,53 @@ it keeps eight layers' experts **on the CPU and computes them there**, so those 
 cross PCIe at all. Its decode advantage is traffic it does not generate. That is the same
 mechanism established here on 2026-09-11, now measured from this side.
 
-**Three candidates, and this file is not picking one.** Coalescing the 295,952 copies into
+**Three candidates were named; the first two are now measured.** Coalescing the 295,952 copies into
 fewer larger ones (the gap between 6.0 and 9.33 GB/s is real and addressable); batching the
 per-expert GEMVs so one launch covers all eight; or computing some layers' experts host-side
 the way `llama.cpp` does. A bigger device cache was measured on 2026-09-11 and bought 3–4%,
 which is evidence against the simplest of the three. The last three confident answers about
 "where the remaining time goes" were each wrong and each died to an instrument, so these stay
 candidates until one of them is a pair of runs.
+
+### the fix that followed: staging on its own stream (2026-09-12)
+
+The obvious read of the trace above is "coalesce those 295,952 copies". **The trace says no.**
+67.1% of them are under 64 KB and those are **0.01% of the bytes and 0.6% of the time** — 74 ms
+of 13,535. Achieved bandwidth is also flat at ~6 GB/s from 124 KB up to 1.98 MB, so a bigger
+copy is not a faster one and merging them cannot buy what it looks like it should.
+
+What was actually wrong is that **every copy and every kernel was on one stream**, and a stream
+is an ordered queue: a miss copy for expert *e+1* could not start until expert *e*'s GEMV
+finished. `SP_G4_MOE_OVERLAP=1` puts expert staging on a second stream with a CUDA event per
+expert, so a layer's copies run beside a layer's arithmetic.
+
+| decode, 127 steps at depth 3,720 | n=5, ms |
+|---|---|
+| `SP_G4_MOE_OVERLAP=0` | 7,836 / 7,906 / 8,106 / 8,220 / 8,373 |
+| `SP_G4_MOE_OVERLAP=1` | **7,269 / 7,316 / 7,337 / 7,356 / 7,479** |
+
+**1.078× on min/min, 1.105× on medians, and the ranges do not touch** — the worst armed run
+beats the best unarmed one. 16.2 → 17.5 tok/s. The armed arm is also steadier: 2.9% spread
+against 6.9%. Prefill is untouched by construction; the path is gated on `n_tok == 1`.
+
+**The output is byte-identical**, and for a scheduling change that is the correctness test
+rather than a bonus. The same weights reach the same kernels in the same order; only the
+transfers move. Text that shifted would mean an expert had been computed against weights that
+had not landed yet — which is exactly what the per-expert events exist to prevent.
+
+**It is not the 1.5–1.8× the arithmetic suggested,** and the reason is worth more than the
+speedup. A second trace with it armed shows **35.7% of the copy time on the new stream now
+hides behind a running kernel** — the mechanism works. The ceiling is a *routing dependency*,
+not the scheduler: layer L+1's experts are not known until layer L has produced its output, so
+only a layer's own copies can be hidden behind its own compute, and a layer does not have
+enough compute to hide all of them. Cross-layer prefetch would need speculative routing.
+
+**Two hazards, both handled and both worth stating.** A copy must not land in a cache slot that
+earlier work is still reading — the copy stream waits on an event recorded on the compute
+stream before any staging begins. And resolving a whole layer's experts before computing any of
+them lets the LRU evict a slot the layer itself is about to use — resolving stamps each slot
+most-recently-used, and the path refuses to arm unless the cache holds at least four times the
+active set. Both checks fail *safe*: the engine silently stays serial.
 
 ## Against `llama.cpp`, honestly
 

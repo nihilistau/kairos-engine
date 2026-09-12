@@ -5875,6 +5875,66 @@ static void g4_nan_probe(const char *tag, int L, const float *d, cudaStream_t st
     }
 }
 
+
+/* ── EXPERT STAGING ON ITS OWN STREAM (2026-09-12) ────────────────────────────────────
+ * nsys, decode, 384 tokens: 15,137 ms of kernels and 13,535 ms of host->device memcpy,
+ * and BOTH ON STREAM 13 — the same one. 28,672 ms of the 38,098 ms span is those two
+ * never once overlapping, because a single stream is an ordered queue: the miss copy for
+ * expert e+1 cannot begin until expert e's GEMV has finished, and expert e's GEMV cannot
+ * begin until its own copy has landed.
+ *
+ * COALESCING WAS THE OBVIOUS FIX AND THE TRACE KILLED IT. 67.1% of the copies are under
+ * 64 KB — and they are 0.01% of the bytes and 0.6% of the time. Merging every one of them
+ * perfectly is worth about half a percent. Achieved bandwidth is also flat at ~6 GB/s from
+ * 124 KB to 1.98 MB, so size is not what limits the transfer and a bigger copy does not go
+ * faster. What is left is the ordering.
+ *
+ * The routing for a layer names all its experts at once, so expert 1's arithmetic can run
+ * while experts 2..8 are still arriving. The ceiling is wall-clock going from
+ * kernels + copies to max(kernels, copies).
+ *
+ * DECODE ONLY, and the reason is not caution about prefill: prefill is expert-major and
+ * already stages each expert once for the whole token set, so it has little left to hide.
+ * Decode is where n_tok == 1 makes "once per expert per layer" mean "once per TOKEN".
+ *
+ * THE TWO HAZARDS, BOTH REAL:
+ *   1. A copy must not overwrite a cache slot that earlier work is still reading. A single
+ *      stream made that impossible by construction and this removes that guarantee, so the
+ *      copy stream waits on an event recorded on the compute stream before any staging
+ *      begins. Correctness first; what overlaps is this layer's copies against this layer's
+ *      compute, which is where the time is.
+ *   2. Pass 1 resolves every active expert BEFORE any of them computes, so the LRU could
+ *      evict a slot another expert in the same layer is about to use. Resolving stamps each
+ *      slot most-recently-used as it goes, and the guard below refuses to enable overlap
+ *      unless the cache holds at least four times the active set. */
+#define G4_MOE_OVL_MAX 32
+static cudaStream_t g_moe_cps  = NULL;
+static cudaEvent_t  g_moe_ev[G4_MOE_OVL_MAX];
+static cudaEvent_t  g_moe_ready = NULL;
+static int          g_moe_overlap = -1;          /* -1 untried, 0 off, 1 on */
+
+static int moe_overlap_on(void) {
+    if (g_moe_overlap >= 0) return g_moe_overlap;
+    const char *ev = getenv("SP_G4_MOE_OVERLAP");
+    g_moe_overlap = (ev && *ev) ? atoi(ev) : 0;
+    if (!g_moe_overlap) return 0;
+    if (cudaStreamCreate(&g_moe_cps) != cudaSuccess) {
+        fprintf(stderr, "    [g4-moe] overlap: stream create failed - staying serial\n");
+        g_moe_overlap = 0; return 0;
+    }
+    int ok = (cudaEventCreateWithFlags(&g_moe_ready, cudaEventDisableTiming) == cudaSuccess);
+    for (int i = 0; ok && i < G4_MOE_OVL_MAX; i++)
+        ok = (cudaEventCreateWithFlags(&g_moe_ev[i], cudaEventDisableTiming) == cudaSuccess);
+    if (!ok) {
+        fprintf(stderr, "    [g4-moe] overlap: event create failed - staying serial\n");
+        cudaStreamDestroy(g_moe_cps); g_moe_cps = NULL; g_moe_overlap = 0; return 0;
+    }
+    fprintf(stderr, "    [g4-moe] EXPERT STAGING OVERLAP ON (SP_G4_MOE_OVERLAP=1): "
+                    "misses copy on a second stream and the compute waits per expert\n");
+    fflush(stderr);
+    return 1;
+}
+
 static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ffL,
                         int n_tok, float eps, int use_int8,
                         float *dx, float *dnx, float *dg, float *dup, float *ddn,
@@ -6059,6 +6119,35 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
 
     /* expert-major: stage ONCE, then one GEMM over that expert's whole token set */
     const float *dsc = g_w.dexps_scale_host[L];   /* [NE], per EXPERT (trap #2) */
+
+    /* PASS 1 of the overlap: resolve every active expert and let its miss-copy start on the
+     * copy stream, so that by the time expert 1 has finished computing, 2..8 have landed.
+     * See the block at moe_overlap_on for the two hazards and what holds them. */
+    int ovl_n = 0, ovl_e[G4_MOE_OVL_MAX], ovl_cp[G4_MOE_OVL_MAX];
+    DevTensor ovl_gu[G4_MOE_OVL_MAX], ovl_dw[G4_MOE_OVL_MAX];
+    int ovl = (n_tok == 1) && moe_overlap_on() && g_ec_slots > 0;
+    if (ovl) {
+        for (int e = 0; e < NE && ovl; e++) if (ms->bkt_n[e]) {
+            if (ovl_n >= G4_MOE_OVL_MAX) { ovl = 0; break; }   /* more active than slots here */
+            ovl_e[ovl_n++] = e;
+        }
+        /* the cache must be able to hold this layer's whole active set several times over,
+         * or pass 1 evicts a slot pass 2 has not read yet */
+        if (ovl && g_ec_slots < 4 * ovl_n) ovl = 0;
+    }
+    if (ovl) {
+        /* nothing may be overwritten until work already queued on the compute stream is done */
+        cudaEventRecord(g_moe_ready, st);
+        cudaStreamWaitEvent(g_moe_cps, g_moe_ready, 0);
+        for (int i = 0; i < ovl_n; i++) {
+            const long long miss0 = g_ec_miss;
+            if (moe_resident(L, ovl_e[i], NE, E, FFE, g_moe_cps, &ovl_gu[i], &ovl_dw[i])) return -1;
+            ovl_cp[i] = (g_ec_miss != miss0);
+            if (ovl_cp[i]) cudaEventRecord(g_moe_ev[i], g_moe_cps);
+        }
+    }
+    int ovl_i = 0;
+
     for (int e = 0; e < NE; e++) {
         const int cnt = ms->bkt_n[e];
         if (cnt == 0) continue;
@@ -6074,7 +6163,13 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
         DevTensor gu, dw;
         moe_clk::time_point _mt_st;
         if (_mtm) _mt_st = moe_clk::now();
-        if (moe_resident(L, e, NE, E, FFE, st, &gu, &dw)) return -1;
+        if (ovl) {
+            /* PASS 2: resolved already. Wait only for THIS expert's copy — waiting for all
+             * of them would put the serialisation back with extra steps. */
+            gu = ovl_gu[ovl_i]; dw = ovl_dw[ovl_i];
+            if (ovl_cp[ovl_i]) cudaStreamWaitEvent(st, g_moe_ev[ovl_i], 0);
+            ovl_i++;
+        } else if (moe_resident(L, e, NE, E, FFE, st, &gu, &dw)) return -1;
         if (_mtm) { g_moe_stage_ms += moe_ms_since(_mt_st); _mt_st = moe_clk::now(); }
 
         k_moe_gather_rows<<<(unsigned)(((size_t)cnt*E + 255) / 256), 256, 0, st>>>(

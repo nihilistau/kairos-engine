@@ -31,6 +31,12 @@ copies, at ~6.0 GB/s against a 9.33 GB/s link. It is the bus, not the kernels �
 exactly why `llama.cpp -ncmoe 8` wins decode: it computes those experts on the CPU and never
 sends them. Candidates are in the README; none is claimed as *the* answer yet.
 
+**A fix landed for it** (`SP_G4_MOE_OVERLAP=1`, decode only): expert staging moved to a second
+CUDA stream with a per-expert event, so a layer's copies run beside its arithmetic. **1.078× on
+decode, n=5, ranges non-overlapping, output byte-identical.** Coalescing the copies — the
+obvious fix — was measured and rejected first: 67% of them are under 64 KB and they are 0.01%
+of the bytes. The remaining ceiling is a routing dependency rather than a scheduling one.
+
 ## CI (2026-09-12)
 
 There is CI now, and there had never been any. Linux, no GPU, fresh clone — it proves only that
