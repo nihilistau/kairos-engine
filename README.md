@@ -182,6 +182,13 @@ is applied where the model is, not where the client is.
 Every number here is from this card — **RTX 2060, 12 GB, Windows/WDDM** — on the model above.
 Nothing is estimated, and the negative results are kept because they were expensive.
 
+**Dated, because there is a second table elsewhere.** These are the CUDA **kernel** results of
+2026-09-11/12. The Kairos README carries an earlier and separate experiment — the memory-tiering
+work of 09-08/09-10, about where the weights live rather than how the kernels run. The decode
+figures differ between the two files because they are different runs of different work, not
+because either is wrong, and they must not be added together. One pinned workload with every
+kernel armed and `llama.cpp --n-cpu-moe` on the same row is owed and not yet done.
+
 ## Where the time went, and where it goes now
 
 Profiled with Nsight Systems on a ~4k-token prefill plus 128 generated tokens:
