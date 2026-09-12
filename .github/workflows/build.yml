@@ -1,0 +1,75 @@
+name: build
+
+# ── THIS REPO HAD NO CI AT ALL UNTIL 2026-09-12 ──────────────────────────────────────────
+# It is built on one Windows machine with one CUDA card, and nothing had ever compiled it
+# anywhere else. Pointing a Linux toolchain at a fresh clone found four things in one sitting:
+#
+#   * `build-core-cpu.bat` builds `%ENGINE%..\core`, which exists in the author's tree and NOT
+#     in a clone, where the math core is `lib/shannon-prime-system`. The script an adopter is
+#     told to run cannot work as written.
+#   * the math core's `bench_sp_hedge` uses CPU_SET/CPU_ZERO without `_GNU_SOURCE`, so it does
+#     not link on glibc. The LIBRARIES build; only that benchmark target fails.
+#   * `src/network/quic_shard.rs` imported the `exact`-gated `ntt_ffi` unconditionally, so
+#     `--no-default-features` — a profile this crate's own Cargo.toml documents — could not
+#     compile. Fixed; this job is what would have caught it.
+#   * several auxiliary binaries import CUDA-gated modules unconditionally and still do not
+#     build without a wire backend. That is why this job checks `--lib`.
+#
+# WHAT THIS JOB IS NOT. There is no GPU here and no CUDA compile: it cannot tell you the
+# kernels are correct, only that the tree still builds for someone who is not the author. That
+# is a low bar and it was not being cleared.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-cpu:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build build-essential libclang-dev clang
+          cc --version | head -1
+          cmake --version | head -1
+
+      # The library targets only. `bench_sp_hedge` does not link on glibc (CPU_SET without
+      # _GNU_SOURCE) and naming the targets keeps this job honest about what it proves
+      # instead of turning the whole build off to get a green tick.
+      - name: math core — library targets
+        run: |
+          cmake -S lib/shannon-prime-system -B build/core \
+                -DCMAKE_BUILD_TYPE=Release -DSP_SYSTEM_BUILD_TESTS=OFF
+          cmake --build build/core --target sp_forward sp_model sp_gguf sp_arena -j "$(nproc)"
+          find build/core -name '*.a' | sort
+
+      - name: engine tokenizer — compiles
+        run: |
+          set -e
+          for f in src/tokenizer/*.c; do
+            cc -c "$f" -Iinclude -Ilib/shannon-prime-system/include -Isrc/tokenizer \
+               -o "/tmp/$(basename "$f").o"
+            echo "  ok $f"
+          done
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # BOTH feature profiles. The default one and the no-`exact` one documented in
+      # Cargo.toml as DESIGN-NO-EXACT-PROFILE §4b — the second is the one that was broken,
+      # and checking only the default would have missed it exactly as it was missed before.
+      - name: sp-daemon library — default features
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-14/lib
+        run: cd tools/sp_daemon && cargo check --lib
+
+      - name: sp-daemon library — no default features
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-14/lib
+        run: cd tools/sp_daemon && cargo check --no-default-features --lib

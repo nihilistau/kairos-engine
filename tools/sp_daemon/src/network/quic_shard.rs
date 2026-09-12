@@ -353,7 +353,16 @@ pub async fn run_garner_loop(
                                 if q1.len() != ntt_n as usize || q2.len() != ntt_n as usize {
                                     return;
                                 }
+                                // ── THE RECOMBINATION IS `exact`'s, AND SO IS THIS CALL ──
+                                // `ntt_ffi` is `#[cfg(feature = "exact")]` in lib.rs and this
+                                // site imported it unconditionally, so `--no-default-features`
+                                // — the profile Cargo.toml documents as DESIGN-NO-EXACT-PROFILE
+                                // §4b — did not compile. Caught by a Linux `cargo check` on a
+                                // fresh clone in 2026-09-12; nothing had ever built this crate
+                                // in a configuration other than the author's.
+                                #[allow(unused_mut)]
                                 let mut coeffs = vec![0i64; ntt_n as usize];
+                                #[cfg(feature = "exact")]
                                 unsafe {
                                     use crate::ntt_ffi::{ntt_crt_recombine, ntt_free, ntt_init};
                                     let ctx = ntt_init(ntt_n);
@@ -365,6 +374,15 @@ pub async fn run_garner_loop(
                                         coeffs.as_mut_ptr(),
                                     );
                                     ntt_free(ctx);
+                                }
+                                // Without the integer math core there is nothing to recombine.
+                                // DROP the block: sending `coeffs` still full of zeros would be
+                                // a wrong answer wearing the shape of a right one, and the
+                                // receiver cannot tell those apart.
+                                #[cfg(not(feature = "exact"))]
+                                {
+                                    let _ = (&q1, &q2, &coeffs);
+                                    return;
                                 }
                                 let _ = results_tx.send(GarnerResult {
                                     seq_id,

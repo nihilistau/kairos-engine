@@ -3,6 +3,43 @@
 **Date:** 2026-09-12  
 **Class:** `LIVE` — the optional native CUDA backend for the **companion** stack.
 
+**Version:** `0.6.0` — the first tagged cut. Derived from **Shannon-Prime-Engine**, and the
+number is a claim about lineage and maturity rather than a semver contract: it is one person
+and one model's engine, research grade, one card, one OS.
+
+What it does have is duration. It is the **only** backend of a live companion stack and has
+served that stack continuously for months — which is a different kind of evidence from a
+benchmark, and the one this repository can actually stand behind. Treat uptime claims as the
+operator's experience of it: nothing here publishes an uptime receipt.
+
+## Where the remaining gap is (2026-09-12, measured)
+
+**Prefill is no longer behind `llama.cpp` — it is ahead.** On one workload in one sitting,
+3,720 tokens, same card, same Q4_0 weights:
+
+| | engine, kernels off | engine, kernels on | `llama.cpp -ncmoe 8` |
+|---|---:|---:|---:|
+| prefill 3,720 tok | 98.9 tok/s | **304.2 tok/s** | 262.6 tok/s |
+| decode @ depth 3,720 | 12.70 tok/s | **16.16 tok/s** | **38.25 tok/s** |
+| prefill + 128 decode | 46,016 ms | **21,715 ms** | ~17,277 ms |
+
+The kernels are worth **2.12× end to end** — *not* the ~2.7× that appeared here previously,
+which was two speedups measured on different prompts at different times and added together.
+Prefill is a **1.16× lead**; decode is a **2.37× deficit**, depth-matched. **Decode is the whole
+remaining gap and the next piece of work**, and the suspects (per-step launch overhead over 30
+layers, the expert stage and its host sync, WDDM) are named as suspects, not as a diagnosis.
+The last two confident claims about "most of the remaining gap" were both wrong.
+
+## CI (2026-09-12)
+
+There is CI now, and there had never been any. Linux, no GPU, fresh clone — it proves only that
+the tree builds for somebody who is not the author. That bar was not being cleared: the first
+run found `build-core-cpu.bat` pointing at a directory that does not exist in a clone, a math
+core benchmark that does not link on glibc, and a documented Cargo profile
+(`--no-default-features`) that could not compile because one call site imported a feature-gated
+module unconditionally. The last of those is fixed; the first two are recorded here rather than
+papered over.
+
 ## Recent — the attention kernels, 2026-09-12
 
 Three kernels carried the same defect and it was worth about half the engine's GPU time. An

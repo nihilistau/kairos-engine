@@ -187,7 +187,7 @@ Nothing is estimated, and the negative results are kept because they were expens
 work of 09-08/09-10, about where the weights live rather than how the kernels run. The decode
 figures differ between the two files because they are different runs of different work, not
 because either is wrong, and they must not be added together. One pinned workload with every
-kernel armed and `llama.cpp --n-cpu-moe` on the same row is owed and not yet done.
+kernel armed and `llama.cpp --n-cpu-moe` on the same row is **now measured** — see *One workload, both kernels, one sitting* below.
 
 ## Where the time went, and where it goes now
 
@@ -263,12 +263,68 @@ fp16 operand precision, and it is recorded as a real numerical change rather tha
 through. Output text was byte-identical on every prompt tried, which is evidence, not proof;
 `=0` disarms either one.
 
+## One workload, both kernels, one sitting (2026-09-12)
+
+Everything above this section was **stitched**: the attention result was measured before the
+fp16 GEMM existed and the GEMM result after it, so no reader — and no author — had ever seen
+both kernels run against both kernels off on one prompt. This is that run.
+
+**3,720 tokens of ordinary varied prose**, greedy, 128 generated, RTX 2060 12 GB, Gemma-4-26B-A4B
+Q4_0 (13.26 GiB). The engine is driven through `/v1/oneshot` on a directly-launched daemon so
+only the three knobs move; `llama.cpp` is `llama-bench -ncmoe 8` on the same card and the same
+weights. Engine n=3 for the totals and n=2 for the split, minimum reported.
+
+| | engine, kernels **off** | engine, kernels **on** | `llama.cpp` `-ncmoe 8` |
+|---|---:|---:|---:|
+| prefill, 3,720 tok | 37,619 ms — 98.9 tok/s | **12,228 ms — 304.2 tok/s** | 14,169 ms — 262.6 tok/s |
+| decode @ depth 3,720 | 12.70 tok/s | **16.16 tok/s** | **38.25 tok/s** |
+| prefill + 128 decode | 46,016 ms | **21,715 ms** | ~17,277 ms |
+
+The kernels are worth **3.08× on prefill**, **1.27× on decode**, **2.12× end to end**. The off
+and on ranges do not touch: worst `on` (23,595 ms) is far below best `off` (46,016 ms).
+
+**2.12×, not the ~2.7× stitched above.** Two speedups measured on different prompts at different
+times do not compose, and the honest combined figure is the smaller one. The older rows stay
+because they are what those experiments measured; this row is what the engine does.
+
+### the gap moved, and this file was wrong about where it is
+
+**Prefill is no longer the deficit — it is a lead.** 304.2 tok/s against 262.6 is **1.16× faster
+than `llama.cpp`**, and the engine's number is if anything understated: it is measured through
+the HTTP door and includes template application, tokenisation and one decode step, while
+`llama-bench`'s `pp` is prompt processing alone.
+
+**Decode is now the entire remaining gap: 16.16 tok/s against 38.25, so `llama.cpp` is 2.37×
+faster there.** That comparison is depth-matched on purpose — `llama-bench`'s default `tg128`
+runs at depth 0 and reports 41.19 tok/s, which would have flattered this engine by comparing a
+cold-context decode against a 3,720-token one. Measuring it at `-d 3720` is what makes the
+number mean anything.
+
+So the next piece of work is **decode**, and the suspects are named rather than picked: per-step
+launch overhead across 30 layers, the expert stage and its host sync, and WDDM. That is a
+hypothesis with an instrument attached, not a third claim about where the time goes — the last
+two such claims were both wrong, and both were killed by a trace rather than by argument.
+
+**What this comparison is not.** `llama.cpp` with `-ncmoe 8` keeps eight layers' experts on the
+CPU and computes them there; this engine streams experts from a pinned host arena to the GPU.
+Different strategies for the same shortage of VRAM, compared on wall-clock for the same job,
+which is the only axis a user experiences.
+
 ## Against `llama.cpp`, honestly
 
-On the same card, same weights, same workload, `llama.cpp` (`-ncmoe 8`) remains faster at
-prefill. It is a mature, widely-tuned runtime and this is one person's kernel work. What this
-engine offers is not "faster than llama.cpp" — it is the capability list at the top of this
-file, on hardware that is otherwise too small for the model.
+**This section said `llama.cpp` "remains faster at prefill" until 2026-09-12, and the combined
+measurement above falsified it.** Prefill is now 304.2 tok/s here against 262.6 there — a 1.16×
+lead — and the sentence survived only because nobody had run the two kernels together against a
+depth-matched baseline. It is corrected rather than quietly deleted, because a README that
+silently drops its own wrong claims teaches a reader nothing about how much to trust the rest.
+
+Where `llama.cpp` is genuinely ahead is **decode: 38.25 tok/s against 16.16 at the same depth,
+2.37×.** It is a mature, widely-tuned runtime and this is one person's kernel work, and on the
+part of the job a user waits through most — the tokens arriving one at a time — it wins
+comfortably.
+
+What this engine offers is still not "faster than llama.cpp". It is the capability list at the
+top of this file, on hardware that is otherwise too small for the model.
 
 ---
 
