@@ -28,7 +28,7 @@ param(
     [switch]$IncludeHex = $false,            # cell 5 (Memory hex_ntt) — only safe at small ctx
     [string]$OnlyModel = "",                 # "" = both; "Memory" or "Gemma3" filters
     [string]$BinaryPath = "/data/local/tmp/sp_ntt_bench_toks",  # use on-device binary (no rebuild)
-    [string]$AdbExe = "D:\Files\Android\pt-latest\platform-tools\adb.exe",
+    [string]$AdbExe = "<android-sdk>\pt-latest\platform-tools\adb.exe",
     [string]$Serial = "R5CT22445JA"
 )
 

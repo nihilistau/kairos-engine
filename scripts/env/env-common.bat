@@ -26,7 +26,7 @@ set SP_PIN_VS_BUILDTOOLS=C:\Program Files (x86)\Microsoft Visual Studio\2019\Bui
 REM Tier-3 MSVC-parity toolchain (separate; NOT the CUDA host). VS18 BuildTools on D:
 REM (MSVC v14.50, cl 19.50, ships <stdatomic.h>). Used only for the tracked de-GCC
 REM MSVC-parity build, never for CPU(=MinGW) or CUDA(=VS2019) production.
-set SP_PIN_VS2022_BUILDTOOLS=D:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools
+set SP_PIN_VS2022_BUILDTOOLS=<vs-tools-root>\Microsoft Visual Studio\18\BuildTools
 set SP_PIN_CUDA_VERSION=13.2
 set SP_PIN_CUDA_ROOT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v%SP_PIN_CUDA_VERSION%
 set SP_PIN_VULKAN_MIN=1.3.250

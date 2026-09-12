@@ -13,7 +13,7 @@ REM  script lives in tools/sp_daemon/). NDK: android-ndk-r27d, API 21, arm64-v8a
 REM ============================================================================
 setlocal
 
-set "NDK=D:\Files\Android\android-ndk-r27d"
+set "NDK=<android-sdk>\android-ndk-r27d"
 set "TOOLCHAIN=%NDK%\build\cmake\android.toolchain.cmake"
 REM engine root = two levels up from tools/sp_daemon/
 set "ENGINE=%~dp0..\.."

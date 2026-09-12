@@ -12,11 +12,11 @@ REM
 REM  Required env:
 REM    HEXAGON_SDK_ROOT  pinned to C:\Qualcomm\Hexagon_SDK\5.5.6.0 by
 REM                      scripts\env\env-hexagon.bat
-REM    NDK               android-ndk-r27d at D:\Files\Android\android-ndk-r27d
+REM    NDK               android-ndk-r27d at <android-sdk>\android-ndk-r27d
 REM ============================================================================
 setlocal
 
-set "NDK=D:\Files\Android\android-ndk-r27d"
+set "NDK=<android-sdk>\android-ndk-r27d"
 set "TOOLCHAIN=%NDK%\build\cmake\android.toolchain.cmake"
 REM engine root = two levels up from tools/sp_daemon/
 set "ENGINE=%~dp0..\.."

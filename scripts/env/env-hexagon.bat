@@ -49,7 +49,7 @@ REM freethedsp shim (opt-in via env var on device run).
 set SP_FREETHEDSP=0
 
 REM ADB: pt-latest (v36) handles Android 13+; old adbs were disabled.
-set SP_ADB=D:\Files\Android\pt-latest\platform-tools\adb.exe
+set SP_ADB=<android-sdk>\pt-latest\platform-tools\adb.exe
 if not exist "%SP_ADB%" set SP_ADB=adb
 set SP_ADB_SERIAL=R5CT22445JA
 set SP_DEVICE_DIR=/data/local/tmp/sp22u

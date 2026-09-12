@@ -18,4 +18,4 @@ AR_aarch64_linux_android  = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\l
 # -isystem points at clang's builtin headers (stddef.h etc.) which live in the
 # NDK clang resource dir, NOT the sysroot — the host libclang doesn't know the
 # NDK's resource path, so stdint.h's #include <stddef.h> fails without this.
-BINDGEN_EXTRA_CLANG_ARGS_aarch64-linux-android = "--target=aarch64-linux-android21 --sysroot=D:/Files/Android/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/sysroot -isystem D:/Files/Android/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/lib/clang/18/include"
+BINDGEN_EXTRA_CLANG_ARGS_aarch64-linux-android = "--target=aarch64-linux-android21 --sysroot=<android-sdk>/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/sysroot -isystem <android-sdk>/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/lib/clang/18/include"

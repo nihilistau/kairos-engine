@@ -14,7 +14,7 @@ REM                        build-android.bat --bin foo  (extra cargo args pass t
 REM ============================================================================
 setlocal
 
-set "NDK_BIN=D:\Files\Android\android-ndk-r27d\toolchains\llvm\prebuilt\windows-x86_64\bin"
+set "NDK_BIN=<android-sdk>\android-ndk-r27d\toolchains\llvm\prebuilt\windows-x86_64\bin"
 set "CC_aarch64_linux_android=%NDK_BIN%\aarch64-linux-android21-clang.cmd"
 set "CXX_aarch64_linux_android=%NDK_BIN%\aarch64-linux-android21-clang++.cmd"
 set "AR_aarch64_linux_android=%NDK_BIN%\llvm-ar.exe"

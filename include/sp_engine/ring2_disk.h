@@ -1,7 +1,7 @@
 /* ring2_disk.h — C2.1 Step 2b: physical Optane-backed Ring-2 byte store.
  *
  * Swaps the Step-2a mock RAM Ring-2 for two real files (K, V) on a fast
- * byte-addressable drive (Optane E:/F:). Spilled (layer,token) KV blocks are
+ * byte-addressable drive (an Optane or NVMe volume). Spilled (layer,token) KV blocks are
  * written at a deterministic 4 KB-aligned offset; the recall router fetches the
  * scattered top-B blocks back with blocking reads.
  *
