@@ -29,13 +29,24 @@ Prefill is a **1.16× lead**; decode is a **2.37× deficit**, depth-matched. **D
 15.1 s in kernels and **13.5 s receiving 81.4 GB of expert weights across PCIe** in 295,952
 copies, at ~6.0 GB/s against a 9.33 GB/s link. It is the bus, not the kernels — which is also
 exactly why `llama.cpp -ncmoe 8` wins decode: it computes those experts on the CPU and never
-sends them. Candidates are in the README; none is claimed as *the* answer yet.
+sends them.
 
-**A fix landed for it** (`SP_G4_MOE_OVERLAP=1`, decode only): expert staging moved to a second
-CUDA stream with a per-expert event, so a layer's copies run beside its arithmetic. **1.078× on
-decode, n=5, ranges non-overlapping, output byte-identical.** Coalescing the copies — the
-obvious fix — was measured and rejected first: 67% of them are under 64 KB and they are 0.01%
-of the bytes. The remaining ceiling is a routing dependency rather than a scheduling one.
+**Two of the three candidates have now been spent, and the third is the only one left.**
+Coalescing the copies — the obvious one — was measured and **rejected**: 67% of them are under
+64 KB and those are 0.01% of the bytes, so merging them buys nothing. Overlapping them
+*was* worth something and is armed (`SP_G4_MOE_OVERLAP=1`, decode only): expert staging moved
+to a second CUDA stream with a per-expert event, so a layer's copies run beside its arithmetic
+— **1.078× on decode, n=5, ranges non-overlapping, output byte-identical.**
+
+**Do not spend a fourth attempt on scheduling.** 1.078× is close to what this shape can give,
+and the reason is structural rather than tunable: which experts a token needs is not known
+until the router has run, so the copy cannot be issued earlier than it already is. The stream
+hides the *latency* of a copy behind arithmetic; it cannot reduce the 81.4 GB, and the link is
+the thing that is saturated. A third stream, a deeper event pipeline or a bigger staging arena
+all move the same bytes at the same 6.0 GB/s. **The remaining ceiling is a routing dependency,
+not a scheduling one** — and the only candidate that attacks it is the one `llama.cpp` uses:
+do not send the experts at all, compute them where they already live. That is a CPU/GPU split
+of the MoE, it is not written here, and it is the honest next thing.
 
 ## CI (2026-09-12)
 
@@ -87,10 +98,12 @@ fp32 reduction-order noise, ~√256·eps.
 
 `SP_G4_ATTN_V2`: `0` the previous kernels, `1` the new ones, `2` parity. Disarming is one value.
 
-**Still open:** `volta_sgemm_128x64_tn` is the largest single line at 24.2%, beside
-`k_dequant_arena_q4b` — this engine dequantises Q4 to fp32 and runs cuBLAS **fp32** SGEMM,
-where llama.cpp's hottest kernel `mul_mat_vec_q<Q4_0>` multiplies the Q4 bytes directly
-against q8_1 activations.
+**The matmul, and what closed it.** `volta_sgemm_128x64_tn` was the largest single line at
+24.2%, beside `k_dequant_arena_q4b` — this engine dequantises Q4 to fp32 and runs cuBLAS
+**fp32** SGEMM, where llama.cpp's hottest kernel `mul_mat_vec_q<Q4_0>` multiplies the Q4 bytes
+directly against q8_1 activations. Two things were tried against that observation. **The first
+was declined and the second is armed**; both are recorded below, because which one lost is the
+useful part.
 
 **I first wrote that this was most of the remaining gap. It is not — tested 2026-09-12.** The
 direct path is already in this tree: `gemm_q4b_dp4a_batched` + `k_gemm_q4b_dp4a`, wired into

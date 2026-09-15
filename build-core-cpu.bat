@@ -6,9 +6,12 @@ REM shape staging's engine-root cmake produced). Toolchain mirrors staging
 REM build-cpu: clang-cl + Ninja Release (env-cuda supplies vcvars64 + PATH).
 setlocal
 set "ENGINE=%~dp0"
+REM SP_CORE, not ..\core: the sibling directory exists only in the source tree, and this
+REM line is the one a fresh clone died on (2026-09-15). resolve-core.bat has the reasoning.
+call "%ENGINE%scripts\env\resolve-core.bat" || goto :err
 call "%ENGINE%scripts\env\env-cuda.bat" || goto :err
 
-cmake -S "%ENGINE%..\core" -B "%ENGINE%build-cpu\lib\shannon-prime-system" -G Ninja ^
+cmake -S "%SP_CORE%" -B "%ENGINE%build-cpu\lib\shannon-prime-system" -G Ninja ^
   -DCMAKE_BUILD_TYPE=Release ^
   -DCMAKE_C_COMPILER="C:/Program Files/LLVM/bin/clang-cl.exe" ^
   -DCMAKE_CXX_COMPILER="C:/Program Files/LLVM/bin/clang-cl.exe" ^
