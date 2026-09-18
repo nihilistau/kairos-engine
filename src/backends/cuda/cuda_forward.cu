@@ -8125,6 +8125,26 @@ extern "C" int gemma4_kv_prefill(sp_g4_kv *s, const int32_t *toks, int n) {
             if (cudaMalloc(&g_hd_dev, (size_t)g_hd_cap * (size_t)s->E * sizeof(float)) != cudaSuccess) g_hd_dev = NULL;
             g_hd_host = (float *)malloc((size_t)g_hd_cap * (size_t)s->E * sizeof(float));
         }
+        /* SAY WHY, BECAUSE A 0-BYTE FILE CANNOT (2026-09-18). Every decline in this tap was
+         * silent: fopen failing, the device ring failing to allocate, the host staging
+         * failing — each leaves an empty file that reads exactly like "the tap is broken",
+         * and an evening was spent on that reading. The ring is Pmax*E*4, which is 225 MB
+         * at Pmax=20000, requested beside a resident 13 GB model on a 12 GB card. One line,
+         * inside the getenv guard, so the null floor is untouched. */
+        if (!g_hd_f) {
+            fprintf(stderr, "[g4-kv] hidden dump: fopen(%s) FAILED — no capture\n", hdp);
+        } else if (!g_hd_dev || !g_hd_host) {
+            fprintf(stderr, "[g4-kv] hidden dump: OPEN ok but staging FAILED "
+                            "(dev=%p host=%p, wanted %d x %d x 4 = %.1f MB each) — the "
+                            "per-token tap needs BOTH and will capture nothing\n",
+                    (void *)g_hd_dev, (void *)g_hd_host, g_hd_cap, (int)s->E,
+                    (double)g_hd_cap * (double)s->E * 4.0 / 1048576.0);
+        } else {
+            fprintf(stderr, "[g4-kv] hidden dump: armed, ring %d x %d (%.1f MB)\n",
+                    g_hd_cap, (int)s->E,
+                    (double)g_hd_cap * (double)s->E * 4.0 / 1048576.0);
+        }
+        fflush(stderr);
       } }
     /* G-PK2-PREFILL (2026-07-07): the >~1000-token prefill wedge (GATEWAY-PREFILL-STALL).
      * Root-cause class: this loop queues n * ~700 async launches with ZERO intermediate
@@ -8187,6 +8207,17 @@ extern "C" int gemma4_kv_prefill(sp_g4_kv *s, const int32_t *toks, int n) {
             cudaMemcpy(g_hd_host, g_hd_dev, (size_t)g_hd_pos * (size_t)s->E * sizeof(float),
                        cudaMemcpyDeviceToHost);
             fwrite(g_hd_host, sizeof(float), (size_t)g_hd_pos * (size_t)s->E, g_hd_f);
+        } else {
+            /* THE THREE WAYS THIS WRITES NOTHING, NAMED. Silent before, and the symptom is
+             * a 0-byte file — which is also what a missing knob, a wrong path and a broken
+             * tap all look like. g_hd_pos == 0 specifically means the per-token fire site
+             * in g4_kv_step never ran, i.e. its `g_hd_f && g_hd_dev` guard was false for
+             * every position of the prefill. */
+            fprintf(stderr, "[g4-kv] hidden dump: NOTHING WRITTEN (dev=%p host=%p pos=%d, "
+                            "n=%d) — %s\n", (void *)g_hd_dev, (void *)g_hd_host, g_hd_pos, n,
+                    g_hd_pos == 0 ? "the per-token tap captured no positions"
+                                  : "the staging buffers are missing");
+            fflush(stderr);
         }
         fflush(g_hd_f);
         { const char *hdd = getenv("SP_HIDDEN_DUMP_DECODE");
