@@ -2397,6 +2397,105 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                         int moe_on, int NE, int NU, int FFE,
                         g4_moe_scratch *ms);
 
+/* ── K/V-AS-STORED TAP (2026-09-19, diagnostic, default off) ─────────────────
+ * Dumps the K and V that ONE layer will attend to, from whichever path is
+ * running, so gemma4_cuda_probe and gemma4_kv_prefill_batched_from can be
+ * compared at the boundary that separates the write path from the score path.
+ *
+ * WHY THIS BOUNDARY. Position 0's residual already agrees between the two
+ * paths to ~8e-05, which exonerates the per-position math — but it does NOT
+ * exonerate K[0]. A softmax over a SINGLE key returns weight 1 whatever the
+ * score is, so position 0 never reads its own key. Position 1 is the first
+ * position where K[0] enters a real softmax, and position 1 is exactly where
+ * the disagreement appears at full size: 6.383e-02, stable to four significant
+ * figures across different prompts. Cosine ~1 here puts the fault in the
+ * read/score path; cosine off 1 puts it in the write/RoPE path.
+ *
+ * DEAD BY READING, so this tap deliberately does NOT reprint any of it: both
+ * paths derive period/kvfs/g_hd/s_hd/g_base/s_base by the same expression with
+ * the same fallbacks (2413-2417 vs 6770-6775 -- `s->` is a COPY of `c->`, not a
+ * second formula); both select the RoPE table as `global ? g_base : s_base`
+ * with `ffac = global ? g_w.rope_freqs : NULL`; both take
+ * `src = kvfs - (global ? 1 : 2)` for shared layers and neither projects Wk/Wv
+ * there; both copy V from the RAW K projection before k_norm and before RoPE;
+ * both use ascale 1.0f. At P == 0 the served path takes the same no-offset
+ * k_rope/k_rope_freqs the probe does (the _at/_atn absolute-angle variants are
+ * the P > 0 branch), so the position ids match too. Dumping is_swa, theta, src
+ * or hd from both sites would only reprint the same integers.
+ *
+ * The differences this tap is pointed at, and the only ones left at P == 0:
+ *   write  the served path rounds K and V through fp16 (companion sets
+ *          kv.fp16 AND kv.fp16_globals, so G4_KV_FP16_LAYER is 1 on EVERY
+ *          layer) while the probe keeps fp32 scratch;
+ *   score  g4_prefill_attn_flat (served) against k_attn (probe).
+ * A third line, only worth opening if the first does not move pos 1: whether
+ * the k_norm / weightless-V-norm KERNELS differ in precision between the paths.
+ * The ORDER is already known to match.
+ *
+ * STAGES, in forward order within a block. "nx" is the block INPUT after
+ * attn_norm; "q" is Q after q_norm and RoPE; "kpre" is K after k_norm and
+ * before RoPE; "krope" is K straight out of RoPE; "kpost" is K AS STORED, which
+ * on the served side is after the in-place fp16 round and on the probe is the
+ * same buffer as krope; "v" is V as stored; "ao" is the attention OUTPUT.
+ * kpre vs krope splits a rotate bug from a projection bug; krope vs kpost
+ * isolates the fp16 store; and nx/q/kpost/v all agreeing while ao does not is
+ * the score path caught in the act, since those four are its entire input.
+ *
+ * SP_DUMP_KV_LAYER = -1 scans EVERY layer (the file name carries L), which is
+ * what localizes the first layer to diverge: the parity number this exists to
+ * explain is measured on `dx` after all 30 layers, so a clean read at one layer
+ * proves nothing about the stack. SP_DUMP_KV_STAGES takes a comma list to keep
+ * a full scan off the disk. Widths differ per stage -- nx is E, q and ao are
+ * qd, the K/V stages are kvd -- and the caller passes the width, because a raw
+ * headerless dump read at the wrong width is how var/hidden/head.bin was
+ * misread for a year.
+ *
+ * Rows are absolute positions 0..n-1 and nothing else: the served side is
+ * REFUSED unless P == 0, so a persist-KV reseam can never make row i mean
+ * position i+P in one file and position i in the other -- the alignment defect
+ * that produced a withdrawn "error grows with position" reading on 2026-09-19.
+ * Raw headerless little-endian f32, n*kvd floats, truncating: one fresh
+ * prefill writes each file exactly once. Every decline says so on stderr,
+ * because a tap that is armed and silently writes nothing has already cost a
+ * day on this bug. It costs a full stream sync, so it is off unless SP_DUMP_KV
+ * names a path. */
+static void g4_dump_kv_tap(const char *who, const char *stage, int L, int P,
+                           const float *dsrc, int n, int kvd, cudaStream_t st)
+{
+    const char *base = getenv("SP_DUMP_KV");
+    if (!base || !*base) return;
+    { const char *lsel = getenv("SP_DUMP_KV_LAYER");
+      const int want = (lsel && *lsel) ? atoi(lsel) : 0;
+      if (want >= 0 && L != want) return; }        /* -1 = every layer, for a scan */
+    { const char *ssel = getenv("SP_DUMP_KV_STAGES");   /* comma list; unset = all */
+      if (ssel && *ssel && !strstr(ssel, stage)) return; }
+    if (P != 0) {
+        fprintf(stderr, "[kvtap] %s %s L=%d DECLINED: P=%d is a reseam, not a fresh prefill\n",
+                who, stage, L, P);
+        return;
+    }
+    const size_t nfl = (size_t)n * (size_t)kvd;
+    float *h = (float *)malloc(nfl * sizeof(float));
+    if (!h) { fprintf(stderr, "[kvtap] %s %s L=%d DECLINED: host OOM\n", who, stage, L); return; }
+    cudaStreamSynchronize(st);
+    if (cudaMemcpy(h, dsrc, nfl * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fprintf(stderr, "[kvtap] %s %s L=%d DECLINED: D2H failed\n", who, stage, L);
+        free(h); return;
+    }
+    char path[1024];
+    snprintf(path, sizeof path, "%s.%s.L%02d.%s", base, who, L, stage);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[kvtap] %s %s L=%d DECLINED: cannot open %s\n", who, stage, L, path);
+        free(h); return;
+    }
+    fwrite(h, sizeof(float), nfl, f);
+    fclose(f);
+    free(h);
+    fprintf(stderr, "[kvtap] %s %s L=%d wrote n=%d kvd=%d -> %s\n",
+            who, stage, L, n, kvd, path);
+}
+
 /* attn_only modes: 1 = stop after last layer's attention residual; 2/3/4/5 =
  * intra-block bisection stages; 0 = stop after last layer's FFN residual;
  * ETA.4: -1 = FULL FORWARD — all layers + AltUp injection + per-layer out_scale
@@ -2587,7 +2686,15 @@ extern "C" int gemma4_cuda_probe(const qwen3_model *m, const int32_t *tokens,
         const size_t nE = (size_t)n_tok * E;
 
         /* ── attention ── */
+        /* dxin BEFORE the norm, and it is the ONLY stage that can see a scale error.
+         * nx/q/kpost are all post-RMSNorm and v/ao are convex in normalized inputs, so
+         * every other stage divides out the residual's magnitude -- which is exactly
+         * what pl_out_scale (a ~0.1 per-layer damping ON THIS STREAM) changes. A scan
+         * of normalized stages reading clean at every layer is therefore not evidence
+         * that the residual agrees; it is evidence the scan was blind to this class. */
+        g4_dump_kv_tap("probe", "dxin", L, 0, dx, n_tok, E, st);
         k_rmsnorm<<<n_tok, 256, 0, st>>>(dx, g_w.attn_norm[L], E, eps, dnx);
+        g4_dump_kv_tap("probe", "nx", L, 0, dnx, n_tok, E, st);
         if (attn_only == 2 && L == n_layers - 1) {            /* ── bisect: post-attn_norm nx ── */
             if (cudaMemcpyAsync(out_x, dnx, (size_t)n_tok*E*sizeof(float), cudaMemcpyDeviceToHost, st) != cudaSuccess) {
                 sp_set_error("g4 dl nx"); goto done; }
@@ -2614,6 +2721,7 @@ extern "C" int gemma4_cuda_probe(const qwen3_model *m, const int32_t *tokens,
         if (ffac) k_rope_freqs<<<n_tok*nh, hd/2, 0, st>>>(dq, nh, hd, qd, rbase, ffac);
         else      k_rope<<<n_tok*nh, hd/2, 0, st>>>(dq, nh, hd, qd, rbase);
         if (bx_dump_f && L == bx_layer) BX_REC("ROPo", dq, n_tok*nh, hd);
+        g4_dump_kv_tap("probe", "q", L, 0, dq, n_tok, qd, st);
         if (attn_only == 3 && L == n_layers - 1) {            /* ── bisect: q post norm+rope [n_tok*qd] ── */
             if (cudaMemcpyAsync(out_x, dq, (size_t)n_tok*qd*sizeof(float), cudaMemcpyDeviceToHost, st) != cudaSuccess) {
                 sp_set_error("g4 dl q"); goto done; }
@@ -2630,9 +2738,35 @@ extern "C" int gemma4_cuda_probe(const qwen3_model *m, const int32_t *tokens,
                 cudaMemcpyAsync(dv, dk, (size_t)n_tok*kvd*sizeof(float), cudaMemcpyDeviceToDevice, st);
             }
             k_rmsnorm_head<<<n_tok*nkv, 256, 0, st>>>(dk, g_w.k_norm[L], nkv, hd, kvd, eps);
+            g4_dump_kv_tap("probe", "kpre", L, 0, dk, n_tok, kvd, st);
             if (ffac) k_rope_freqs<<<n_tok*nkv, hd/2, 0, st>>>(dk, nkv, hd, kvd, rbase, ffac);
             else      k_rope<<<n_tok*nkv, hd/2, 0, st>>>(dk, nkv, hd, kvd, rbase);
+            g4_dump_kv_tap("probe", "krope", L, 0, dk, n_tok, kvd, st);
             k_rmsnorm_head_noweight<<<n_tok*nkv, 256, 0, st>>>(dv, nkv, hd, kvd, eps);  /* WEIGHTLESS V-norm */
+            /* ── SP_PROBE_KV_F16: the one-line A/B for suspect (1) (2026-09-19) ──────
+             * The SERVED path rounds K and V through fp16 here (cuda_forward.cu:7925,
+             * gated on G4_KV_FP16_LAYER, which companion makes 1 on EVERY layer via
+             * kv.fp16 + kv.fp16_globals) so that its attention reads exactly the bytes
+             * the sink stores. This probe keeps fp32 scratch and never rounds, which at
+             * P == 0 is one of only two surviving differences between the two forwards.
+             *
+             * Arming this makes the probe's stored K/V bit-match the served store. If
+             * the position-1 relL2 of 6.383e-02 collapses, the fp16 store IS the gap and
+             * g4_prefill_attn_flat vs k_attn never needs opening; if it survives, the
+             * write path is exonerated and the score path is the remaining suspect.
+             *
+             * Placed to mirror the served ORDER exactly: rope, then weightless V-norm,
+             * then the round. Unset, this is a no-op and the probe is byte-identical. */
+            { static int pf16 = -1;
+              if (pf16 < 0) { const char *e = getenv("SP_PROBE_KV_F16"); pf16 = (e && *e == '1'); }
+              if (pf16) {
+                  const unsigned nb16 = (unsigned)(((size_t)n_tok*kvd + 255) / 256);
+                  k_round_f16<<<nb16, 256, 0, st>>>(dk, (size_t)n_tok*kvd);
+                  k_round_f16<<<nb16, 256, 0, st>>>(dv, (size_t)n_tok*kvd);
+              } }
+            /* AS STORED: the final K/V this path attends to. */
+            g4_dump_kv_tap("probe", "kpost", L, 0, dk, n_tok, kvd, st);
+            g4_dump_kv_tap("probe", "v",     L, 0, dv, n_tok, kvd, st);
             if (cudaMalloc(&Kst[L], (size_t)n_tok*kvd*sizeof(float)) != cudaSuccess ||
                 cudaMalloc(&Vst[L], (size_t)n_tok*kvd*sizeof(float)) != cudaSuccess) {
                 sp_set_error("g4 Kst OOM"); goto done;
@@ -2649,6 +2783,9 @@ extern "C" int gemma4_cuda_probe(const qwen3_model *m, const int32_t *tokens,
         {   int bd = hd > n_tok ? hd : n_tok; if (bd > 1024) bd = 1024;
             k_attn<<<n_tok*nh, bd, (size_t)n_tok*sizeof(float), st>>>(
                 dq, Kuse, Vuse, n_tok, qd, kvd, hd, grp, ascale, win, dao); }
+        /* The score path's OUTPUT. nx/q/kpost/v are its entire input, so those four
+         * agreeing while this does not is the attention kernel caught in the act. */
+        g4_dump_kv_tap("probe", "ao", L, 0, dao, n_tok, qd, st);
         if (attn_only == 4 && L == n_layers - 1) {            /* ── bisect: ao post-attention [n_tok*qd] ── */
             if (cudaMemcpyAsync(out_x, dao, (size_t)n_tok*qd*sizeof(float), cudaMemcpyDeviceToHost, st) != cudaSuccess) {
                 sp_set_error("g4 dl ao"); goto done; }
@@ -2714,6 +2851,10 @@ extern "C" int gemma4_cuda_probe(const qwen3_model *m, const int32_t *tokens,
         if (g_w.pl_out_scale && g_w.pl_out_scale[L])
             k_scale_by_dev<<<(unsigned)((nE+255)/256), 256, 0, st>>>(dx, nE, g_w.pl_out_scale[L]);
     }
+
+    /* dxout: exactly what this function returns for attn_only == 0, and exactly what
+     * SP_HIDDEN_DUMP_DX writes on the served side. L = 30 means "after the stack". */
+    g4_dump_kv_tap("probe", "dxout", 30, 0, dx, n_tok, E, st);
 
     /* ── ETA.4: final norm + (tied) head + logit softcap (gemma4.c 243-249) ── */
     if (full) {
@@ -7784,7 +7925,9 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
         const int win=global?-1:SW;
         const float ascale=1.0f;
         const size_t nE=(size_t)n*E;
+        g4_dump_kv_tap("served", "dxin", L, P, dx, n, E, st);
         k_rmsnorm<<<n,256,0,st>>>(dx, g_w.attn_norm[L], E, eps, dnx);
+        g4_dump_kv_tap("served", "nx", L, P, dnx, n, E, st);
         MMB(&g_w.Wq[L],dnx,dq);
         k_rmsnorm_head<<<n*nh,256,0,st>>>(dq, g_w.q_norm[L], nh, hd, qd, eps);
         if (P == 0) {
@@ -7794,12 +7937,14 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
             if (ffac) k_rope_freqs_atn<<<n*nh,hd/2,0,st>>>(dq,nh,hd,qd,rbase,ffac,P);
             else      k_rope_at<<<n*nh,hd/2,0,st>>>(dq,nh,hd,qd,rbase,P);
         }
+        g4_dump_kv_tap("served", "q", L, P, dq, n, qd, st);
         float *Kuse=NULL,*Vuse=NULL;
         if (L < kvfs) {                                  /* OWNER: project, norm, rope, SINK to resident */
             MMB(&g_w.Wk[L],dnx,dk);
             if (g_w.Wv[L].f32 || g_w.Wv[L].codes) { MMB(&g_w.Wv[L],dnx,dv); }
             else cudaMemcpyAsync(dv,dk,(size_t)n*kvd*sizeof(float),cudaMemcpyDeviceToDevice,st);
             k_rmsnorm_head<<<n*nkv,256,0,st>>>(dk, g_w.k_norm[L], nkv, hd, kvd, eps);
+            g4_dump_kv_tap("served", "kpre", L, P, dk, n, kvd, st);
             if (P == 0) {
                 if (ffac) k_rope_freqs<<<n*nkv,hd/2,0,st>>>(dk,nkv,hd,kvd,rbase,ffac);
                 else      k_rope<<<n*nkv,hd/2,0,st>>>(dk,nkv,hd,kvd,rbase);
@@ -7807,6 +7952,7 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
                 if (ffac) k_rope_freqs_atn<<<n*nkv,hd/2,0,st>>>(dk,nkv,hd,kvd,rbase,ffac,P);
                 else      k_rope_at<<<n*nkv,hd/2,0,st>>>(dk,nkv,hd,kvd,rbase,P);
             }
+            g4_dump_kv_tap("served", "krope", L, P, dk, n, kvd, st);
             k_rmsnorm_head_noweight<<<n*nkv,256,0,st>>>(dv,nkv,hd,kvd,eps);
             const int h16 = G4_KV_FP16_LAYER(s, L);
             /* ── KV READ/STORE CONSISTENCY — and an honest refutation (2026-08-20) ──────
@@ -7835,6 +7981,11 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
                   k_round_f16<<<nb16, 256, 0, st>>>(dk, (size_t)n*kvd);
                   k_round_f16<<<nb16, 256, 0, st>>>(dv, (size_t)n*kvd);
               } }
+            /* AS STORED: after the fp16 round, so "kpost" is the bytes this batch's
+             * attention and every later read of the cache actually see. krope vs kpost
+             * on this side is the fp16 store in isolation. */
+            g4_dump_kv_tap("served", "kpost", L, P, dk, n, kvd, st);
+            g4_dump_kv_tap("served", "v",     L, P, dv, n, kvd, st);
             if (P > 0) {
                 /* ── #41b SUFFIX OWNER ─────────────────────────────────────────────── */
                 if (!ring_on || global) {
@@ -7976,6 +8127,10 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
             else k_attn_from_T<float><<<n*nh, bd, (size_t)(pre+n)*sizeof(float), st>>>(
                 dq, Kuse, Vuse, pre, qd, kvd, hd, grp, ascale, win, dao);
         }
+        /* ONE site, after every attend branch converges: the flat P==0 kernel, the two
+         * k_attn_from_T/g4_prefill_attn suffix branches and the ring comb all land here,
+         * so the tap cannot be armed for one of them and silently absent from another. */
+        g4_dump_kv_tap("served", "ao", L, P, dao, n, qd, st);
         MMB(&g_w.Wo[L],dao,dap);
         k_rmsnorm<<<n,256,0,st>>>(dap, g_w.post_attn[L], E, eps, dnx);
         k_add<<<(unsigned)((nE+255)/256),256,0,st>>>(dx,dnx,nE);
@@ -8081,6 +8236,12 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
              * Pmax*E allocation is not needed. Order matters — after the rmsnorm, `dnx`
              * holds the normed rows and `dx` is still the residual, but reusing the buffer
              * in the other order would overwrite dx's staged copy before it is written. */
+            /* The SAME dx, through the kv tap, so the parity quantity can be compared
+             * without the /v1/hidden JSON route or this file's suffix-alignment rule in
+             * between. When the per-layer scan says the forwards agree and the dx parity
+             * says they do not, that is the only way to tell which of the two is wrong.
+             * (Nested under g_hd_f like the rest of this block: arm --dump with it.) */
+            g4_dump_kv_tap("served", "dxout", 30, P, dx, n, E, st);
             if (g_hdx_f && g_hd_host && cudaStreamSynchronize(st) == cudaSuccess
                 && cudaMemcpy(g_hd_host, dx, (size_t)n * (size_t)E * sizeof(float),
                               cudaMemcpyDeviceToHost) == cudaSuccess) {
