@@ -5122,6 +5122,13 @@ static int g4_kv_step(sp_g4_kv *s, int do_head);  /* A1: fwd for g4_kv_step_grap
  * Default-off (env unset) ⇒ g_hd_f==NULL ⇒ byte-identical. Uses the RESIDENT weights +
  * kernels the daemon serves with (no separate probe = no residency mismatch). */
 static FILE  *g_hd_f    = NULL;   /* dump file for the current prefill (NULL = off) */
+/* SP_HIDDEN_DUMP_DX: the same positions one step earlier, BEFORE out_norm. Exists so a
+ * parity comparison against gemma4_cuda_probe's band read (which is pre-norm) does not
+ * have to fit the final norm -- fitting it produced a "gain" of median 7.3, which is not
+ * an RMSNorm weight, i.e. the transform was confounded with the measurement. Batched
+ * prefill only: the per-token dump currently captures nothing (pos=0, separate open
+ * item), so there is no working dnx there to pair a dx with. */
+static FILE  *g_hdx_f   = NULL;
 /* G-VERBATIM (2026-07-12): the tap closed at prefill end, so we had ONLY ever measured
  * the prefill forward — which is provably CORRECT (its hiddens predict 4,4,7,1 with
  * margins 3-8). Every token the user actually SEES comes out of the DECODE steps, which
@@ -8030,6 +8037,17 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
       if (hdp && *hdp) {
         if (P == 0) { if (g_hd_f) fclose(g_hd_f); g_hd_f = fopen(hdp, "wb"); g_hd_pos = 0; }
         else if (!g_hd_f) { g_hd_f = fopen(hdp, "ab"); }
+        /* Same truncate-on-P==0 / append-otherwise rule as the dnx file above, so the two
+         * stay row-aligned across the chunks gemma4_kv_prefill_batched splits this into. */
+        { const char *hdx = getenv("SP_HIDDEN_DUMP_DX");
+          if (hdx && *hdx) {
+              if (P == 0) { if (g_hdx_f) fclose(g_hdx_f); g_hdx_f = fopen(hdx, "wb"); }
+              else if (!g_hdx_f) { g_hdx_f = fopen(hdx, "ab"); }
+              if (!g_hdx_f) {
+                  fprintf(stderr, "[g4-kv] hidden dump dx: fopen(%s) FAILED\n", hdx);
+                  fflush(stderr);
+              }
+          } }
         /* THE DECODE BRANCH GUARDS ON g_hd_dev, NOT JUST g_hd_f. g4_kv_step opens with
          * `if (g_hd_f && g_hd_dev)` and streams out of g_hd_host, and BOTH were allocated
          * only inside the per-token prefill's open block — so opening the file here and
@@ -8046,6 +8064,29 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
             /* out_norm over all n rows, into the scratch the forward has already finished
              * with. n blocks, one per position — the n-wide form of the per-token tap.
              * Staged through g_hd_host, which is already Pmax*E and so always >= n*E. */
+            /* ── THE PRE-NORM RESIDUAL, SO PARITY NEEDS NO TRANSFORM (2026-09-19) ───────
+             * SP_HIDDEN_DUMP gives post-out_norm `dnx`, and gemma4_cuda_probe's band read
+             * gives pre-norm `dx`. Comparing them means fitting the norm, and a fit is an
+             * experiment of its own: done that way the recovered "gain" came out with
+             * median 7.3 and max 565, which is not an RMSNorm weight — so the transform
+             * was confounded with the thing being measured and the relL2 said nothing
+             * about whether the two forwards agree.
+             *
+             * SP_HIDDEN_DUMP_DX writes the SAME positions one step earlier, before the
+             * final norm, so probe-dx meets served-dx directly and the comparison is a
+             * plain scale-free relL2 in the attention-parity convention.
+             *
+             * Written BEFORE the rmsnorm, and staged through the same g_hd_host: the two
+             * D2H copies are sequential on one stream, so one buffer is safe and a second
+             * Pmax*E allocation is not needed. Order matters — after the rmsnorm, `dnx`
+             * holds the normed rows and `dx` is still the residual, but reusing the buffer
+             * in the other order would overwrite dx's staged copy before it is written. */
+            if (g_hdx_f && g_hd_host && cudaStreamSynchronize(st) == cudaSuccess
+                && cudaMemcpy(g_hd_host, dx, (size_t)n * (size_t)E * sizeof(float),
+                              cudaMemcpyDeviceToHost) == cudaSuccess) {
+                fwrite(g_hd_host, sizeof(float), (size_t)n * (size_t)E, g_hdx_f);
+                fflush(g_hdx_f);
+            }
             k_rmsnorm<<<n, 256, 0, st>>>(dx, g_w.out_norm, E, eps, dnx);
             if (g_hd_host && cudaStreamSynchronize(st) == cudaSuccess
                 && cudaMemcpy(g_hd_host, dnx, (size_t)n * (size_t)E * sizeof(float),
@@ -8065,6 +8106,7 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
                   /* Closing per chunk is safe: `gemma4_kv_prefill_batched` calls this
                    * function again with P>0, which reopens in append mode above. */
                   fclose(g_hd_f); g_hd_f = NULL;
+                  if (g_hdx_f) { fclose(g_hdx_f); g_hdx_f = NULL; }
               } }
         }
       } }
