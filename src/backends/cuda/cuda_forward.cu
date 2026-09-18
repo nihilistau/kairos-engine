@@ -2424,6 +2424,26 @@ extern "C" int gemma4_cuda_probe(const qwen3_model *m, const int32_t *tokens,
     if (full) n_layers = NL;
     if (n_layers < 0) n_layers = 0;
     if (n_layers > NL) n_layers = NL;
+    /* ── A TRUNCATED READ ON AN ALTUP MODEL WOULD NOT BE THE SERVED FORWARD (2026-09-18).
+     * The AltUp per-layer-input injection below is gated on `full`, because `dipl` — the
+     * per-layer input state it needs — is only allocated in the full-forward branch. On a
+     * checkpoint with g4_n_embd_per_layer != 0 that makes a band read a DIFFERENT
+     * computation from the one the daemon serves, and it would come back as a perfectly
+     * plausible residual with no way to tell.
+     *
+     * So refuse it and say why, rather than answer. This checkpoint reports PL == 0
+     * (hidden_size_per_layer_input = 0), so band reads are unaffected here; the refusal
+     * exists for the model that is not this one. Implementing AltUp in the truncated path
+     * means allocating and threading dipl outside `full`, which is real work and is not
+     * done. The sibling half of this — the per-layer out_scale — WAS wrongly gated and is
+     * fixed below; it applies on this model. */
+    if (!full && PL) {
+        sp_set_error("gemma4_cuda_probe: truncated read (attn_only != -1) is not supported "
+                     "on an AltUp checkpoint (g4_n_embd_per_layer != 0): the per-layer-input "
+                     "injection is only wired in the full-forward path, so the residual "
+                     "would not be what the daemon serves. Use attn_only = -1.");
+        return 1;
+    }
 
     if (g_w.key != m) { free_weights(&g_w); if (build_weights(m, &g_w)) return 1; }
     cublasHandle_t cb = g_w.cublas;
@@ -2673,7 +2693,25 @@ extern "C" int gemma4_cuda_probe(const qwen3_model *m, const int32_t *tokens,
             k_rmsnorm<<<n_tok, 256, 0, st>>>(dpp, g_w.pl_post_norm[L], E, eps, dnx);
             k_add<<<(unsigned)((nE+255)/256), 256, 0, st>>>(dx, dnx, nE);
         }
-        if (full && g_w.pl_out_scale && g_w.pl_out_scale[L])
+        /* ── OUT_SCALE IS PART OF THE BLOCK, IN EVERY MODE (2026-09-18) ──────────────
+         * This read `if (full && ...)`, which made the truncated read the ONLY path in
+         * this file that skips the per-layer output scale. Seven other call sites apply
+         * it unconditionally — 4082, 4157 and 4544 in gemma4_decode_cuda, 6366 and 6661
+         * on the resident KV path, and 7953 in gemma4_kv_prefill_batched_from, which is
+         * the one that actually serves. One path out of eight, and it was the path whose
+         * whole purpose is to report what the other seven compute: AGENTS.md section 0,
+         * an invariant enforced in one of two paths.
+         *
+         * It was not moot on this checkpoint either, which is the part worth writing
+         * down. `pl_out_scale` is allocated on `m->layers[0].out_scale` (line 2061),
+         * NOT on g4_n_embd_per_layer — so it exists and applies even where AltUp is off
+         * (this model reports hidden_size_per_layer_input = 0). I had reasoned the
+         * header's "AltUp/out_scale are NOT in the probe path" caveat was moot here
+         * because PL == 0. Half of it was; this half was not.
+         *
+         * A truncated read must be a PREFIX of the served forward or it is a different
+         * computation wearing the same name. */
+        if (g_w.pl_out_scale && g_w.pl_out_scale[L])
             k_scale_by_dev<<<(unsigned)((nE+255)/256), 256, 0, st>>>(dx, nE, g_w.pl_out_scale[L]);
     }
 
