@@ -85,6 +85,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat",           post(v1_chat))
         // KAI-5 read-only hidden tap (default-off SP_HIDDEN_TAP=1; offline Voice-Head distill)
         .route("/v1/hidden",         post(crate::routes::v1_hidden))
+        // Same flag as the tap: /v1/hidden takes token IDS, so a caller needs the model's
+        // own tokenizer to ask about a specific word. Nothing outside this process can
+        // read an .sp-tokenizer (2026-09-18).
+        .route("/v1/tokenize",       post(crate::routes::v1_tokenize))
         .route("/v1/chat/stream",    get(v1_chat_stream_stub))
         // Chat-integration: MeMo (Grounding → Entity ID → Synthesis) dialogue.
         .route("/v1/dialogue",       post(v1_dialogue))

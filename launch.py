@@ -29,6 +29,18 @@ def wait_http(url: str, secs: int) -> bool:
     return False
 
 
+def daemon_argv(exe: str, model: str, tokenizer: str, port) -> list:
+    """THE argv. One copy, because the arguments are the half that actually drifted —
+    "--daemon-only launching with last month's arguments" is what the ONE COPY rule in
+    this module's header was written about (2026-08-06).
+
+    Extracted 2026-09-18 when a THIRD caller appeared: the band-calibration probe boot
+    (tools/jlens_probe.py), which needs a different port, a different log, a scrubbed
+    environment and the PID back. Those differ per caller; the arguments must not."""
+    return [exe.replace("/", "\\"), "start",
+            "--model", model, "--tokenizer", tokenizer, "--port", str(port)]
+
+
 def launch_daemon(c: dict, env: dict) -> bool:
     """Start the engine and wait for it to answer. True if it came up.
 
@@ -42,9 +54,8 @@ def launch_daemon(c: dict, env: dict) -> bool:
     daemon_log.write("\n-- boot %s --\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
     daemon_log.flush()
     subprocess.Popen(
-        [c["paths"]["engine_exe"].replace("/", "\\"), "start",
-         "--model", c["paths"]["model"], "--tokenizer", c["paths"]["tokenizer"],
-         "--port", str(c["serve"]["port"])],
+        daemon_argv(c["paths"]["engine_exe"], c["paths"]["model"],
+                    c["paths"]["tokenizer"], c["serve"]["port"]),
         env=env, stdout=daemon_log, stderr=subprocess.STDOUT,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return wait_http(f"http://127.0.0.1:{c['serve']['port']}/v1/metrics", 90)
@@ -63,7 +74,14 @@ def daemon_images(c=None) -> list:
 
 def stop_daemon(c=None) -> None:
     """Kill the daemon and the voice server only — never the gateway (the room's start
-    button runs through here and must not kill the thing that pressed it)."""
+    button runs through here and must not kill the thing that pressed it).
+
+    BY IMAGE NAME, WHICH CANNOT TELL TWO DAEMONS APART (noted 2026-09-18). `taskkill /IM`
+    matches every process with that basename, so once a second sp-daemon exists on another
+    port — the calibration probe boot — this function kills BOTH and a probe teardown that
+    used it would take her engine down with it. That is why tools/jlens_probe.py stops its
+    own child by PID and must never call this. Her stack is the only thing entitled to a
+    kill-by-name, because it is the only one whose identity IS "the sp-daemon on this box"."""
     for img in daemon_images(c):
         subprocess.run(["taskkill", "/F", "/IM", img], capture_output=True)
 

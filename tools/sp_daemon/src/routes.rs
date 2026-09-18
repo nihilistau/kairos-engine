@@ -5402,6 +5402,12 @@ Tag of the answer (or [NULL]):");
     // tap is two D2H copies on steps the turn runs anyway. Files + meta written at
     // turn end (after the decode loop). Offline-batch rail ONLY: capture_feat commits
     // like any decode (routes.rs:787 note is about PRE-cache routing, not this site).
+    // 3840 is the DENSE REFERENCE hidden width and that is deliberate here: this rail's
+    // captures and the heads fitted on them live on that substrate. NOT the same bug as
+    // v1_hidden's pinned geometry, fixed 2026-09-18 — that route serves an arbitrary
+    // caller and had to ask the loaded model; this one is tied to an existing corpus, and
+    // retargeting it to 2816 with no capture to re-measure would silently invalidate every
+    // artifact fitted against it. Change it WITH a receipt or not at all.
     const F3_E: usize = 3840; // the dense reference model hidden (UNIFICATION substrate map)
     let f3_dir = std::env::var("SP_F3_CAPTURE").ok().filter(|s| !s.is_empty())
         .filter(|_| cfg!(feature = "legacy_policy"));  // P1b: F3 capture rail = RESEARCH
@@ -5506,6 +5512,11 @@ Tag of the answer (or [NULL]):");
             let b = std::fs::read(&p).map_err(|e| {
                 tracing::warn!("SPECTEST-HEAD: read {p} failed ({e}) — head disabled");
             }).ok()?;
+            // The SPH1 BLOB's own field width in bytes (3840 f32), not a model geometry
+            // read — the file format is fixed and a blob is either this shape or rejected
+            // four lines down. Untouched by the 2026-09-18 v1_hidden geometry fix for that
+            // reason: making this 2816 would reject every existing head rather than read a
+            // new one. A 26B-substrate head would be a new magic, not a new length.
             const VLEN: usize = 3840 * 4;
             if b.len() < 16 + VLEN + 8 || &b[..4] != b"SPH1" {
                 tracing::warn!("SPECTEST-HEAD: bad blob {p} — head disabled");
@@ -7777,14 +7788,26 @@ mod chat_integration_tests {
 }
 
 // ── KAI-5: read-only hidden-state tap (/v1/hidden). Default-OFF (SP_HIDDEN_TAP=1).
-// Runs gemma4_cuda_probe(attn_only=0) on the RESIDENT GPU weights (g_w) and returns the
-// per-position residual hidden [n, E=3840]. Read-only: the probe allocates its OWN
-// scratch and never touches the resident KV cache, so the served forward is unaffected.
-// For offline Voice-Head self-distillation (ADR-KAI5); use with the daemon otherwise idle.
+// Runs gemma4_cuda_probe on the RESIDENT GPU weights (g_w) and returns the per-position
+// residual hidden [n, hidden_dim] at a CALLER-CHOSEN depth. Read-only: the probe allocates
+// its OWN scratch and never touches the resident KV cache, so the served forward is
+// unaffected. For offline Voice-Head self-distillation (ADR-KAI5) and, since 2026-09-18,
+// for band calibration — where in the stack does a concept exist without being the next
+// word. Use with the daemon otherwise idle.
+//
+// IT IS A PREFILL. The probe is a one-shot forward over the tokens you hand it, with its
+// own scratch — it is NOT the resident decode path, and it cannot tell you anything about
+// state across GENERATED tokens. A "hold that persisted while she was speaking" read off
+// this route would be a prefill residual wearing a decode claim. Different question,
+// different door (SP_G4_DEC_PROBE / SP_G4_DEC_DUMP).
 mod hidden_tap {
     use std::os::raw::{c_int, c_void};
     extern "C" {
         pub fn sp_model_to_gemma4(m: *const c_void) -> *const c_void;
+        /// THE MoE ONE. sp_model.h:194 — "gemma4 backbone + MoE FFN, AR decode (26B-A4B)".
+        /// The served checkpoint is SP_ARCH_GEMMA4_MOE and the dense converter returns
+        /// NULL for it, which is what "sp_model_to_gemma4 null" was (2026-09-18).
+        pub fn sp_model_to_gemma4_moe(m: *const c_void) -> *const c_void;
         pub fn gemma4_cuda_probe(m: *const c_void, tokens: *const i32, n_tok: c_int,
                                  n_layers: c_int, attn_only: c_int, out_x: *mut f32) -> c_int;
         pub fn sp_last_error() -> *const std::os::raw::c_char;
@@ -7799,10 +7822,49 @@ mod hidden_tap {
 }
 
 #[derive(serde::Deserialize)]
-pub struct HiddenReq { pub tokens: Vec<i32> }
+pub struct HiddenReq {
+    pub tokens: Vec<i32>,
+    /// Stop after this many blocks. None = the whole stack. 0 = embed+scale only.
+    /// This is the knob that makes the route a BAND reader instead of a last-layer reader:
+    /// the probe ABI has always taken it (cuda_backend.h), the route just never passed it.
+    pub n_layers: Option<i32>,
+    /// The probe ABI has THREE modes and the public header documents two:
+    ///   `0`  (default) stop after block n_layers-1's FFN residual  -> [n, hidden_dim]
+    ///   `-1`           ETA.4 FULL forward: n_layers forced to the whole stack, final norm
+    ///                  + tied head + logit softcap run, output is LOGITS [n, vocab].
+    ///   `1`            attention residual — ACCEPTED BY THE ABI, REFUSED BY THIS ROUTE.
+    ///                  See the match below for why (layer-dependent row stride).
+    /// -1 is the parity mode: the only one that reaches the head, so the only one that can
+    /// be compared against the served path to show the probe computes the same forward at
+    /// all. Establish that before trusting any truncated read from mode 0.
+    pub attn_only: Option<i32>,
+}
 
 #[derive(serde::Serialize)]
-pub struct HiddenResp { pub n: usize, pub e: usize, pub hidden: Vec<f32> }
+pub struct HiddenResp {
+    pub n: usize,
+    /// The MODEL's hidden width (geometry), whatever mode ran.
+    pub e: usize,
+    /// The row stride of `hidden` — `e` for modes 0/1, vocab_size for mode -1, and `qd`
+    /// (not `e`) is what mode 1 actually writes on an MQA/GQA model. Always divide by this,
+    /// never by `e`: the two differ in two of the three modes.
+    pub width: usize,
+    /// Echoed back RESOLVED, after clamping — never assume the request's value was used.
+    pub n_layers: i32,
+    pub attn_only: i32,
+    /// n_layers of the loaded model, so a caller can turn `n_layers` into a DEPTH FRACTION
+    /// without a second round trip or a hardcoded 30.
+    pub model_layers: i32,
+    /// g4_n_embd_per_layer: non-zero means this checkpoint has an AltUp per-layer-input path.
+    /// Reported because cuda_backend.h says the probe does NOT implement AltUp/out_scale, so
+    /// on such a model this residual may not be what the served forward computes. The route
+    /// cannot know whether that matters; it can refuse to hide it. Parity is the caller's job.
+    pub altup_width: u32,
+    /// sp_arch_info wire arch_id, so a receipt records WHICH model the
+    /// depth fractions were measured on rather than trusting a filename.
+    pub arch_id: u32,
+    pub hidden: Vec<f32>,
+}
 
 /// Reconstruct the gemma4 view (qwen3_model) once and cache the pointer (weights are
 /// shared with the resident model — never freed here).
@@ -7817,14 +7879,105 @@ pub async fn v1_hidden(
     }
     let n = req.tokens.len();
     if n == 0 { return (StatusCode::BAD_REQUEST, "no tokens").into_response(); }
-    const E: usize = 3840;   // the dense reference model hidden width
-    const NL: i32 = 48;      // the dense reference model layers
+    // ── GEOMETRY IS READ, NOT PINNED (2026-09-18) ────────────────────────────────────
+    // This was `const E: usize = 3840; const NL: i32 = 48;` — the DENSE REFERENCE model's
+    // width and depth. The served checkpoint is 2816 x 30, so every call allocated
+    // n*3840 floats, asked for 48 blocks of a 30-block stack, and returned a buffer whose
+    // row stride was wrong by 1024 floats. The route has been unreachable-by-correctness
+    // since the model changed, which nothing noticed because it has no caller.
+    //
+    // daemon.rs already fixed exactly this class for the recall layer — "These used to be
+    // consts pinned to the dense reference model (HD=512, NL=48, PERIOD=6, G_NH=16)" — and
+    // the fix is the same: ask the model. sp_arch_info carries hidden_dim and n_layers.
+    //
+    // NOT TOUCHED: F3_E and VLEN elsewhere in this file are also 3840, and they are NOT
+    // this bug. 3840 is the gemma4-12B hidden width and the F3/SPECTEST captures may still
+    // be built on that substrate; retargeting them here, with no receipt and no capture to
+    // re-measure, would break a rail that was never about the 26B.
+    let arch = match state.model.arch_info() {
+        Ok(a) => a,
+        Err(msg) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("sp_model_arch: {msg}")).into_response(),
+    };
+    let e_dim = arch.hidden_dim as usize;
+    let model_layers = arch.n_layers as i32;
+    if e_dim == 0 || model_layers <= 0 {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("degenerate geometry: hidden_dim={e_dim} n_layers={model_layers}"))
+            .into_response();
+    }
+    // Clamped, and the RESOLVED values are echoed in the response: a caller that asked for
+    // layer 48 of a 30-layer stack must be told it got 30, not left to assume.
+    //
+    // attn_only is NOT clamp(0,1). -1 is the ETA.4 full forward and the first draft of
+    // this clamp silently deleted it — which would have removed the only mode that reaches
+    // the head, i.e. the only mode that can be compared against the served path. Reading
+    // the probe's own body is what caught it: `const int full = (attn_only == -1)`, a third
+    // mode the public header does not mention. An enum clamped to the documented values is
+    // still wrong when the documentation is short.
+    let n_layers = req.n_layers.unwrap_or(model_layers).clamp(0, model_layers);
+    let attn_only = match req.attn_only.unwrap_or(0) {
+        -1 => -1,
+        0 => 0,
+        // MODE 1 IS REFUSED RATHER THAN GUESSED. It writes `dao`, the attention output, at
+        // n_tok*qd — and qd is n_head*head_dim on a GLOBAL layer but g4_nh_swa*g4_hd_swa on
+        // a sliding-window one (4096 vs 2048 here), so the row stride depends on which kind
+        // of layer n_layers-1 happens to be. That is derivable from the arch plus the SWA
+        // period, and it is not derived yet. Returning a buffer whose stride this route
+        // guessed is the 3840-vs-2816 bug with a new number, so: say no, name the reason.
+        v => return (StatusCode::BAD_REQUEST,
+                     format!("attn_only={v} unsupported: 0 = FFN residual [n, hidden_dim], \
+                              -1 = full forward logits [n, vocab]. Mode 1 (attention \
+                              residual) is refused because its row stride is qd, which \
+                              differs between global and sliding-window layers and this \
+                              route does not derive it yet."))
+            .into_response(),
+    };
+    // Mode -1 returns LOGITS [n, vocab], not a residual [n, E] — a caller sizing its buffer
+    // from `e` would under-allocate by ~93x on this vocabulary. The probe forces
+    // n_layers = NL in that mode too, so both are reported back resolved.
+    let out_width = if attn_only == -1 { arch.vocab_size as usize } else { e_dim };
+    let n_layers = if attn_only == -1 { model_layers } else { n_layers };
     // scoped so no raw pointer lives across the .await (a !Send future breaks the handler)
+    // ── THE CONVERTER IS PER-ARCH, AND THIS ROUTE HAD THE DENSE ONE (2026-09-18) ──────
+    // `sp_model_to_gemma4` returns NULL for a MoE checkpoint, so every call to this route
+    // died with "sp_model_to_gemma4 null" on the model actually being served. Third
+    // dense-reference assumption in one function, after E=3840 and NL=48 — the route was
+    // written for a model this box no longer runs, and had no caller to notice.
+    //
+    // arch_id here is the WIRE value from sp_arch_info (QWEN3=2, GEMMA3=3 in its own
+    // comment), i.e. the SP_ARCH_ID_* set, NOT the internal SP_ARCH_* one where GEMMA4 is
+    // 3 and GEMMA4_MOE is 6. Two enums, both in scope, four lines apart in the greps —
+    // worth spelling out rather than leaving a bare 11.
+    const ARCH_ID_GEMMA4: u32 = 7;
+    const ARCH_ID_GEMMA4_MOE: u32 = 11;
     let qm: usize = {
         let sp_ptr = state.model.as_ptr() as *const std::os::raw::c_void;
-        *HIDDEN_QM.get_or_init(|| unsafe { hidden_tap::sp_model_to_gemma4(sp_ptr) } as usize)
+        match HIDDEN_QM.get() {
+            Some(&v) => v,
+            None => {
+                let v = unsafe {
+                    match arch.arch_id {
+                        ARCH_ID_GEMMA4_MOE => hidden_tap::sp_model_to_gemma4_moe(sp_ptr),
+                        ARCH_ID_GEMMA4 => hidden_tap::sp_model_to_gemma4(sp_ptr),
+                        _ => std::ptr::null(),
+                    }
+                } as usize;
+                // CACHE ONLY SUCCESS. `get_or_init` memoised the NULL, so one failed
+                // conversion made the route permanently dead for the process lifetime —
+                // a transient fault becoming terminal, and indistinguishable from the
+                // real bug above while diagnosing it.
+                if v != 0 { let _ = HIDDEN_QM.set(v); }
+                v
+            }
+        }
     };
-    if qm == 0 { return (StatusCode::INTERNAL_SERVER_ERROR, "sp_model_to_gemma4 null").into_response(); }
+    if qm == 0 {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("no gemma4 view for arch_id={} (expected {} GEMMA4 or {} GEMMA4_MOE); \
+                         the converter returned null", arch.arch_id,
+                        ARCH_ID_GEMMA4, ARCH_ID_GEMMA4_MOE)).into_response();
+    }
     // ── THE TAP IS A FORWARD (2026-08-29 audit, F-8): this ran gemma4_cuda_probe
     // with no device lock, no yield, ON THE RUNTIME THREAD — the distill harness
     // tapping mid-turn was the wedge class through the door tonight's pass missed,
@@ -7834,17 +7987,87 @@ pub async fn v1_hidden(
     let toks = req.tokens.clone();
     let res = task::spawn_blocking(move || -> Result<Vec<f32>, String> {
         let _gpu = device_guard(&app, "hidden_tap");
-        let mut out = vec![0f32; n * E];
+        let mut out = vec![0f32; n * out_width];
         let rc = unsafe {
             hidden_tap::gemma4_cuda_probe(qm as *const std::os::raw::c_void, toks.as_ptr(),
-                                          n as i32, NL, 0, out.as_mut_ptr())
+                                          n as i32, n_layers, attn_only, out.as_mut_ptr())
         };
         if rc != 0 { return Err(format!("probe rc={rc}: {}", hidden_tap::last_error())); }
         Ok(out)
     }).await;
     match res {
-        Ok(Ok(out)) => Json(HiddenResp { n, e: E, hidden: out }).into_response(),
+        Ok(Ok(out)) => Json(HiddenResp {
+            n, e: e_dim, width: out_width, n_layers, attn_only, model_layers,
+            altup_width: arch.g4_n_embd_per_layer,
+            arch_id: arch.arch_id,
+            hidden: out,
+        }).into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response(),
     }
+}
+
+// ── /v1/tokenize — ids in, ids out. Default-OFF behind the same SP_HIDDEN_TAP flag.
+//
+// WHY IT HAD TO EXIST (2026-09-18). /v1/hidden takes TOKEN IDS, and the band calibration
+// it serves is built on questions like "what is the rank of the token `car` at depth d" —
+// which is unanswerable without knowing which id `car` is. The model is an .sp-model with
+// an .sp-tokenizer, both engine-native, so nothing outside this process can tokenize for
+// it: `tokenizers`, `sentencepiece` and `transformers` are all installed on the box and
+// all useless here. The alternative was reversing the .sp-tokenizer format in Python,
+// which would have been a SECOND implementation of the tokenizer — the thing this
+// codebase's §0 is about — and it would have drifted from the one that actually runs.
+//
+// It also returns the EOT STOP IDS, because the caller wants to compute eot_margin the
+// way the decode loop computes it (best stop logit minus best non-stop logit) rather than
+// re-deriving which ids count as a turn boundary. That derivation is
+// `tokenizer.eos_ids ++ turn_stop_ids()` and it belongs in one place.
+//
+// Same flag as the tap, deliberately: one switch for the whole calibration surface, so
+// "is the instrument reachable" has one answer instead of two.
+#[derive(serde::Deserialize)]
+pub struct TokenizeReq {
+    /// Text to encode. Either this or `ids` (for a decode round-trip); text wins.
+    pub text: Option<String>,
+    /// Ids to decode back to pieces — the round-trip check that `ids` mean what you think.
+    pub ids: Option<Vec<i32>>,
+}
+
+#[derive(serde::Serialize)]
+pub struct TokenizeResp {
+    pub ids: Vec<i32>,
+    /// One decoded piece per id, utf8-lossy. Lossy because a BPE piece can be half a
+    /// codepoint: that is real and the caller should see it rather than get an error.
+    pub pieces: Vec<String>,
+    /// eos_ids ++ turn_stop_ids(), exactly as run_kvdecode_chat builds eot_stop_ids.
+    pub stop_ids: Vec<i32>,
+    pub vocab_size: u32,
+}
+
+pub async fn v1_tokenize(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TokenizeReq>,
+) -> Response {
+    if std::env::var("SP_HIDDEN_TAP").ok().as_deref() != Some("1") {
+        return (StatusCode::FORBIDDEN, "tokenize disabled (set SP_HIDDEN_TAP=1)").into_response();
+    }
+    let tk = state.tokenizer.clone();
+    let ids: Vec<i32> = match (&req.text, &req.ids) {
+        (Some(t), _) => match tk.encode(t) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("encode: {e}")).into_response(),
+        },
+        (None, Some(v)) => v.clone(),
+        (None, None) => return (StatusCode::BAD_REQUEST, "give `text` or `ids`").into_response(),
+    };
+    let pieces: Vec<String> = ids.iter()
+        .map(|&id| String::from_utf8_lossy(tk.decode_token(id)).into_owned())
+        .collect();
+    let vocab_size = match state.model.arch_info() {
+        Ok(a) => a.vocab_size,
+        Err(_) => 0,
+    };
+    let stop_ids: Vec<i32> = tk.eos_ids.iter().copied()
+        .chain(tk.turn_stop_ids().iter().copied()).collect();
+    Json(TokenizeResp { ids, pieces, stop_ids, vocab_size }).into_response()
 }
