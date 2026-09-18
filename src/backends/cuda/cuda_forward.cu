@@ -2469,8 +2469,21 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
  * because a tap that is armed and silently writes nothing has already cost a
  * day on this bug. It costs a full stream sync, so it is off unless SP_DUMP_KV
  * names a path. */
-static void g4_dump_kv_tap(const char *who, const char *stage, int L, int P,
-                           const float *dsrc, int n, int kvd, cudaStream_t st)
+/* ONE writer, two arrival shapes. The PREFILL tap hands over n rows that begin at absolute
+ * position 0 and truncates; the DECODE tap hands over ONE row per generated token and must
+ * append, because g4_kv_step is called once per token and a truncating write would leave a
+ * file containing only the last one. Rather than a second copy of the fopen/D2H/fwrite that
+ * could drift from this one, both go through here and `append` picks the mode (AGENTS.md
+ * section 0).
+ *
+ * A decode row's position is NOT its row index -- the tap can be armed mid-session, and the
+ * first row is then whatever token was next. So an appending dump writes an int32 position
+ * per row to a `.pos` sidecar in lockstep, and the data file stays raw headerless f32 at one
+ * known width. Alignment guessed from row order is the defect that cost two withdrawn
+ * readings on the prefill side; it is not being reinvented here. */
+static void g4_dump_kv_tap_at(const char *who, const char *stage, int L, int pos,
+                              const float *dsrc, int n, int kvd, int append,
+                              cudaStream_t st)
 {
     const char *base = getenv("SP_DUMP_KV");
     if (!base || !*base) return;
@@ -2479,9 +2492,9 @@ static void g4_dump_kv_tap(const char *who, const char *stage, int L, int P,
       if (want >= 0 && L != want) return; }        /* -1 = every layer, for a scan */
     { const char *ssel = getenv("SP_DUMP_KV_STAGES");   /* comma list; unset = all */
       if (ssel && *ssel && !strstr(ssel, stage)) return; }
-    if (P != 0) {
+    if (!append && pos != 0) {
         fprintf(stderr, "[kvtap] %s %s L=%d DECLINED: P=%d is a reseam, not a fresh prefill\n",
-                who, stage, L, P);
+                who, stage, L, pos);
         return;
     }
     const size_t nfl = (size_t)n * (size_t)kvd;
@@ -2494,7 +2507,7 @@ static void g4_dump_kv_tap(const char *who, const char *stage, int L, int P,
     }
     char path[1024];
     snprintf(path, sizeof path, "%s.%s.L%02d.%s", base, who, L, stage);
-    FILE *f = fopen(path, "wb");
+    FILE *f = fopen(path, append ? "ab" : "wb");
     if (!f) {
         fprintf(stderr, "[kvtap] %s %s L=%d DECLINED: cannot open %s\n", who, stage, L, path);
         free(h); return;
@@ -2502,8 +2515,29 @@ static void g4_dump_kv_tap(const char *who, const char *stage, int L, int P,
     fwrite(h, sizeof(float), nfl, f);
     fclose(f);
     free(h);
+    if (append) {
+        /* the row -> position map, in lockstep, so nothing downstream has to infer it */
+        char ppath[1100];
+        snprintf(ppath, sizeof ppath, "%s.pos", path);
+        FILE *pf = fopen(ppath, "ab");
+        if (pf) { int32_t p32 = (int32_t)pos; fwrite(&p32, sizeof(int32_t), 1, pf); fclose(pf); }
+        /* One line per ARM, not per token: a decode tap fires once per generated token per
+         * layer, and a per-row line would bury the log it shares with her gateway. */
+        static int said = 0;
+        if (!said) { said = 1;
+            fprintf(stderr, "[kvtap] %s %s L=%d APPENDING one row/token (width %d) -> %s (+ .pos)\n",
+                    who, stage, L, kvd, path); }
+        return;
+    }
     fprintf(stderr, "[kvtap] %s %s L=%d wrote n=%d kvd=%d -> %s\n",
             who, stage, L, n, kvd, path);
+}
+
+/* The prefill shape: n rows starting at absolute position 0, truncating. */
+static void g4_dump_kv_tap(const char *who, const char *stage, int L, int P,
+                           const float *dsrc, int n, int kvd, cudaStream_t st)
+{
+    g4_dump_kv_tap_at(who, stage, L, P, dsrc, n, kvd, /*append=*/0, st);
 }
 
 /* attn_only modes: 1 = stop after last layer's attention residual; 2/3/4/5 =
@@ -2765,10 +2799,19 @@ extern "C" int gemma4_cuda_probe(const qwen3_model *m, const int32_t *tokens,
              * IT RAN, AND THE STORE IS NOT THE GAP: with this armed the divergence is
              * unchanged. Measured independently, the served round costs 1.76e-04 (krope
              * vs kpost on that side alone), which is two orders under the effect. The
-             * seed is `byteexact` — the chat default is ON (CONTRACT-CHAT-FULLSTACK S1),
-             * i.e. integer islands + CRT-NTT attention, against this probe's float
-             * k_attn — worth 9.5x at L=0 on a bit-identical block input. Kept because it
-             * is the only way to hold the store constant while varying that.
+             * seed of the probe-vs-DAEMON-DEFAULT gap is `byteexact` — field-absent means
+             * ON (CONTRACT-CHAT-FULLSTACK S1), i.e. integer islands + CRT-NTT attention
+             * against this probe's float k_attn, worth 9.5x at L=0 on a bit-identical
+             * block input.
+             *
+             * BUT THAT DEFAULT IS NOT WHAT SHE RUNS, and saying so was an error worth
+             * leaving written down. This MoE checkpoint REFUSES it — "SP_BYTEEXACT not
+             * implemented for the expert branch" — so a field-absent /v1/chat prefills and
+             * then dies at the decode head without emitting a token. Her profile sets
+             * byteexact = false and her harness sends it explicitly for exactly that
+             * reason. On the configuration she is actually served the seed is the fp16
+             * tensor-core GEMM alone. Kept because it is still the only way to hold the
+             * store constant while varying the attend.
              *
              * Placed to mirror the served ORDER exactly: rope, then weightless V-norm,
              * then the round. Unset, this is a no-op and the probe is byte-identical. */
@@ -6717,6 +6760,36 @@ static int g4_kv_step(sp_g4_kv *s, int do_head) {
         }
     }
     for (int L = 0; L < NL; L++) {
+        /* ── SERVED-PATH LAYER READ (2026-09-19, diagnostic, default off) ───────────────
+         * The UNNORMALIZED residual entering layer L of the RESIDENT decode step — the
+         * forward that actually answers /v1/chat.
+         *
+         * WHY HERE AND NOT THROUGH THE PROBE. `gemma4_cuda_probe` behind /v1/hidden is a
+         * different forward, and 2026-09-19 measured how different: writing e_L for the
+         * disagreement, one block is e_{L+1} ~ J_L e_L + eta_L, where eta_L is fresh
+         * rounding every `gemm_w_lift` mints and J_L only transports it. On the
+         * configuration she is ACTUALLY served — byteexact FALSE, which her profile sets
+         * and her harness sends explicitly because this MoE checkpoint refuses the
+         * daemon's field-absent ON default outright ("SP_BYTEEXACT not implemented for the
+         * expert branch") — eta is the fp16 tensor-core GEMM alone, ~1.5e-04 after one
+         * block, and I+J_ffn+Wo carries it at ~1.21x per layer to ~4e-02 by L=29.
+         * Attention only SMEARS that error across positions — a convex combination cannot
+         * grow a max-norm — which is why positions 0-1 stay near 3e-04 and the tail rises.
+         * No flag closes it: the two paths are two implementations, not one with a knob.
+         *
+         * Read the layer HERE and e_L is zero by construction: one forward, nothing to
+         * reconcile, no parity gate to pass. That is the whole point.
+         *
+         * NO CUDA-GRAPH COST ON THIS CHECKPOINT, which is the objection this normally
+         * meets. `use_graph` already carries `&& !moe_on`, and this model reports moe_on=1
+         * (NE=128, NU=8), so the graph fast path is declined for her whatever this does.
+         * What it does cost is a D2H plus a sync per tapped step, which is why it is off
+         * unless SP_DUMP_KV_DECODE=1 and why a caller should pick ONE layer rather than
+         * scan thirty. One row per generated token, appended, position in the sidecar. */
+        { static int dec_tap = -1;
+          if (dec_tap < 0) { const char *e = getenv("SP_DUMP_KV_DECODE"); dec_tap = (e && *e == '1'); }
+          if (dec_tap)
+              g4_dump_kv_tap_at("decode", "dxin", L, s->dpos_host, s->dx, 1, E, /*append=*/1, st); }
         /* ADR-012 CONTIGUOUS full-layer CPU tail: at the first tail layer, hand the residual + the
          * two shared-KV owner caches to host in ONE batched async D2H set + ONE sync, run EVERY
          * remaining layer on the CPU (attention+FFN+AltUp via gemma4_tail_cpu), hand the residual
