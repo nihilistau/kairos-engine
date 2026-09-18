@@ -2402,14 +2402,20 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
  * running, so gemma4_cuda_probe and gemma4_kv_prefill_batched_from can be
  * compared at the boundary that separates the write path from the score path.
  *
- * WHY THIS BOUNDARY. Position 0's residual already agrees between the two
- * paths to ~8e-05, which exonerates the per-position math — but it does NOT
- * exonerate K[0]. A softmax over a SINGLE key returns weight 1 whatever the
- * score is, so position 0 never reads its own key. Position 1 is the first
- * position where K[0] enters a real softmax, and position 1 is exactly where
- * the disagreement appears at full size: 6.383e-02, stable to four significant
- * figures across different prompts. Cosine ~1 here puts the fault in the
- * read/score path; cosine off 1 puts it in the write/RoPE path.
+ * WHY THIS BOUNDARY. Position 0's residual agrees between the two paths, which
+ * exonerates the per-position math — but it does NOT exonerate K[0]. A softmax
+ * over a SINGLE key returns weight 1 whatever the score is, so position 0 never
+ * reads its own key. Position 1 is the first position where K[0] enters a real
+ * softmax. Cosine ~1 here puts the fault in the read/score path; cosine off 1
+ * puts it in the write/RoPE path.
+ *
+ * IT ANSWERED: cosine 0.999999943 at L=0, so the write path is clean and the
+ * fault is the attend. WITHDRAWN on the way, and recorded here because this
+ * comment asserted it: "position 1 disagrees at 6.383e-02, stable to four
+ * significant figures across prompts". That was fixed REPEATED prompts under a
+ * persist-KV reseam. With a nonce at P == 0, position 1 is ~3e-03 and positions
+ * 0 and 1 are the CLEANEST in the sequence, because they attend over one or two
+ * keys and barely mix. Use a nonce.
  *
  * DEAD BY READING, so this tap deliberately does NOT reprint any of it: both
  * paths derive period/kvfs/g_hd/s_hd/g_base/s_base by the same expression with
@@ -2423,14 +2429,18 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
  * the P > 0 branch), so the position ids match too. Dumping is_swa, theta, src
  * or hd from both sites would only reprint the same integers.
  *
- * The differences this tap is pointed at, and the only ones left at P == 0:
- *   write  the served path rounds K and V through fp16 (companion sets
- *          kv.fp16 AND kv.fp16_globals, so G4_KV_FP16_LAYER is 1 on EVERY
+ * The differences this tap is pointed at:
+ *   write  the served path rounds K and V through fp16 (the companion profile
+ *          sets kv.fp16 AND kv.fp16_globals, so G4_KV_FP16_LAYER is 1 on EVERY
  *          layer) while the probe keeps fp32 scratch;
  *   score  g4_prefill_attn_flat (served) against k_attn (probe).
- * A third line, only worth opening if the first does not move pos 1: whether
- * the k_norm / weightless-V-norm KERNELS differ in precision between the paths.
- * The ORDER is already known to match.
+ *
+ * AND THE ONE THAT IS NOT AN ENV KNOB AT ALL, which is why it outlasted six
+ * such eliminations: `byteexact`. /v1/chat with the field ABSENT means ON
+ * (CONTRACT-CHAT-FULLSTACK S1) = exact-integer islands + CRT-NTT attention,
+ * against /v1/hidden's float k_attn. That is the SEED — 9.5x at L=0 on a
+ * bit-identical block input. A suspect list closed over environment variables
+ * is not closed; check the request body too.
  *
  * STAGES, in forward order within a block. "nx" is the block INPUT after
  * attn_norm; "q" is Q after q_norm and RoPE; "kpre" is K after k_norm and
@@ -2748,12 +2758,17 @@ extern "C" int gemma4_cuda_probe(const qwen3_model *m, const int32_t *tokens,
              * gated on G4_KV_FP16_LAYER, which companion makes 1 on EVERY layer via
              * kv.fp16 + kv.fp16_globals) so that its attention reads exactly the bytes
              * the sink stores. This probe keeps fp32 scratch and never rounds, which at
-             * P == 0 is one of only two surviving differences between the two forwards.
+             * P == 0 is one ENV-VISIBLE difference between the two forwards.
              *
-             * Arming this makes the probe's stored K/V bit-match the served store. If
-             * the position-1 relL2 of 6.383e-02 collapses, the fp16 store IS the gap and
-             * g4_prefill_attn_flat vs k_attn never needs opening; if it survives, the
-             * write path is exonerated and the score path is the remaining suspect.
+             * Arming this makes the probe's stored K/V bit-match the served store.
+             *
+             * IT RAN, AND THE STORE IS NOT THE GAP: with this armed the divergence is
+             * unchanged. Measured independently, the served round costs 1.76e-04 (krope
+             * vs kpost on that side alone), which is two orders under the effect. The
+             * seed is `byteexact` — the chat default is ON (CONTRACT-CHAT-FULLSTACK S1),
+             * i.e. integer islands + CRT-NTT attention, against this probe's float
+             * k_attn — worth 9.5x at L=0 on a bit-identical block input. Kept because it
+             * is the only way to hold the store constant while varying that.
              *
              * Placed to mirror the served ORDER exactly: rope, then weightless V-norm,
              * then the round. Unset, this is a no-op and the probe is byte-identical. */
