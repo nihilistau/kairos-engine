@@ -5583,6 +5583,27 @@ Tag of the answer (or [NULL]):");
     };
     // the margin at the step that PRODUCED the token we are about to emit
     let mut kairos_margin: f32 = f32::NAN;
+    // ── WHICH END CONDITION ACTUALLY FIRED (2026-09-19) ──────────────────────────────────
+    // `eot_margin` alone cannot say. It only knows whether the STOP TOKEN was leading; it
+    // knows nothing about the harness ending the turn on a decoded stop string, on the judge
+    // halt, on a fault, or on the cap. Without this, 26.6% of non-capped turns sit at
+    // margin <= 0 and are unattributable, which is why docs/SPEAK-OR-SILENT-2026-09-19.md can
+    // only publish FALSE-CONTINUE as a bound rather than a rate.
+    //
+    // THE DEFAULT IS max_tokens BECAUSE THAT IS THE FALL-THROUGH. The loop is
+    // `for _ in 0..max_tokens`; every other end takes a `break 'decode` and overwrites this.
+    // Running out of iterations is the one end with no statement of its own.
+    //
+    // `thought_ceiling` IS DELIBERATELY NOT A VALUE. The ceiling masks logits, it does not
+    // leave the loop, so a turn never ends "because of" it — shipping the value would create a
+    // label that can never appear, and an enum nobody can produce is worse than a missing one.
+    //
+    // PRIORITY IS THE CODE'S OWN ORDER, not a table: eos, judge_halt, stop_string, error,
+    // then fall-through. Only one site can run, so there is nothing to arbitrate. The one real
+    // ambiguity — a stop string matching ON the final allowed token — is recorded as
+    // `stop_string`, i.e. what actually ended it. The classifier is unaffected because it
+    // labels by `n_gen` hitting a cap, not by this field.
+    let mut finish_reason: &'static str = "max_tokens";
     // PERSIST-KV: the tokens we commit to the KV this turn (each is decode_step'd in the loop
     // body below). Appended to the prompt to form the next turn's reusable committed prefix.
     let mut committed_gen: Vec<i32> = Vec::new();
@@ -5610,6 +5631,7 @@ Tag of the answer (or [NULL]):");
         if (!tokenizer.eos_ids.is_empty() && tokenizer.eos_ids.contains(&next_token))
             || turn_stop_ids.contains(&next_token)
         {
+            finish_reason = "eos";          // the sampler chose a stop id last step
             break 'decode;
         }
         if eot_dbg && eot_gen.len() < 64 { eot_gen.push(next_token); }
@@ -5622,7 +5644,10 @@ Tag of the answer (or [NULL]):");
         // the babble never reaches the client. judge_ground gate => normal chat unchanged.
         if judge_ground.is_some() {
             let tb = String::from_utf8_lossy(token_bytes);
-            if tb.contains('\n') || tb.contains('`') { break 'decode; }
+            if tb.contains('\n') || tb.contains('`') {
+                finish_reason = "judge_halt";   // ground-judge concision halt, not a stop string
+                break 'decode;
+            }
         }
         let stop_hit = match dec_buf.push(token_bytes) {
             PushResult::Emit(bytes) => {
@@ -5638,6 +5663,15 @@ Tag of the answer (or [NULL]):");
                             cancel_child.store(1, Ordering::Relaxed);
                             let _ = app.events_tx.send(DaemonEvent::Chat { chat_id, status: "cancelled" });
                             sessions.remove(chat_id);
+                            // THE CANCEL END IS THE ONLY ONE THAT LEAVES BEFORE THE KAIROS LINE BELOW, so without
+                            // its own emit a client disconnect would be absent from the log entirely rather than
+                            // labelled, and absent reads as 'did not happen'. Same shape as the terminal line so one
+                            // parser handles both. The margin here is whatever the last COMPLETED step wrote, which
+                            // for a cancel is genuinely stale, and that is exactly why the reason must travel with it.
+                            if kairos_on {
+                                tracing::info!("KAIROS: turn ended — eot_margin={:.3} n_gen={} (client cancelled mid-stream) finish_reason={}",
+                                               kairos_margin, committed_gen.len(), "cancel");
+                            }
                             return;
                         }
                     }
@@ -5662,6 +5696,7 @@ Tag of the answer (or [NULL]):");
         app.tokens_decoded.fetch_add(1, Ordering::Relaxed);
 
         if stop_hit {
+            finish_reason = "stop_string";  // the harness matched decoded TEXT; no stop id won
             break 'decode;
         }
 
@@ -5702,6 +5737,7 @@ Tag of the answer (or [NULL]):");
             // K/V may come from a faulted launch while the lengths still agree. The
             // turn is dirty; the commit below must not describe this cache.
             cache_dirty = true;
+            finish_reason = "error";        // terminal-sync fault; the margin below is stale
             break 'decode;
         }
         if eot_dbg && eot_ranks.len() < 64 { eot_ranks.push(stop_rank(logits).1); }
@@ -5731,10 +5767,15 @@ Tag of the answer (or [NULL]):");
                           else { serde_json::Value::Null },
             "n_gen": committed_gen.len(),
             "eot_bias": eot_bias,
+            // Same enum on the wire as in the log, so a panel and a classifier reading this
+            // turn cannot disagree about why it ended.
+            "finish_reason": finish_reason,
             "chat_id": chat_id,
         });
-        tracing::info!("KAIROS: turn ended — eot_margin={:.3} n_gen={} (margin<=0 => she was cut off; ~0 => more to say)",
-                       kairos_margin, committed_gen.len());
+        // `finish_reason` goes LAST and carries no spaces, so the existing readers that split
+        // this line on `key=value` keep working unchanged (tools/eot_calibrate.py is one).
+        tracing::info!("KAIROS: turn ended — eot_margin={:.3} n_gen={} (margin<=0 => she was cut off; ~0 => more to say) finish_reason={}",
+                       kairos_margin, committed_gen.len(), finish_reason);
         // ── WAS SHE INTERRUPTED MID-THOUGHT? (2026-08-30, observability only) ──────
         // The thought CEILING closes `<channel|>` by masking every other logit, which
         // is an interruption mid-reasoning — and the suspicion is that the model then
