@@ -5583,6 +5583,18 @@ Tag of the answer (or [NULL]):");
     };
     // the margin at the step that PRODUCED the token we are about to emit
     let mut kairos_margin: f32 = f32::NAN;
+    // ── THE OTHER OPERATING POINT: "WOULD SHE START TALKING" (2026-09-19) ────────────────
+    // `kairos_margin` is overwritten every step, so what survives is the margin at the step
+    // that ENDED the turn -- "would she stop HERE". That is one question. The other, and the
+    // one a speak-or-silent policy would actually consult before she says anything, is whether
+    // the stop token was already leading at the FIRST decode step, i.e. whether she had
+    // anything to say at all. The two have different thresholds and only one of them was
+    // observable; docs/SPEAK-OR-SILENT-2026-09-19.md records that gap as open.
+    //
+    // Captured on the first step only, never overwritten, so it cannot silently become a copy
+    // of the terminal value on short turns.
+    let mut kairos_margin_first: f32 = f32::NAN;
+    let mut kairos_steps: u32 = 0;
     // ── WHICH END CONDITION ACTUALLY FIRED (2026-09-19) ──────────────────────────────────
     // `eot_margin` alone cannot say. It only knows whether the STOP TOKEN was leading; it
     // knows nothing about the harness ending the turn on a decoded stop string, on the judge
@@ -5742,7 +5754,11 @@ Tag of the answer (or [NULL]):");
         }
         if eot_dbg && eot_ranks.len() < 64 { eot_ranks.push(stop_rank(logits).1); }
         // KAIROS: read the impulse on the RAW logits, BEFORE the bias below tips her.
-        if kairos_on { kairos_margin = eot_margin_of(logits); }
+        if kairos_on {
+            kairos_margin = eot_margin_of(logits);
+            if kairos_steps == 0 { kairos_margin_first = kairos_margin; }
+            kairos_steps += 1;
+        }
         if eot_bias != 0.0 { for &s in &eot_stop_ids { logits[s] += eot_bias; } }
         next_token = sampler.sample(logits);
         sampler.observe(next_token);
@@ -5770,12 +5786,17 @@ Tag of the answer (or [NULL]):");
             // Same enum on the wire as in the log, so a panel and a classifier reading this
             // turn cannot disagree about why it ended.
             "finish_reason": finish_reason,
+            // The FIRST step's margin as well as the last: "would she start talking" against
+            // "would she stop here". Null until a turn actually decodes a step.
+            "eot_margin_first": if kairos_margin_first.is_finite() {
+                                    serde_json::json!(kairos_margin_first)
+                                } else { serde_json::Value::Null },
             "chat_id": chat_id,
         });
         // `finish_reason` goes LAST and carries no spaces, so the existing readers that split
         // this line on `key=value` keep working unchanged (tools/eot_calibrate.py is one).
-        tracing::info!("KAIROS: turn ended — eot_margin={:.3} n_gen={} (margin<=0 => she was cut off; ~0 => more to say) finish_reason={}",
-                       kairos_margin, committed_gen.len(), finish_reason);
+        tracing::info!("KAIROS: turn ended — eot_margin={:.3} n_gen={} (margin<=0 => she was cut off; ~0 => more to say) finish_reason={} eot_margin_first={:.3}",
+                       kairos_margin, committed_gen.len(), finish_reason, kairos_margin_first);
         // ── WAS SHE INTERRUPTED MID-THOUGHT? (2026-08-30, observability only) ──────
         // The thought CEILING closes `<channel|>` by masking every other logit, which
         // is an interruption mid-reasoning — and the suspicion is that the model then
