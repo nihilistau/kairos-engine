@@ -5917,11 +5917,55 @@ static unsigned char      *g_ec_pend = NULL;  /* [slots] */
 static int                 g_ec_slots = 0;
 static unsigned long long  g_ec_clock = 0;
 static long long           g_ec_hit = 0, g_ec_miss = 0;
+/* EVICTION POLICY (2026-09-29, SP_MOE_EVICT_HL). Unset/0 = LRU, byte-for-byte the old scan.
+ * > 0 = decayed-frequency eviction with that half-life in DECODE TOKENS: every access of
+ * (L,e) — GPU hit, GPU miss, or a miss the CPU serves — adds 1 to its score, and the score
+ * halves every hl tokens (a tick is one access; NL*8 ticks per decode token). The victim is
+ * the lowest-scoring slot NOT touched in the last G4_EV_GUARD ticks (two tokens): LRU's
+ * implicit guarantee, that nothing the current or previous layer resolved is ever the victim,
+ * is kept explicitly. Scores live per KEY, not per slot, so an expert's history survives its
+ * eviction. Stored in growing units 2^((t-base)/hl) so a compare is a plain min, rescaled
+ * before it can overflow. Replay (var/bench/evict_0929.py, 6 GB, hl=32, guard 480):
+ * 12.39 -> 11.12 misses/token on the bench trace; 18.1 -> 14.2 on a held-out one.
+ * Eviction choice never changes a single output bit: it only moves which experts are
+ * GPU-served and which CPU-served, and the two paths are bit-identical. */
+static double             *g_ec_ks = NULL;    /* [NL*NE] decayed-frequency score, growing units */
+static double              g_ev_hlt = 0.0;    /* half-life in ticks; 0 = LRU */
+static double              g_ev_unit = 1.0;   /* 2^((clock - base)/hlt) */
+static unsigned long long  g_ev_base = 0;
+static long long           g_ev_all = 0;
+#define G4_EV_GUARD_TOK 2ull
+static unsigned long long  g_ev_guard = 480;
+static void moe_ev_touch(long long key) {   /* caller holds the MoE lock and has advanced g_ec_clock */
+    if (g_ev_hlt <= 0.0 || !g_ec_ks) return;
+    g_ev_unit = exp2((double)(g_ec_clock - g_ev_base) / g_ev_hlt);
+    if (g_ev_unit > 1e200) {                /* rescale every score; ordering is unchanged */
+        for (long long i = 0; i < g_ev_all; i++) g_ec_ks[i] /= g_ev_unit;
+        g_ev_base = g_ec_clock; g_ev_unit = 1.0;
+    }
+    g_ec_ks[key] += g_ev_unit;
+}
+static int moe_ev_victim(void) {            /* caller holds the MoE lock */
+    int victim = 0; unsigned long long best = ~0ull;
+    for (int i = 0; i < g_ec_slots; i++) {
+        if (g_ec_key[i] < 0) return i;
+        if (g_ec_use[i] < best) { best = g_ec_use[i]; victim = i; }
+    }
+    if (g_ev_hlt <= 0.0 || !g_ec_ks) return victim;          /* LRU */
+    int v2 = -1; double bv = 0.0;
+    for (int i = 0; i < g_ec_slots; i++) {
+        if (g_ec_clock - g_ec_use[i] < g_ev_guard) continue;   /* resolved too recently */
+        const double sc = g_ec_ks[g_ec_key[i]];
+        if (v2 < 0 || sc < bv) { bv = sc; v2 = i; }
+    }
+    return v2 >= 0 ? v2 : victim;
+}
 
 static void moe_cache_free(void) {
     void *d[] = { g_ec_gup_codes, g_ec_down_codes, g_ec_gup_bs, g_ec_down_bs };
     for (size_t i = 0; i < sizeof(d)/sizeof(d[0]); i++) if (d[i]) cudaFree(d[i]);
-    free(g_ec_key); free(g_ec_use); free(g_ec_map);
+    free(g_ec_key); free(g_ec_use); free(g_ec_map); free(g_ec_ks); g_ec_ks = NULL;
+    g_ev_hlt = 0.0; g_ev_unit = 1.0; g_ev_base = 0; g_ev_all = 0;
     if (g_ec_pev) { for (int i = 0; i < g_ec_slots; i++) if (g_ec_pev[i]) cudaEventDestroy(g_ec_pev[i]); }
     free(g_ec_pev); free(g_ec_pend); g_ec_pev = NULL; g_ec_pend = NULL;
     g_ec_gup_codes = g_ec_down_codes = NULL; g_ec_gup_bs = g_ec_down_bs = NULL;
@@ -5966,9 +6010,21 @@ static void moe_cache_init(int NL, int NE, size_t gup_b, size_t gup_bsn,
         if (cudaEventCreateWithFlags(&g_ec_pev[i], cudaEventDisableTiming) != cudaSuccess) g_ec_pev[i] = NULL;
     for (long long i = 0; i < all; i++) g_ec_map[i] = -1;
     g_ec_slots = slots;
-    fprintf(stderr, "    [g4-moe] EXPERT CACHE: %d/%lld slots resident (%.2f GB, %.1f%% of all experts)\n",
+    {   const char *ev = getenv("SP_MOE_EVICT_HL");
+        const double hl = (ev && *ev) ? atof(ev) : 0.0;
+        if (hl > 0.0) {
+            g_ec_ks = (double *)calloc((size_t)all, sizeof(double));
+            if (g_ec_ks) {
+                g_ev_all = all; g_ev_hlt = hl * (double)NL * 8.0;   /* NL layers x top-8 per token */
+                g_ev_guard = G4_EV_GUARD_TOK * (unsigned long long)NL * 8ull;
+                g_ev_base = 0; g_ev_unit = 1.0;
+            }
+        }
+    }
+    fprintf(stderr, "    [g4-moe] EXPERT CACHE: %d/%lld slots resident (%.2f GB, %.1f%% of all experts), eviction %s\n",
             slots, all, (double)slots * (double)per / 1073741824.0,
-            100.0 * (double)slots / (double)all);
+            100.0 * (double)slots / (double)all,
+            g_ev_hlt > 0.0 ? "decayed-frequency (SP_MOE_EVICT_HL)" : "LRU");
     fflush(stderr);
 }
 
@@ -5990,11 +6046,7 @@ static int moe_resident(int L, int e, int NE, int E, int FFE, cudaStream_t st,
     int slot = g_ec_map[key];
     if (slot < 0) {                                   /* MISS: LRU victim */
         g_ec_miss++;
-        int victim = 0; unsigned long long best = ~0ull;
-        for (int i = 0; i < g_ec_slots; i++) {
-            if (g_ec_key[i] < 0) { victim = i; break; }
-            if (g_ec_use[i] < best) { best = g_ec_use[i]; victim = i; }
-        }
+        const int victim = moe_ev_victim();
         if (g_ec_key[victim] >= 0) g_ec_map[g_ec_key[victim]] = -1;
         if (g_ec_pend && g_ec_pend[victim]) {           /* an admission is still filling it */
             if (g_ec_pev[victim]) cudaStreamWaitEvent(st, g_ec_pev[victim], 0);
@@ -6032,6 +6084,7 @@ static int moe_resident(int L, int e, int NE, int E, int FFE, cudaStream_t st,
         *gu = g; *dw = d;
     }
     g_ec_use[slot] = ++g_ec_clock;
+    moe_ev_touch(key);
     if (((g_ec_hit + g_ec_miss) & 0x3FFFF) == 0) {
         fprintf(stderr, "    [g4-moe] expert cache: %.1f%% hit (%lld hit / %lld miss)\n",
                 100.0 * (double)g_ec_hit / (double)(g_ec_hit + g_ec_miss), g_ec_hit, g_ec_miss);
@@ -6123,13 +6176,18 @@ static void moe_admit_flush(void) {
 /* resident AND not still being filled? (the CPU path never waits on an admission) */
 static int moe_ready_now(int L, int e, int NE) {
     G4_MOE_SHARED_LOCK();
-    const int slot = g_ec_map[(long long)L * NE + e];
-    if (slot < 0) return 0;
-    if (g_ec_pend[slot]) {
-        if (g_ec_pev[slot] && cudaEventQuery(g_ec_pev[slot]) != cudaSuccess) return 0;
-        g_ec_pend[slot] = 0;
+    const long long key = (long long)L * NE + e;
+    const int slot = g_ec_map[key];
+    int ready = 1;
+    if (slot < 0) ready = 0;
+    else if (g_ec_pend[slot]) {
+        if (g_ec_pev[slot] && cudaEventQuery(g_ec_pev[slot]) != cudaSuccess) ready = 0;
+        else g_ec_pend[slot] = 0;
     }
-    return 1;
+    /* a miss the CPU serves is still an access: the frequency policy must count it
+     * (a ready expert is counted by moe_resident, which serves it next) */
+    if (!ready && g_ev_hlt > 0.0) { ++g_ec_clock; moe_ev_touch(key); }
+    return ready;
 }
 /* Admit (L,e) into the cache WITHOUT anything waiting on it: the copy runs on its own stream
  * after g_adm_ready (recorded on the compute stream by the caller, so no queued kernel can
@@ -6146,11 +6204,7 @@ static void moe_admit_async(int L, int e, int NE, int E, int FFE) {
         else { if (sl >= 0) g_ec_pend[sl] = 0; g_adm_ring[i] = -1; if (free_i < 0) free_i = i; }
     }
     if (inflight >= g_admit_cap || free_i < 0) { g_adm_skip++; return; }
-    int victim = 0; unsigned long long best = ~0ull;
-    for (int i = 0; i < g_ec_slots; i++) {
-        if (g_ec_key[i] < 0) { victim = i; break; }
-        if (g_ec_use[i] < best) { best = g_ec_use[i]; victim = i; }
-    }
+    const int victim = moe_ev_victim();
     if (g_ec_key[victim] >= 0) g_ec_map[g_ec_key[victim]] = -1;
     unsigned char  *gc = g_ec_gup_codes  + (size_t)victim * g_w.slot_gup_bytes;
     unsigned char  *dc = g_ec_down_codes + (size_t)victim * g_w.slot_down_bytes;

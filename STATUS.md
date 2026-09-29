@@ -1,9 +1,9 @@
 # STATUS — kairos-engine
 
-**Date:** 2026-09-12  
+**Date:** 2026-09-29  
 **Class:** `LIVE` — the optional native CUDA backend for the **companion** stack.
 
-**Version:** `0.7.0` (0.6.0 was the first tagged cut). Derived from **Shannon-Prime-Engine**, and the
+**Version:** `0.7.1` (0.6.0 was the first tagged cut; 0.7.1 adds `SP_MOE_EVICT_HL` and the handshake probe). Derived from **Shannon-Prime-Engine**, and the
 number is a claim about lineage and maturity rather than a semver contract: it is one person
 and one model's engine, research grade, one card, one OS.
 
@@ -11,6 +11,13 @@ What it does have is duration. It is the **only** backend of a live companion st
 served that stack continuously for months — which is a different kind of evidence from a
 benchmark, and the one this repository can actually stand behind. Treat uptime claims as the
 operator's experience of it: nothing here publishes an uptime receipt.
+
+## Later on 2026-09-29 (0.7.1): eviction, and the next step
+
+- **Oracle replay of the real routing trace:** at 6 GB, perfect (Belady) eviction would cut misses 12.2 -> 4.8 per token, but only with ~64 tokens of foresight. A perfect 8-token forecast gets 10.2. No predictor is being built.
+- **The one policy that beat LRU:** decayed frequency, 32-token half-life (`SP_MOE_EVICT_HL=32`). In the engine: **31.2 vs 28.2 tok/s median (+10.6%), 18 runs text-identical**. Off by default and not yet armed upstream: the traced confirmation run was cut short.
+- **Next step, P0 passed:** a mapped-memory handshake measured 2.1 us round trip and 4.3 us/layer in a CUDA graph. The design keeps the host's serial per-layer work off the GPU's path; see the README.
+- **Warning:** two host hangs during the A/B. Each was a GPU TDR in a batched prefill, followed by a failed driver recovery. The cause is unknown; see the README.
 
 ## Where the gap is now (2026-09-29, measured) — this supersedes the 09-12 section below
 

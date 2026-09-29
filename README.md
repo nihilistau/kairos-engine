@@ -434,6 +434,48 @@ the CPU's misses (0.11 ms each at ~30 GB/s), the combine and the next layer's gr
 cache shrinks that wait directly, which is why 6 GB is worth +13%. What is left is structural:
 hiding the CPU experts behind GPU work.
 
+### 2026-09-29: which experts to keep, and taking the host off the GPU's path
+
+**Would a smarter cache close the gap? Replayed, not guessed.** The real routing trace (4,275
+decode tokens, 1.03M expert accesses) was replayed through every policy at the engine's actual
+slot counts (`var/bench/belady_0929.py`, `evict_0929.py` in the source tree).
+
+- **The oracle ceiling is low.** At 6 GB (50% of experts resident), LRU hits 0.949 and perfect Belady eviction 0.980. Misses go 12.2 -> 4.8 per token, but reaching that needs ~64 tokens of foresight. A *perfect* 8-token forecast (the horizon of recent predictor papers) only gets 10.2.
+- **Routing is sticky, in bursts.** Adjacent tokens share 43% of a layer's experts, so recency dominates.
+- **Frequency made things worse.** Decayed LFU at long half-lives: 15-19 misses/token. So did admit-on-second-miss (13.6). ARC and pinned hot sets tie LRU.
+- **One winner:** decayed frequency with a **32-token half-life** and a 2-token recency guard. Replay: 12.39 -> 11.12 misses/token (18.1 -> 14.2 on a held-out conversation).
+- **In the engine** (`SP_MOE_EVICT_HL=32`, 6 GB, 3 interleaved rounds): **31.2 vs 28.2 tok/s median, +10.6%**, all 18 runs text-identical.
+- **Misses are thin.** Per (layer, token): p50 0, p90 1, p99 3. Most layers have no CPU work at all.
+
+**So the lever is not the cache, it is the turnaround.** A mapped-memory latency probe
+(`tools/moe_cpu_bench/handshake_test.cu`) measured this card under WDDM:
+- a GPU -> host -> GPU handshake round trip is **2.1 us**;
+- inside a 30-layer CUDA graph it costs **4.3 us per layer**;
+- the graph needs no host API call to be submitted.
+
+Today's launch + sync is itself only 8.5 us. The ~0.5 ms per layer the GPU sits idle is the host's
+serial work between the router and the next layer: routing, per-expert event queries, ~10
+launches, the CPU rows' copy and two graph launches.
+
+The next design removes that from the GPU's path, and keeps the output byte-identical by construction:
+- **Top-8:** the GPU speculates its top-8 from the router logits and starts its resident experts at once. The host runs today's exact `moe_topk_host` and weights, and the CPU computes whatever the GPU did not.
+- **Waiting:** the GPU waits on a mapped flag, not a host sync.
+- **Combine:** it runs in today's order.
+
+The projection is ~43-48 tok/s against `llama.cpp`'s 38.25. It is a projection, and the build
+order in the source tree's `docs/DESIGN-2026-09-29-host-free-layer.md` makes each step a pair of runs.
+
+**An operational warning from the same day.** Twice during these A/Bs the host machine hung. In
+both cases:
+- a batched prefill in a scratch session hit a **GPU TDR** (live dump 0x117, `nvlddmkm`);
+- the display driver's recovery then failed (0x1A8 / 0x1B8 black-screen dumps).
+
+Both were LRU arms, on a path unchanged from runs that had been clean the day before. The cause is
+not known. If you bench this engine in a loop on WDDM:
+- give it the GPU to itself;
+- consider raising `TdrDelay`;
+- watch VRAM headroom at a 6 GB cache.
+
 ## Against `llama.cpp`, honestly
 
 **This section said `llama.cpp` "remains faster at prefill" until 2026-09-12, and the combined
@@ -490,6 +532,7 @@ armed on someone else's hardware. It also means you have to ask for it.
 | `SP_G4_MOE_CPU` | `0` | `1` | misses on the CPU, bit-exact (needs AVX-512 VNNI). `2` = parity: GPU served, CPU recomputes. `SP_G4_MOE_CPU_THREADS` (2) |
 | `SP_G4_SEG_GRAPH` | `0` | `1` | per-layer segment CUDA graphs for the MoE decode step |
 | `SP_G4_MOE_BISECT` | `0` | `0` | ADR-013's per-op syncs at layer 0 (were always on until 2026-09-28) |
+| `SP_MOE_EVICT_HL` | `0` (LRU) | `0` | decayed-frequency expert eviction, half-life in decode tokens; `32` measured +10.6% at 6 GB, not yet armed upstream |
 
 Kairos maps each of these from its profile, so arming them is a profile edit rather than an
 environment variable — `serve.py` strips every unmapped `SP_*` on purpose, and a knob it does
