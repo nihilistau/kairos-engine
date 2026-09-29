@@ -444,7 +444,11 @@ slot counts (`var/bench/belady_0929.py`, `evict_0929.py` in the source tree).
 - **Routing is sticky, in bursts.** Adjacent tokens share 43% of a layer's experts, so recency dominates.
 - **Frequency made things worse.** Decayed LFU at long half-lives: 15-19 misses/token. So did admit-on-second-miss (13.6). ARC and pinned hot sets tie LRU.
 - **One winner:** decayed frequency with a **32-token half-life** and a 2-token recency guard. Replay: 12.39 -> 11.12 misses/token (18.1 -> 14.2 on a held-out conversation).
-- **In the engine** (`SP_MOE_EVICT_HL=32`, 6 GB, 3 interleaved rounds): **31.2 vs 28.2 tok/s median, +10.6%**, all 18 runs text-identical.
+- **In the engine** (`SP_MOE_EVICT_HL=32`, 3 interleaved rounds x 2, all runs text-identical):
+  - 6 GB: **31.2 vs 28.2 tok/s median, +10.6%**;
+  - 5.5 GB: **31.45 vs 29.6, +6.2%**.
+
+  Traced at 5.5 GB: resident-at-routing 0.896 -> 0.909 in every layer, misses/token -13%. Armed upstream at 32; the engine default stays LRU.
 - **Misses are thin.** Per (layer, token): p50 0, p90 1, p99 3. Most layers have no CPU work at all.
 
 **So the lever is not the cache, it is the turnaround.** A mapped-memory latency probe
@@ -475,6 +479,8 @@ not known. If you bench this engine in a loop on WDDM:
 - give it the GPU to itself;
 - consider raising `TdrDelay`;
 - watch VRAM headroom at a 6 GB cache.
+
+Upstream now runs **5.5 GB with `TdrDelay = 10`**. The full A/B re-ran on that setting without a fault, at a peak of 9.2 GB VRAM.
 
 ## Against `llama.cpp`, honestly
 
@@ -527,12 +533,12 @@ armed on someone else's hardware. It also means you have to ask for it.
 | `SP_G4_GEMM_F16` | `0` (fp32 SGEMM) | `1` | fp16 tensor-core weight GEMM. `2` = parity, fp32 served |
 | `SP_KV_PREFILL_DP4A` | `0` | `0` | fused Q4 prefill GEMM — **off, and measured slower**; see the table above |
 | `SP_MOE_TIMING` | `0` | `0` | per-phase MoE instrumentation: sync / drain / route / stage / launch |
-| `SP_G4_MOE_CACHE_GB` | `[kv] moe_cache_gb` | `6.0` | device expert cache budget. `0` disables the cache |
+| `SP_G4_MOE_CACHE_GB` | `[kv] moe_cache_gb` | `5.5` | device expert cache budget. `0` disables the cache. 6.0 measured faster but coincided with two TDR hangs; see above |
 | `SP_G4_MOE_GROUPED` | `0` | `1` | one grouped launch for a decode layer's resident experts. `2` = parity: old loop served, bitwise compare |
 | `SP_G4_MOE_CPU` | `0` | `1` | misses on the CPU, bit-exact (needs AVX-512 VNNI). `2` = parity: GPU served, CPU recomputes. `SP_G4_MOE_CPU_THREADS` (2) |
 | `SP_G4_SEG_GRAPH` | `0` | `1` | per-layer segment CUDA graphs for the MoE decode step |
 | `SP_G4_MOE_BISECT` | `0` | `0` | ADR-013's per-op syncs at layer 0 (were always on until 2026-09-28) |
-| `SP_MOE_EVICT_HL` | `0` (LRU) | `0` | decayed-frequency expert eviction, half-life in decode tokens; `32` measured +10.6% at 6 GB, not yet armed upstream |
+| `SP_MOE_EVICT_HL` | `0` (LRU) | `32` | decayed-frequency expert eviction, half-life in decode tokens; +10.6% at 6 GB, +6.2% at 5.5 GB |
 
 Kairos maps each of these from its profile, so arming them is a profile edit rather than an
 environment variable — `serve.py` strips every unmapped `SP_*` on purpose, and a knob it does

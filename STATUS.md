@@ -15,9 +15,15 @@ operator's experience of it: nothing here publishes an uptime receipt.
 ## Later on 2026-09-29 (0.7.1): eviction, and the next step
 
 - **Oracle replay of the real routing trace:** at 6 GB, perfect (Belady) eviction would cut misses 12.2 -> 4.8 per token, but only with ~64 tokens of foresight. A perfect 8-token forecast gets 10.2. No predictor is being built.
-- **The one policy that beat LRU:** decayed frequency, 32-token half-life (`SP_MOE_EVICT_HL=32`). In the engine: **31.2 vs 28.2 tok/s median (+10.6%), 18 runs text-identical**. Off by default and not yet armed upstream: the traced confirmation run was cut short.
+- **The one policy that beat LRU:** decayed frequency, 32-token half-life (`SP_MOE_EVICT_HL=32`). In the engine:
+  - 6 GB: **31.2 vs 28.2 tok/s median (+10.6%)**;
+  - 5.5 GB: **31.45 vs 29.6 (+6.2%)**;
+  - traced: misses/token -13%;
+  - every run text-identical.
+
+  Armed upstream; the engine default stays LRU.
 - **Next step, P0 passed:** a mapped-memory handshake measured 2.1 us round trip and 4.3 us/layer in a CUDA graph. The design keeps the host's serial per-layer work off the GPU's path; see the README.
-- **Warning:** two host hangs during the A/B. Each was a GPU TDR in a batched prefill, followed by a failed driver recovery. The cause is unknown; see the README.
+- **Warning:** two host hangs during the A/B at 6 GB. Each was a GPU TDR in a batched prefill, followed by a failed driver recovery. The cause is unknown. Upstream moved to a 5.5 GB cache and `TdrDelay = 10`, and the re-run was clean; see the README.
 
 ## Where the gap is now (2026-09-29, measured) — this supersedes the 09-12 section below
 
