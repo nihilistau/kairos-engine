@@ -1,0 +1,7 @@
+# build products and run output; the .cu sources, build scripts and result logs are the receipt
+*.exe
+*.exp
+*.lib
+*.pdb
+*_sass.txt
+build*.log

@@ -241,7 +241,7 @@ behind knobs that default off, with the numbers written beside them.
 |---|---|
 | **Fused Q4×int8 `dp4a` prefill GEMM** (`SP_KV_PREFILL_DP4A`) — the `llama.cpp` approach, already implemented here | **~18% SLOWER** than dequant + `cublasSgemm`, and it quantises activations to int8, which **changes generated text** at temperature 0. `volta_sgemm` is hand-tuned cuBLAS assembly; a custom kernel has to beat that, not merely match the format |
 | **Device-side MoE top-k** — remove the per-layer host sync | The sync is **99.9% GPU drain**; the host routing is **0.53%** of the branch. The rewrite buys half a percent |
-| **Raising the expert cache** | 3–4%, because 33% residency already yields ~95.5% hits |
+| **Raising the expert cache** | 3–4% on 2026-09-11, because 33% residency was believed to yield ~95.5% hits. **Corrected 2026-09-28:** measured decode hit rate is 83-87%, and once the copies were no longer hidden by other costs, 4 -> 5 -> 6 GB bought +10% and +13%. It is 6 GB now |
 
 ## Numerical honesty
 
@@ -392,6 +392,48 @@ them lets the LRU evict a slot the layer itself is about to use — resolving st
 most-recently-used, and the path refuses to arm unless the cache holds at least four times the
 active set. Both checks fail *safe*: the engine silently stays serial.
 
+## Decode, 2026-09-28/29: the hybrid, and the host thread
+
+The trace above said "the bus". A second look, with the stream overlap armed, said the thread
+that *issues* the work is the real limiter: the host was inside the CUDA API ~95% of every
+token (2,757 kernel launches at ~11 us each on WDDM, plus a router sync per layer), and the GPU
+sat idle 18-26 ms of every token waiting for it. Routing was also measured over a real
+conversation, not assumed: an **LRU cache beats even the hindsight-best static hot set**
+(0.869 vs 0.839 hit at 33% capacity), so "pin the hot experts" was the wrong design before it
+was built. Four changes followed, each gated on the greedy output hash staying identical:
+
+| | knob | what | bench decode @ ~3.9k |
+|---|---|---|---:|
+| | | 4 GB cache, per-expert loop | 17.5 tok/s |
+| cache | `SP_G4_MOE_CACHE_GB` | 5 GB | 19.1 |
+| A | `SP_G4_MOE_GROUPED=1` | a decode layer's resident experts in ~6 launches instead of ~56 | 23.9 |
+| B/C | `SP_G4_MOE_CPU=1` | experts not resident at routing computed on the CPU (AVX-512 VNNI) from the pinned arena, then admitted to the cache in the background | 26.5 |
+| D | `SP_G4_SEG_GRAPH=1` | per-layer segment CUDA graphs: the fixed kernel stretches captured once, replayed per token | 28.1 |
+| cache | `SP_G4_MOE_CACHE_GB=6` | | **31.7** |
+
+**The CPU path is bit-exact, not "close".** A first cut matched the GPU to relL2 ~2e-6 and still
+changed greedy text at token ~25, so it was rebuilt to match bit for bit. The GEMV reproduces
+`k_gemv_q4b_dp4a_v2`'s int8 dots, its FFMA order (read off the SASS) and its lane/shuffle
+reduction. The GELU was the hard part: CUDA `tanhf` compiles to MUFU.EX2 + MUFU.RCP, which are
+hardware approximations. Two properties were verified **exhaustively** on this card:
+- MUFU.RCP depends only on the mantissa;
+- MUFU.EX2(i+f) = MUFU.EX2(f) * 2^i.
+
+So two 2^23-entry tables built on the GPU at start let the CPU replay the GELU op for op: 0 of 16.8M
+inputs differ. In the engine's parity mode (`=2`), 7,501 real experts were 0 not bit-identical;
+the grouped launch was 7,800 layers bit-identical. The tables are a fact about *this* GPU:
+re-run parity on any other card.
+
+**A leak found on the way.** `gemma4_kv_close` never freed the session's MoE scratch (~300 MiB
+after a 2,048-token chunk), so every scratch session (`/v1/oneshot`, capture, recall) leaked it.
+It is fixed; VRAM is now flat across oneshots.
+
+**Where the time is now** (nsys, 34.75 ms/token at 5 GB): GPU kernels 18.8 ms, and the GPU's
+compute is idle ~16 ms. In each layer it finishes the resident experts in ~0.09 ms, then waits for
+the CPU's misses (0.11 ms each at ~30 GB/s), the combine and the next layer's graphs. A bigger
+cache shrinks that wait directly, which is why 6 GB is worth +13%. What is left is structural:
+hiding the CPU experts behind GPU work.
+
 ## Against `llama.cpp`, honestly
 
 **This section said `llama.cpp` "remains faster at prefill" until 2026-09-12, and the combined
@@ -399,6 +441,8 @@ measurement above falsified it.** Prefill is now 304.2 tok/s here against 262.6 
 lead — and the sentence survived only because nobody had run the two kernels together against a
 depth-matched baseline. It is corrected rather than quietly deleted, because a README that
 silently drops its own wrong claims teaches a reader nothing about how much to trust the rest.
+
+**Update 2026-09-29:** decode is now 31.7 tok/s against 38.25, 1.21x rather than 2.37x. See *Decode, 2026-09-28/29* above. The paragraph below is the 09-12 state.
 
 Where `llama.cpp` is genuinely ahead is **decode: 38.25 tok/s against 16.16 at the same depth,
 2.37×.** It is a mature, widely-tuned runtime and this is one person's kernel work, and on the
@@ -441,7 +485,11 @@ armed on someone else's hardware. It also means you have to ask for it.
 | `SP_G4_GEMM_F16` | `0` (fp32 SGEMM) | `1` | fp16 tensor-core weight GEMM. `2` = parity, fp32 served |
 | `SP_KV_PREFILL_DP4A` | `0` | `0` | fused Q4 prefill GEMM — **off, and measured slower**; see the table above |
 | `SP_MOE_TIMING` | `0` | `0` | per-phase MoE instrumentation: sync / drain / route / stage / launch |
-| `SP_G4_MOE_CACHE_GB` | `[kv] moe_cache_gb` | `4.0` | device expert cache budget. `0` disables the cache |
+| `SP_G4_MOE_CACHE_GB` | `[kv] moe_cache_gb` | `6.0` | device expert cache budget. `0` disables the cache |
+| `SP_G4_MOE_GROUPED` | `0` | `1` | one grouped launch for a decode layer's resident experts. `2` = parity: old loop served, bitwise compare |
+| `SP_G4_MOE_CPU` | `0` | `1` | misses on the CPU, bit-exact (needs AVX-512 VNNI). `2` = parity: GPU served, CPU recomputes. `SP_G4_MOE_CPU_THREADS` (2) |
+| `SP_G4_SEG_GRAPH` | `0` | `1` | per-layer segment CUDA graphs for the MoE decode step |
+| `SP_G4_MOE_BISECT` | `0` | `0` | ADR-013's per-op syncs at layer 0 (were always on until 2026-09-28) |
 
 Kairos maps each of these from its profile, so arming them is a profile edit rather than an
 environment variable — `serve.py` strips every unmapped `SP_*` on purpose, and a knob it does

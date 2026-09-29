@@ -62,6 +62,18 @@
  * calls that take nothing else, so a plain mutex is the honest type and a nested take
  * would now be a bug worth failing on rather than papering over. */
 static std::mutex g_moe_shared_mtx;
+/* PHASE D (2026-09-28): the decode MoE branch can be run in three pieces so the kernel-only
+ * pieces can be captured into CUDA graphs: 1 = PRE (dense FFN, router, the D2Hs), 2 = MID (the
+ * sync, host routing, experts, combine), 3 = TAIL (the recombine norms). 0 = all, as before. */
+static thread_local int g_ffn_phase = 0;
+/* ADR-013's bisect syncs (MBK) ran on EVERY decode token at L == 0 — ~11 full drains per token.
+ * They are a fault-localisation tool: SP_G4_MOE_BISECT=1 arms them. */
+static int moe_bisect_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("SP_G4_MOE_BISECT"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on;
+}
+#include "moe_cpu_expert.h"   /* step B: routed experts on the CPU (AVX-512 VNNI) */
 #define G4_MOE_SHARED_LOCK() std::lock_guard<std::mutex> _g4_shared_lk(g_moe_shared_mtx)
 
 #include <cstdio>
@@ -2368,6 +2380,17 @@ typedef struct g4_moe_scratch_s {
     float *bktw, *wt_h;
     int    capE, capNE, capNU, capT;
     int    ffcapFFE, ffcapT;
+    /* SP_MOE_BUCKET_PIN (2026-09-28): the layer's whole bucket table (every active expert's
+     * rows + weights) packed into ONE pinned host buffer and sent in two copies per layer,
+     * instead of two PAGEABLE copies per expert on the compute stream. */
+    int   *brows_h, *brows_d; float *bw_h, *bw_d; int bcap;
+    /* SP_G4_MOE_GROUPED (2026-09-28): step A's per-caller buffers — NU experts' gate_up,
+     * GELU output, down output, their int8 activations + block scales, and a parity acc. */
+    float *ggu, *gh, *gout, *gsx, *gacc; signed char *gqx; int gcapE, gcapF;
+    /* step B: pinned host copies of the expert input and the CPU experts' outputs */
+    float *cin_h, *cout_h; int ccapE;
+    float *cgu_h, *csx_h, *cinsx_h; signed char *cq_h, *cinq_h;   /* v2 bit-exact round trip */
+    float *logd_h;   /* phase D: pinned [NE] router logits for n_tok == 1 (graph-capturable D2H) */
 } g4_moe_scratch;
 static void moe_scratch_free(g4_moe_scratch *ms);   /* defined with the MoE kernels */
 /* ── THE ONE FFN (ADR-013). ───────────────────────────────────────────────────
@@ -5310,6 +5333,13 @@ struct sp_g4_kv {
      * When on, the graph path is declined (the bx attention takes a host ctx +
      * ctx-sized i64 shared mem, not graph-capturable) — chat runs per-step. */
     int bx_on;
+    /* PHASE D (2026-09-28): per-layer SEGMENT graphs for the MoE decode step. A layer's
+     * kernel-only stretches are captured once and replayed; the host keeps only what is
+     * genuinely per-token (the ring KV write + journal, which use host slot indices, and the
+     * MoE routing between router sync and combine). seg_mode: 0 undecided, 1 armed, 2 off. */
+    int seg_mode, seg_ready, seg_warm;
+    cudaGraphExec_t segA[64], segB[64], segH;
+    const void *seg_key[8];
 };
 
 extern "C" void gemma4_kv_close(sp_g4_kv *s);   /* fwd: gemma4_kv_open frees on OOM */
@@ -5570,6 +5600,72 @@ __global__ void k_moe_scatter_acc(const float *src, const int *rows, const float
     atomicAdd(&dst[(size_t)rows[r] * (size_t)E + (i % E)], w[r] * src[i]);
 }
 
+/* ── STEP A: ONE LAUNCH FOR A LAYER'S RESIDENT EXPERTS (2026-09-28) ─────────────────────
+ * nsys put the decode expert loop at ~1,700 of 2,757 launches per token (8 experts x
+ * gather, 2x(quant, GEMV), GELU, scatter), on a host thread that is ~95% inside the CUDA
+ * API. At n_tok == 1 every expert reads the SAME input, so the loop collapses to:
+ *   quant(in) once -> grouped gate_up GEMV (grid.y = expert) -> GELU over all -> batched
+ *   quant(h) -> grouped down GEMV -> ordered combine.
+ * BYTE-IDENTITY is the design constraint, not a hope:
+ *  - k_gemv_q4b_dp4a_grp's body is k_gemv_q4b_dp4a_v2's, token for token; only the
+ *    pointers come from blockIdx.y. Same per-row arithmetic, same lane/shuffle order.
+ *  - k_quant_act_int8_batched is k_quant_act_int8 per row (same ops, same order).
+ *  - k_moe_gelu_split_batch already runs per element; nrows>1 changes nothing per element.
+ *  - the old combine was sequential atomicAdd(acc, w*out) in ASCENDING e on one stream,
+ *    i.e. acc = fadd_rn(acc, fmul_rn(w, out)) per expert in e order. k_moe_combine_ord does
+ *    exactly that loop, with the _rn intrinsics so the compiler cannot contract to an FMA.
+ * The expert pointer table and the weights ride as KERNEL PARAMETERS — no H2D at all. */
+#define G4G_MAX 8
+struct G4MoeGrp {
+    const unsigned char      *codes[G4G_MAX];
+    const unsigned long long *ro[G4G_MAX];
+    const unsigned short     *bs[G4G_MAX];
+    int                       oslot[G4G_MAX];   /* step B: row k's output goes to slot oslot[k] */
+};
+struct G4MoeW { float w[G4G_MAX]; int row[G4G_MAX]; };   /* row: which gout row slot k reads */
+__global__ void k_gemv_q4b_dp4a_grp(G4MoeGrp g, int bs_nblk, int in,
+                                    const signed char *qx_all, int qx_stride,
+                                    const float *sxb_all, int sx_stride,
+                                    float *y_all, int y_stride, int out) {
+    const int k = blockIdx.y;
+    const unsigned char *codes = g.codes[k];
+    const unsigned long long *row_off = g.ro[k];
+    const unsigned short *bscale = g.bs[k];
+    const signed char *qx = qx_all + (size_t)k * (size_t)qx_stride;
+    const float *sxb = sxb_all + (size_t)k * (size_t)sx_stride;
+    float *y = y_all + (size_t)g.oslot[k] * (size_t)y_stride;
+    /* --- verbatim k_gemv_q4b_dp4a_v2 body from here --- */
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int j = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= out) return;
+    const int4 *wrow = (const int4 *)(codes + row_off[j]);   /* 16 B = 32 Q4B weights */
+    const int4 *qxi  = (const int4 *)qx;
+    const unsigned short *bs = bscale + (size_t)j * (size_t)bs_nblk;
+    const int n32 = in >> 5;
+    float facc = 0.0f;
+    int a, b;
+    for (int c = lane; c < n32; c += 32) {
+        int4 wv = wrow[c];
+        int4 q0 = qxi[2*c], q1 = qxi[2*c + 1];
+        int a0 = 0, a1 = 0;
+        sp_unpack8(wv.x, a, b); a0 = __dp4a(a, q0.x, a0); a0 = __dp4a(b, q0.y, a0);
+        sp_unpack8(wv.y, a, b); a0 = __dp4a(a, q0.z, a0); a0 = __dp4a(b, q0.w, a0);
+        sp_unpack8(wv.z, a, b); a1 = __dp4a(a, q1.x, a1); a1 = __dp4a(b, q1.y, a1);
+        sp_unpack8(wv.w, a, b); a1 = __dp4a(a, q1.z, a1); a1 = __dp4a(b, q1.w, a1);
+        float wbsc = __half2float(__ushort_as_half(__ldg(&bs[c])));
+        facc += wbsc * ((float)a0 * sxb[2*c] + (float)a1 * sxb[2*c + 1]);
+    }
+    for (int o = 16; o > 0; o >>= 1) facc += __shfl_down_sync(0xffffffffu, facc, o);
+    if (lane == 0) y[j] = facc;
+}
+__global__ void k_moe_combine_ord(const float *outs, int n, int E, G4MoeW w, float *acc) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= E) return;
+    float a = acc[i];
+    for (int k = 0; k < n; k++) a = __fadd_rn(a, __fmul_rn(w.w[k], outs[(size_t)w.row[k] * E + i]));
+    acc[i] = a;
+}
+
 /* Stage 4b: fused gate|up split + GELU over a BATCH of nrows rows. */
 __global__ void k_moe_gelu_split_batch(const float *gu, int ffe, int nrows, float *h) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -5698,6 +5794,7 @@ static long long g_moe_stage_bytes = 0, g_moe_stage_n = 0;  /* moe_stage counts 
  */
 static int g_moe_arena_pinned = -1;      /* -1 untried, 0 no, 1 yes */
 
+static int g_moe_scales_pinned = 0, g_moe_scales_refused = 0;
 static void moe_arena_pin_try(int NL_layers) {
     if (g_moe_arena_pinned >= 0) return;      /* fast path, no lock */
     G4_MOE_SHARED_LOCK();                     /* once-per-process init, now racy-free */
@@ -5718,14 +5815,28 @@ static void moe_arena_pin_try(int NL_layers) {
                                               cudaHostRegisterReadOnly);
             if (ce == cudaSuccess) { ok++; gb += pt->codes_bytes / 1e9; }
             else { fail++; cudaGetLastError(); }
+            /* SP_MOE_PIN_SCALES (2026-09-28). Only the CODES were registered, so every miss
+             * also sent its two per-32-block f16 scale arrays from PAGEABLE memory — a
+             * host-blocking copy that the second stream cannot hide (nsys: 81 pageable
+             * copies/token, 39.5 us of host each). Registering them where they lie makes
+             * those copies asynchronous. Same bytes, same order: byte-identical. */
+            { const char *ps = getenv("SP_MOE_PIN_SCALES"), *pc = getenv("SP_G4_MOE_CPU");
+              const int want = (ps && ps[0] == '1') || (pc && (pc[0] == '1' || pc[0] == '2'));
+              if (want && pt->bscale && pt->bs_nblk) {
+                  const size_t sb = (size_t)pt->rows * (size_t)pt->bs_nblk * sizeof(unsigned short);
+                  cudaError_t cs = cudaHostRegister((void *)pt->bscale, sb, cudaHostRegisterReadOnly);
+                  if (cs == cudaSuccess) { g_moe_scales_pinned++; gb += sb / 1e9; }
+                  else { g_moe_scales_refused++; cudaGetLastError(); } } }
         }
     }
     const double t1 = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     g_moe_arena_pinned = (ok > 0 && fail == 0) ? 1 : 0;
-    fprintf(stderr, "    [g4-moe] arena pin: %d ok / %d refused, %.2f GB in %.2fs -> %s\n",
+    fprintf(stderr, "    [g4-moe] arena pin: %d ok / %d refused, %.2f GB in %.2fs -> %s"
+                    " (block scales pinned: %d ok / %d refused)\n",
             ok, fail, gb, t1 - t0,
-            g_moe_arena_pinned ? "DIRECT H2D from the arena" : "falling back to the ring");
+            g_moe_arena_pinned ? "DIRECT H2D from the arena" : "falling back to the ring",
+            g_moe_scales_pinned, g_moe_scales_refused);
     fflush(stderr);
 }
 
@@ -5798,6 +5909,11 @@ static unsigned short     *g_ec_gup_bs    = NULL, *g_ec_down_bs    = NULL;
 static int                *g_ec_key = NULL;   /* [slots] -> L*NE+e, or -1 (empty)  */
 static unsigned long long *g_ec_use = NULL;   /* [slots] LRU stamp                 */
 static int                *g_ec_map = NULL;   /* [NL*NE] -> slot, or -1            */
+/* step C (2026-09-28): a slot being filled by an ASYNC admission copy is "pending" until its
+ * event completes. Any user of a pending slot makes its stream wait on that event; the CPU
+ * path instead treats a pending slot as a miss, so decode never waits on an admission. */
+static cudaEvent_t        *g_ec_pev = NULL;   /* [slots] */
+static unsigned char      *g_ec_pend = NULL;  /* [slots] */
 static int                 g_ec_slots = 0;
 static unsigned long long  g_ec_clock = 0;
 static long long           g_ec_hit = 0, g_ec_miss = 0;
@@ -5806,6 +5922,8 @@ static void moe_cache_free(void) {
     void *d[] = { g_ec_gup_codes, g_ec_down_codes, g_ec_gup_bs, g_ec_down_bs };
     for (size_t i = 0; i < sizeof(d)/sizeof(d[0]); i++) if (d[i]) cudaFree(d[i]);
     free(g_ec_key); free(g_ec_use); free(g_ec_map);
+    if (g_ec_pev) { for (int i = 0; i < g_ec_slots; i++) if (g_ec_pev[i]) cudaEventDestroy(g_ec_pev[i]); }
+    free(g_ec_pev); free(g_ec_pend); g_ec_pev = NULL; g_ec_pend = NULL;
     g_ec_gup_codes = g_ec_down_codes = NULL; g_ec_gup_bs = g_ec_down_bs = NULL;
     g_ec_key = g_ec_map = NULL; g_ec_use = NULL;
     g_ec_slots = 0; g_ec_clock = 0; g_ec_hit = 0; g_ec_miss = 0;
@@ -5842,6 +5960,10 @@ static void moe_cache_init(int NL, int NE, size_t gup_b, size_t gup_bsn,
         moe_cache_free(); return;
     }
     for (int i = 0; i < slots; i++) { g_ec_key[i] = -1; g_ec_use[i] = 0; }
+    g_ec_pev = (cudaEvent_t *)calloc((size_t)slots, sizeof(cudaEvent_t));
+    g_ec_pend = (unsigned char *)calloc((size_t)slots, 1);
+    if (g_ec_pev) for (int i = 0; i < slots; i++)
+        if (cudaEventCreateWithFlags(&g_ec_pev[i], cudaEventDisableTiming) != cudaSuccess) g_ec_pev[i] = NULL;
     for (long long i = 0; i < all; i++) g_ec_map[i] = -1;
     g_ec_slots = slots;
     fprintf(stderr, "    [g4-moe] EXPERT CACHE: %d/%lld slots resident (%.2f GB, %.1f%% of all experts)\n",
@@ -5874,6 +5996,10 @@ static int moe_resident(int L, int e, int NE, int E, int FFE, cudaStream_t st,
             if (g_ec_use[i] < best) { best = g_ec_use[i]; victim = i; }
         }
         if (g_ec_key[victim] >= 0) g_ec_map[g_ec_key[victim]] = -1;
+        if (g_ec_pend && g_ec_pend[victim]) {           /* an admission is still filling it */
+            if (g_ec_pev[victim]) cudaStreamWaitEvent(st, g_ec_pev[victim], 0);
+            g_ec_pend[victim] = 0;
+        }
         unsigned char  *gc = g_ec_gup_codes  + (size_t)victim * g_w.slot_gup_bytes;
         unsigned char  *dc = g_ec_down_codes + (size_t)victim * g_w.slot_down_bytes;
         unsigned short *gb = g_ec_gup_bs  ? g_ec_gup_bs  + (size_t)victim * g_w.slot_gup_bs_n  : NULL;
@@ -5887,6 +6013,11 @@ static int moe_resident(int L, int e, int NE, int E, int FFE, cudaStream_t st,
         g_ec_key[victim] = (int)key; g_ec_map[key] = victim; slot = victim;
     } else {                                          /* HIT: pointer math only */
         g_ec_hit++;
+        if (g_ec_pend && g_ec_pend[slot]) {             /* filled asynchronously: wait for it */
+            if (g_ec_pev[slot] && cudaEventQuery(g_ec_pev[slot]) != cudaSuccess)
+                cudaStreamWaitEvent(st, g_ec_pev[slot], 0);
+            else g_ec_pend[slot] = 0;
+        }
         DevTensor g = {}, d = {};
         g.in = E;   g.out = g_w.slot_gup_rows;  g.prec = g_w.slot_gup_prec;
         g.codes = g_ec_gup_codes + (size_t)slot * g_w.slot_gup_bytes;
@@ -5907,6 +6038,139 @@ static int moe_resident(int L, int e, int NE, int E, int FFE, cudaStream_t st,
         fflush(stderr);
     }
     return 0;
+}
+
+/* v3 (2026-09-29): this card's MUFU.RCP by mantissa and MUFU.EX2 by 23-bit fraction, the two
+ * tables that let the CPU replay CUDA tanhf bit for bit (see moe_cpu_expert.h). */
+__global__ void k_mufu_tables(float *trcp, float *tex2) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= (1u << 23)) return;
+    float r, e;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(__uint_as_float(0x3f800000u | i)));
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"((float)i * (1.0f / 8388608.0f)));
+    trcp[i] = r; tex2[i] = e;
+}
+static int g_mufu_ok = 0;
+static void moe_build_mufu_tables(void) {
+    const size_t n = (size_t)1 << 23;
+    float *d1 = NULL, *d2 = NULL, *h1 = (float *)malloc(n * 4), *h2 = (float *)malloc(n * 4);
+    if (h1 && h2 && cudaMalloc(&d1, n * 4) == cudaSuccess && cudaMalloc(&d2, n * 4) == cudaSuccess) {
+        k_mufu_tables<<<(unsigned)(n / 256), 256>>>(d1, d2);
+        if (cudaMemcpy(h1, d1, n * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+            cudaMemcpy(h2, d2, n * 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
+            sp_moe_cpu_set_mufu_tables(h1, h2);
+            float probe[4] = { 0.1f, 1.0f, -1.0f, 3.0f }, hp[2];
+            g_mufu_ok = (sp_moe_cpu_gelu(probe, 2, hp) == 0);
+        }
+    }
+    cudaGetLastError();
+    if (d1) cudaFree(d1); if (d2) cudaFree(d2);
+    free(h1); free(h2);
+}
+
+/* ── STEP B/C helpers (2026-09-28) ─────────────────────────────────────────────────────── */
+static int g_cpu_mode = -1, g_admit_cap = 16;
+static long long g_cpu_n = 0, g_adm_n = 0, g_adm_skip = 0, g_cpu_layers = 0;
+static cudaStream_t g_adm_cps = NULL;
+static cudaEvent_t  g_adm_ready = NULL;
+static int *g_adm_ring = NULL, g_adm_ri = 0;
+
+/* 0 off, 1 serve (misses on the CPU), 2 parity (GPU serves everything; the CPU recomputes the
+ * misses and the difference is logged). Needs the cache, AVX-512 VNNI and the uniform OK_Q4B
+ * slot layout the CPU kernel assumes; any of those missing -> 0, said once. */
+static int moe_cpu_mode(int E, int FFE) {
+    if (g_cpu_mode >= 0) return g_cpu_mode;
+    G4_MOE_SHARED_LOCK();
+    if (g_cpu_mode >= 0) return g_cpu_mode;
+    const char *ev = getenv("SP_G4_MOE_CPU");
+    int m = (ev && (ev[0] == '1' || ev[0] == '2')) ? ev[0] - '0' : 0;
+    const char *why = NULL;
+    if (m) {
+        const char *tv = getenv("SP_G4_MOE_CPU_THREADS"); int nt = tv && *tv ? atoi(tv) : 4;
+        const char *cv = getenv("SP_G4_MOE_ADMIT_INFLIGHT"); if (cv && *cv) g_admit_cap = atoi(cv);
+        if (g_admit_cap < 0) g_admit_cap = 0;
+        if (g_ec_slots <= 0) why = "expert cache off";
+        else if (g_w.slot_gup_prec != 4 || g_w.slot_down_prec != 4 || !g_w.slot_gup_bs_n || !g_w.slot_down_bs_n) why = "experts are not OK_Q4B";
+        else if (g_w.slot_gup_bytes != (size_t)g_w.slot_gup_rows * (size_t)(E / 2) ||
+                 g_w.slot_down_bytes != (size_t)g_w.slot_down_rows * (size_t)(FFE / 2)) why = "expert rows are not uniform Q4 stride";
+        else if (!sp_moe_cpu_init(nt)) why = "CPU lacks AVX-512 F/BW/VNNI";
+        else if (cudaStreamCreateWithFlags(&g_adm_cps, cudaStreamNonBlocking) != cudaSuccess ||
+                 cudaEventCreateWithFlags(&g_adm_ready, cudaEventDisableTiming) != cudaSuccess) why = "admission stream";
+        if (!why) moe_build_mufu_tables();
+        g_adm_ring = (int *)calloc((size_t)(g_admit_cap > 0 ? g_admit_cap : 1), sizeof(int));
+        for (int i = 0; i < g_admit_cap; i++) g_adm_ring[i] = -1;
+        if (why) m = 0;
+        fprintf(stderr, "    [g4-moe] CPU-miss path %s%s%s (SP_G4_MOE_CPU=%c, threads %d, admit in-flight cap %d, GELU %s)\n",
+                m == 1 ? "ON" : m == 2 ? "PARITY (GPU served)" : "OFF", why ? " — " : "", why ? why : "",
+                ev && *ev ? ev[0] : '0', nt, g_admit_cap,
+                g_mufu_ok ? "on the CPU, bit-exact via this card's MUFU tables" : "round trip to the GPU");
+        fflush(stderr);
+    }
+    g_cpu_mode = m;
+    return m;
+}
+static std::mutex g_admq_mtx;
+static int g_admq_n = 0, g_admq[64][5];
+static void moe_admit_async(int L, int e, int NE, int E, int FFE);
+static void moe_admit_enqueue(int L, int e, int NE, int E, int FFE) {
+    std::lock_guard<std::mutex> lk(g_admq_mtx);
+    if (g_admq_n < 64) { int *q = g_admq[g_admq_n++]; q[0] = L; q[1] = e; q[2] = NE; q[3] = E; q[4] = FFE; }
+}
+static void moe_admit_flush(void) {
+    int n, q[64][5];
+    { std::lock_guard<std::mutex> lk(g_admq_mtx); n = g_admq_n; memcpy(q, g_admq, sizeof(int) * 5 * (size_t)n); g_admq_n = 0; }
+    for (int i = 0; i < n; i++) moe_admit_async(q[i][0], q[i][1], q[i][2], q[i][3], q[i][4]);
+}
+/* resident AND not still being filled? (the CPU path never waits on an admission) */
+static int moe_ready_now(int L, int e, int NE) {
+    G4_MOE_SHARED_LOCK();
+    const int slot = g_ec_map[(long long)L * NE + e];
+    if (slot < 0) return 0;
+    if (g_ec_pend[slot]) {
+        if (g_ec_pev[slot] && cudaEventQuery(g_ec_pev[slot]) != cudaSuccess) return 0;
+        g_ec_pend[slot] = 0;
+    }
+    return 1;
+}
+/* Admit (L,e) into the cache WITHOUT anything waiting on it: the copy runs on its own stream
+ * after g_adm_ready (recorded on the compute stream by the caller, so no queued kernel can
+ * still be reading the victim), and the slot stays pending until its event fires. Capped by
+ * copies in flight: an admission queue that outruns the bus only adds latency to itself. */
+static void moe_admit_async(int L, int e, int NE, int E, int FFE) {
+    G4_MOE_SHARED_LOCK();
+    const long long key = (long long)L * NE + e;
+    if (g_ec_map[key] >= 0 || g_admit_cap <= 0) return;
+    int inflight = 0, free_i = -1;
+    for (int i = 0; i < g_admit_cap; i++) {
+        const int sl = g_adm_ring[i];
+        if (sl >= 0 && g_ec_pend[sl] && g_ec_pev[sl] && cudaEventQuery(g_ec_pev[sl]) != cudaSuccess) inflight++;
+        else { if (sl >= 0) g_ec_pend[sl] = 0; g_adm_ring[i] = -1; if (free_i < 0) free_i = i; }
+    }
+    if (inflight >= g_admit_cap || free_i < 0) { g_adm_skip++; return; }
+    int victim = 0; unsigned long long best = ~0ull;
+    for (int i = 0; i < g_ec_slots; i++) {
+        if (g_ec_key[i] < 0) { victim = i; break; }
+        if (g_ec_use[i] < best) { best = g_ec_use[i]; victim = i; }
+    }
+    if (g_ec_key[victim] >= 0) g_ec_map[g_ec_key[victim]] = -1;
+    unsigned char  *gc = g_ec_gup_codes  + (size_t)victim * g_w.slot_gup_bytes;
+    unsigned char  *dc = g_ec_down_codes + (size_t)victim * g_w.slot_down_bytes;
+    unsigned short *gb = g_ec_gup_bs  ? g_ec_gup_bs  + (size_t)victim * g_w.slot_gup_bs_n  : NULL;
+    unsigned short *db = g_ec_down_bs ? g_ec_down_bs + (size_t)victim * g_w.slot_down_bs_n : NULL;
+    DevTensor d1, d2;
+    cudaStreamWaitEvent(g_adm_cps, g_adm_ready, 0);
+    if (g_ec_pend[victim] && g_ec_pev[victim]) cudaStreamWaitEvent(g_adm_cps, g_ec_pev[victim], 0);
+    if (moe_stage(g_w.gup_pt[L], e, g_w.slot_gup_rows, E, gc, g_w.slot_gup_bytes,
+                  gb, g_w.slot_gup_bs_n, g_w.slot_gup_nblk,
+                  g_w.slot_gup_ro, g_w.slot_gup_rp, g_w.slot_gup_prec, g_adm_cps, &d1) ||
+        moe_stage(g_w.down_pt[L], e, g_w.slot_down_rows, FFE, dc, g_w.slot_down_bytes,
+                  db, g_w.slot_down_bs_n, g_w.slot_down_nblk,
+                  g_w.slot_down_ro, g_w.slot_down_rp, g_w.slot_down_prec, g_adm_cps, &d2)) {
+        g_ec_key[victim] = -1; cudaGetLastError(); return;        /* slot left empty, never mapped */
+    }
+    if (g_ec_pev[victim]) { cudaEventRecord(g_ec_pev[victim], g_adm_cps); g_ec_pend[victim] = 1; }
+    g_ec_key[victim] = (int)key; g_ec_map[key] = victim; g_ec_use[victim] = ++g_ec_clock;
+    g_adm_ring[free_i] = victim;
+    g_adm_n++;
 }
 
 /* ── MoE SCRATCH, ONE SET PER FORWARD (2026-08-23) ────────────────────────────────────
@@ -5964,6 +6228,14 @@ static void moe_scratch_free(g4_moe_scratch *ms) {
     for (size_t i = 0; i < sizeof(dev)/sizeof(dev[0]); i++) if (dev[i]) cudaFree(dev[i]);
     free(ms->log_h); free(ms->idx_h); free(ms->wt_h);
     free(ms->rows_h); free(ms->w_h); free(ms->bkt); free(ms->bkt_n); free(ms->bktw);
+    if (ms->brows_h) cudaFreeHost(ms->brows_h);
+    if (ms->bw_h) cudaFreeHost(ms->bw_h);
+    if (ms->brows_d) cudaFree(ms->brows_d);
+    if (ms->bw_d) cudaFree(ms->bw_d);
+    { void *gd[] = { ms->ggu, ms->gh, ms->gout, ms->gsx, ms->gacc, ms->gqx };
+      for (size_t i = 0; i < sizeof(gd)/sizeof(gd[0]); i++) if (gd[i]) cudaFree(gd[i]); }
+    { void *hp[] = { ms->cin_h, ms->cout_h, ms->cgu_h, ms->csx_h, ms->cinsx_h, ms->cq_h, ms->cinq_h, ms->logd_h };
+      for (size_t i = 0; i < sizeof(hp)/sizeof(hp[0]); i++) if (hp[i]) cudaFreeHost(hp[i]); }
     memset(ms, 0, sizeof(*ms));
 }
 
@@ -6157,6 +6429,7 @@ static cudaEvent_t  g_moe_ev[G4_MOE_OVL_MAX];
 static cudaEvent_t  g_moe_ready = NULL;
 static int          g_moe_overlap = -1;          /* -1 untried, 0 off, 1 on */
 
+#define G4_MOE_BKT_MAXE 256
 static int moe_overlap_on(void) {
     if (g_moe_overlap >= 0) return g_moe_overlap;
     const char *ev = getenv("SP_G4_MOE_OVERLAP");
@@ -6194,7 +6467,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     /* ADR-013 BISECT: L==0 only, so cost is one layer's worth of syncs. Every op in
      * this block was unsynced, which meant the first sync downstream took the blame
      * for all of them. Each step now owns its own fault. */
-    #define MBK(tag) do { if (L == 0) { \
+    #define MBK(tag) do { if (L == 0 && moe_bisect_on()) { \
         cudaError_t ce_ = cudaStreamSynchronize(st); \
         if (ce_ == cudaSuccess) ce_ = cudaGetLastError(); \
         if (ce_ != cudaSuccess) { char eb_[224]; snprintf(eb_, sizeof eb_, \
@@ -6203,7 +6476,10 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
             fprintf(stderr, "    [g4-moe] %s\n", eb_); fflush(stderr); \
             sp_set_error(eb_); return -1; } } } while (0)
 
+    const int ph = (n_tok == 1 && moe_on) ? g_ffn_phase : 0;
+    const int do_pre = (ph == 0 || ph == 1), do_mid = (ph == 0 || ph == 2);
     /* ── the DENSE FFN (on a MoE model this is the per-layer SHARED expert) ── */
+    if (do_pre) {
     MBK("entry");
     k_rmsnorm<<<n_tok, 256, 0, st>>>(dx, g_w.ffn_norm[L], E, eps, dnx);
     MBK("ffn_norm");
@@ -6218,6 +6494,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     MBK("Wdown");
 
     g4_nan_probe("ffn-dense(Wdown out)", L, ddn, st);
+    }
     if (!moe_on) {                    /* byte-identical to every previous copy */
         k_rmsnorm<<<n_tok, 256, 0, st>>>(ddn, g_w.post_ffw[L], E, eps, dnx);
         k_add<<<(unsigned)((nE+255)/256), 256, 0, st>>>(dx, dnx, nE);
@@ -6252,6 +6529,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
         sp_set_error(eb_); return -1;
     }
     /* dense branch -> post_ffw_norm_1, held for all tokens while the experts run */
+    if (do_pre) {
     k_rmsnorm<<<n_tok, 256, 0, st>>>(ddn, g_w.post_ffw1[L], E, eps, ms->mlp);
     MBK("post_ffw_norm_1");
 
@@ -6266,6 +6544,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     k_moe_zero<<<(unsigned)((nE + 255) / 256), 256, 0, st>>>(ms->acc, (int)nE);
 
     g4_nan_probe("moe-router-in", L, ms->rin, st);
+    }
     /* THE ONLY SYNC: one D2H for the whole [n_tok x NE] logit block, once per layer. */
     if (_mtm) _mt_sync = moe_clk::now();
     /* ── IS THIS HOST OVERHEAD, OR IS IT THE GPU? (2026-09-11) ───────────────────────────
@@ -6285,14 +6564,46 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
      *     copy  >> drain  ->  the round trip itself is the cost and the rewrite pays.
      *
      * Only under SP_MOE_TIMING, which is already a diagnostic mode. */
-    if (_mtm) {
+    if (_mtm && do_mid) {
         moe_clk::time_point _t_drain = moe_clk::now();
         cudaStreamSynchronize(st);
         g_moe_drain_ms += moe_ms_since(_t_drain);
     }
-    if (cudaMemcpyAsync(ms->log_h, ms->log, (size_t)n_tok * (size_t)NE * sizeof(float),
+    /* STEP B: the CPU experts need the expert input on the host. It rides this sync. */
+    const int cpu_mode = (n_tok == 1 && moe_on) ? moe_cpu_mode(E, FFE) : 0;
+    int cpu_in_ok = 0;
+    if (cpu_mode && !do_pre) cpu_in_ok = (ms->ccapE >= E);
+    if (cpu_mode && do_pre) {
+        if (ms->ccapE < E) {
+            void *hp[] = { ms->cin_h, ms->cout_h, ms->cgu_h, ms->csx_h, ms->cinsx_h, ms->cq_h, ms->cinq_h };
+            for (size_t i = 0; i < sizeof(hp)/sizeof(hp[0]); i++) if (hp[i]) cudaFreeHost(hp[i]);
+            ms->cin_h = ms->cout_h = ms->cgu_h = ms->csx_h = ms->cinsx_h = NULL; ms->cq_h = ms->cinq_h = NULL;
+            ms->ccapE = 0;
+            if (cudaMallocHost(&ms->cin_h,   (size_t)E * sizeof(float)) == cudaSuccess &&
+                cudaMallocHost(&ms->cout_h,  (size_t)G4G_MAX * E * sizeof(float)) == cudaSuccess &&
+                cudaMallocHost(&ms->cgu_h,   (size_t)G4G_MAX * 2 * FFE * sizeof(float)) == cudaSuccess &&
+                cudaMallocHost(&ms->cq_h,    (size_t)G4G_MAX * FFE) == cudaSuccess &&
+                cudaMallocHost(&ms->csx_h,   (size_t)G4G_MAX * (FFE / 16) * sizeof(float)) == cudaSuccess &&
+                cudaMallocHost(&ms->cinq_h,  (size_t)E) == cudaSuccess &&
+                cudaMallocHost(&ms->cinsx_h, (size_t)(E / 16) * sizeof(float)) == cudaSuccess) ms->ccapE = E;
+            else cudaGetLastError();
+        }
+        if (ms->ccapE >= E &&
+            cudaMemcpyAsync(ms->cin_h, ms->in, (size_t)E * sizeof(float), cudaMemcpyDeviceToHost, st) == cudaSuccess)
+            cpu_in_ok = 1;
+    }
+    /* n_tok == 1: logits go to a PINNED buffer (a graph can capture that D2H; pageable, it cannot) */
+    if (n_tok == 1 && !ms->logd_h) {
+        if (cudaMallocHost(&ms->logd_h, (size_t)NE * sizeof(float)) != cudaSuccess) { ms->logd_h = NULL; cudaGetLastError(); }
+    }
+    float *logh = (n_tok == 1 && ms->logd_h) ? ms->logd_h : ms->log_h;
+    if (do_pre &&
+        cudaMemcpyAsync(logh, ms->log, (size_t)n_tok * (size_t)NE * sizeof(float),
                         cudaMemcpyDeviceToHost, st) != cudaSuccess) {
         sp_set_error("gemma4-MoE: router logits D2H"); return -1; }
+    if (ph == 1) return 0;               /* PRE ends at the D2Hs; the sync belongs to MID */
+    if (do_mid) {
+    moe_admit_flush();                   /* the previous layer's admissions, off the GPU's critical path */
     {   cudaError_t ce = cudaStreamSynchronize(st);
         if (ce != cudaSuccess) {
             char eb[192]; snprintf(eb, sizeof eb,
@@ -6308,7 +6619,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     /* host: top-k per token, bucketed BY EXPERT */
     memset(ms->bkt_n, 0, (size_t)NE * sizeof(int));
     for (int t = 0; t < n_tok; t++) {
-        moe_topk_host(ms->log_h + (size_t)t * (size_t)NE, NE, NU, ms->idx_h, ms->wt_h);
+        moe_topk_host(logh + (size_t)t * (size_t)NE, NE, NU, ms->idx_h, ms->wt_h);
         /* ── EXPERT-ROUTE TRACE (SP_MOE_TRACE=1) ─────────────────────────────────
          * The measurement that decides whether MTP speculative decode can pay on
          * this model. Speculation wins when verifying k drafts costs ~one forward —
@@ -6320,9 +6631,42 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
         { static int trace_ = -1;
           if (trace_ < 0) { const char *e = getenv("SP_MOE_TRACE"); trace_ = (e && *e=='1') ? 1 : 0; }
           if (trace_) {
-              fprintf(stderr, "[moe-route] L=%d t=%d e=", L, t);
-              for (int k = 0; k < NU; k++) fprintf(stderr, "%d%s", ms->idx_h[k], k+1<NU?",":"");
-              fprintf(stderr, "\n");
+              /* SP_MOE_TRACE_FILE (2026-09-28): the hybrid-offload measurement. When set,
+               * one line per (layer, token) goes to that file instead of stderr, carrying
+               * what the old line could not: the phase (P = batched prefill, D = n_tok==1
+               * decode), a forward counter (bumped at L==0) so tokens and turns can be
+               * separated, a monotonic microsecond stamp, and per chosen expert its gate
+               * weight and whether it was RESIDENT in the device cache at the moment of
+               * routing (read-only peek at g_ec_map; the hit/miss counters are untouched).
+               * Format:  R <fwd> <P|D> <L> <t> <us> e:w:h,e:w:h,...
+               * Diagnostic only; the default path is unchanged. */
+              static FILE *tf_ = NULL; static int tf_init_ = 0;
+              static long long fwd_ = 0; static int last_L_ = -1;
+              static moe_clk::time_point t0_ = moe_clk::now();
+              if (!tf_init_) { tf_init_ = 1;
+                  const char *fp = getenv("SP_MOE_TRACE_FILE");
+                  if (fp && *fp) { tf_ = fopen(fp, "a");
+                      if (tf_) setvbuf(tf_, NULL, _IOFBF, 1 << 20); } }
+              if (tf_) {
+                  if (t == 0 && (L == 0 || L <= last_L_)) fwd_++;
+                  if (t == 0) last_L_ = L;
+                  const long long us_ = (long long)std::chrono::duration_cast<std::chrono::microseconds>(
+                      moe_clk::now() - t0_).count();
+                  fprintf(tf_, "R %lld %c %d %d %lld ", fwd_, n_tok == 1 ? 'D' : 'P', L, t, us_);
+                  for (int k = 0; k < NU; k++) {
+                      const int ek = ms->idx_h[k];
+                      int hk = -1;
+                      if (g_ec_slots > 0 && ek >= 0 && ek < NE)
+                          hk = g_ec_map[(long long)L * (long long)NE + (long long)ek] >= 0 ? 1 : 0;
+                      fprintf(tf_, "%d:%.4f:%d%s", ek, ms->wt_h[k], hk, k+1<NU?",":"");
+                  }
+                  fputc('\n', tf_);
+                  if (n_tok == 1 && L == 29) fflush(tf_);
+              } else {
+                  fprintf(stderr, "[moe-route] L=%d t=%d e=", L, t);
+                  for (int k = 0; k < NU; k++) fprintf(stderr, "%d%s", ms->idx_h[k], k+1<NU?",":"");
+                  fprintf(stderr, "\n");
+              }
           } }
         for (int k = 0; k < NU; k++) {
             const int e = ms->idx_h[k];
@@ -6334,7 +6678,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                  * "index -1" and "index 999" are completely different faults: one is a
                  * broken router GEMM upstream, the other is a real bounds bug here. The
                  * message now distinguishes them and shows the row. */
-                const float *lg = ms->log_h + (size_t)t * (size_t)NE;
+                const float *lg = logh + (size_t)t * (size_t)NE;
                 int n_nan = 0, n_inf = 0;
                 for (int i = 0; i < NE; i++) {
                     if (lg[i] != lg[i]) n_nan++;
@@ -6369,7 +6713,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
      * See the block at moe_overlap_on for the two hazards and what holds them. */
     int ovl_n = 0, ovl_e[G4_MOE_OVL_MAX], ovl_cp[G4_MOE_OVL_MAX];
     DevTensor ovl_gu[G4_MOE_OVL_MAX], ovl_dw[G4_MOE_OVL_MAX];
-    int ovl = (n_tok == 1) && moe_overlap_on() && g_ec_slots > 0;
+    int ovl = (n_tok == 1) && moe_overlap_on() && g_ec_slots > 0 && !(cpu_mode && cpu_in_ok);
     if (ovl) {
         for (int e = 0; e < NE && ovl; e++) if (ms->bkt_n[e]) {
             if (ovl_n >= G4_MOE_OVL_MAX) { ovl = 0; break; }   /* more active than slots here */
@@ -6392,9 +6736,262 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     }
     int ovl_i = 0;
 
-    for (int e = 0; e < NE; e++) {
+    /* ── STEP A: grouped expert launch (SP_G4_MOE_GROUPED; 1 = serve, 2 = parity) ──────────
+     * Decode only (n_tok == 1), int8 GEMV path only, OK_Q4B experts only, cache on and big
+     * enough that resolving the whole active set cannot evict a member of it. Any condition
+     * false -> the per-expert loop below runs exactly as before. See k_gemv_q4b_dp4a_grp.
+     * ── STEP B (SP_G4_MOE_CPU; 1 = serve, 2 = parity) ──
+     * With the CPU path on, experts not resident at routing are computed on the CPU from the
+     * pinned arena while the GPU runs the resident ones; the CPU outputs go into the same
+     * combine slots, so the sum order is unchanged. Misses are then admitted to the cache
+     * asynchronously (step C). The grouped launch is implied. */
+    static int grp_ = -1;
+    if (grp_ < 0) { const char *ev = getenv("SP_G4_MOE_GROUPED");
+        grp_ = (ev && (ev[0] == '1' || ev[0] == '2')) ? ev[0] - '0' : 0;
+        if (grp_) { fprintf(stderr, "    [g4-moe] GROUPED expert launch %s (SP_G4_MOE_GROUPED=%d)\n",
+                            grp_ == 2 ? "PARITY (old loop served)" : "ON", grp_); fflush(stderr); } }
+    const int cpu_on = cpu_mode && cpu_in_ok;
+    const int grp_eff = grp_ ? grp_ : (cpu_on ? 1 : 0);
+    int grp_done = 0;
+    if (grp_eff && n_tok == 1 && use_int8 && g_ec_slots >= 4 * G4G_MAX
+        && g_w.slot_gup_prec == 4 && g_w.slot_down_prec == 4
+        && g_w.slot_gup_bs_n && g_w.slot_down_bs_n && (E & 31) == 0 && (FFE & 31) == 0) {
+        int nact = 0, act[G4G_MAX];
+        for (int e = 0; e < NE; e++) if (ms->bkt_n[e]) {
+            if (nact >= G4G_MAX) { nact = -1; break; }
+            act[nact++] = e;
+        }
+        const int npE = E, npF = FFE;          /* both %32 == 0, so npad == in */
+        if (nact > 0 && (ms->gcapE < E || ms->gcapF < FFE)) {
+            void *gd[] = { ms->ggu, ms->gh, ms->gout, ms->gsx, ms->gacc, ms->gqx };
+            for (size_t i = 0; i < sizeof(gd)/sizeof(gd[0]); i++) if (gd[i]) cudaFree(gd[i]);
+            ms->ggu = ms->gh = ms->gout = ms->gsx = ms->gacc = NULL; ms->gqx = NULL;
+            ms->gcapE = ms->gcapF = 0;
+            /* rows [0, G4G_MAX) serve the GPU experts, [G4G_MAX, 2*G4G_MAX) the CPU round trip */
+            const size_t qxb = (size_t)npE + (size_t)2 * G4G_MAX * npF;
+            const size_t sxn = (size_t)(npE >> 4) + (size_t)2 * G4G_MAX * (npF >> 4);
+            if (cudaMalloc(&ms->ggu,  (size_t)2 * G4G_MAX * 2 * FFE * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&ms->gh,   (size_t)2 * G4G_MAX * FFE * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&ms->gout, (size_t)2 * G4G_MAX * E * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&ms->gacc, (size_t)E * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&ms->gsx,  sxn * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&ms->gqx,  qxb) == cudaSuccess) { ms->gcapE = E; ms->gcapF = FFE; }
+            else { cudaGetLastError(); nact = -1; }
+        }
+        if (nact > 0) {
+            /* which experts go to the CPU: in serve mode, those not ready on the GPU right now */
+            int oncpu[G4G_MAX] = {0}, ncpu = 0, cpos[G4G_MAX] = {0};
+            if (cpu_on && cpu_mode == 1) {
+                for (int k = 0; k < nact; k++)
+                    if (!moe_ready_now(L, act[k], NE)) { oncpu[k] = 1; ncpu++; }
+            } else if (cpu_on && cpu_mode == 2) { /* parity: the CPU recomputes this layer's misses */
+                for (int k = 0; k < nact; k++)
+                    if (!moe_ready_now(L, act[k], NE)) { oncpu[k] = 2; ncpu++; }
+            }
+            G4MoeGrp ggu_t = {}, gdw_t = {}; G4MoeW wt = {};
+            int ok = 1, nh = 0;
+            for (int k = 0; k < nact && ok; k++) {
+                const int e = act[k];
+                wt.w[k] = ms->bktw[(size_t)e * (size_t)n_tok] * dsc[e];   /* == old w_h[0] */
+                wt.row[k] = k;
+                if (oncpu[k] == 1) continue;        /* served from the CPU slot */
+                DevTensor gu, dw;
+                if (ovl) {                      /* pass 1 resolved them, in the same e order */
+                    if (k >= ovl_n || ovl_e[k] != e) { ok = 0; break; }
+                    gu = ovl_gu[k]; dw = ovl_dw[k];
+                    if (ovl_cp[k]) cudaStreamWaitEvent(st, g_moe_ev[k], 0);
+                } else if (moe_resident(L, e, NE, E, FFE, st, &gu, &dw)) return -1;
+                if (gu.prec != 4 || dw.prec != 4 || !gu.bscale || !dw.bscale) { ok = 0; break; }
+                if (gu.bs_nblk != E >> 5 || dw.bs_nblk != FFE >> 5) { ok = 0; break; }
+                ggu_t.codes[nh] = gu.codes; ggu_t.ro[nh] = gu.row_off; ggu_t.bs[nh] = gu.bscale; ggu_t.oslot[nh] = nh;
+                gdw_t.codes[nh] = dw.codes; gdw_t.ro[nh] = dw.row_off; gdw_t.bs[nh] = dw.bscale; gdw_t.oslot[nh] = k;
+                nh++;
+            }
+            if (ok) {
+                signed char *qxE = ms->gqx, *qxF = ms->gqx + npE;
+                float *sxE = ms->gsx, *sxF = ms->gsx + (npE >> 4);
+                float *dacc = (grp_ == 2) ? ms->gacc : ms->acc;
+                if (grp_ == 2) k_moe_zero<<<(unsigned)((E + 255) / 256), 256, 0, st>>>(ms->gacc, E);
+                if (nh > 0) {
+                    k_quant_act_int8<<<1, 256, 0, st>>>(ms->in, E, npE, qxE, sxE);
+                    { dim3 gr((unsigned)((2 * FFE + 7) / 8), (unsigned)nh);
+                      k_gemv_q4b_dp4a_grp<<<gr, 256, 0, st>>>(ggu_t, E >> 5, E, qxE, 0, sxE, 0,
+                                                              ms->ggu, 2 * FFE, 2 * FFE); }
+                    k_moe_gelu_split_batch<<<(unsigned)(((size_t)nh * FFE + 255) / 256), 256, 0, st>>>(
+                        ms->ggu, FFE, nh, ms->gh);
+                    { dim3 qg(1, (unsigned)nh);
+                      k_quant_act_int8_batched<<<qg, 256, 0, st>>>(ms->gh, nh, FFE, npF, qxF, sxF); }
+                    { dim3 gr((unsigned)((E + 7) / 8), (unsigned)nh);
+                      k_gemv_q4b_dp4a_grp<<<gr, 256, 0, st>>>(gdw_t, FFE >> 5, FFE, qxF, npF, sxF, npF >> 4,
+                                                              ms->gout, E, E); }
+                }
+                if (ncpu) {
+                    /* The GPU is already running the resident experts; the CPU does the rest,
+                     * BIT-EXACT: its GEMVs reproduce k_gemv_q4b_dp4a_v2, and the GELU + requant
+                     * between them run on the GPU (CUDA tanhf is MUFU-based and cannot be
+                     * matched on the CPU) via a short round trip on a high-priority stream.
+                     * CPU rows live at [G4G_MAX, 2*G4G_MAX) of ggu/gh/qxF/sxF. */
+                    static cudaStream_t cst_ = NULL; static cudaEvent_t cev_ = NULL;
+                    if (!cst_) { int lo = 0, hi = 0; cudaDeviceGetStreamPriorityRange(&lo, &hi);
+                        if (cudaStreamCreateWithPriority(&cst_, cudaStreamNonBlocking, hi) != cudaSuccess ||
+                            cudaEventCreateWithFlags(&cev_, cudaEventDisableTiming) != cudaSuccess) {
+                            sp_set_error("gemma4-MoE: CPU round-trip stream"); return -1; } }
+                    int cj[G4G_MAX], cjn = 0;
+                    for (int k = 0; k < nact; k++) if (oncpu[k]) cj[cjn++] = k;
+                    sp_moe_cpu_quant(ms->cin_h, E, (int8_t *)ms->cinq_h, ms->cinsx_h);
+                    if (g_mufu_ok) {
+                        /* v3: everything on the CPU, bit-exact, no round trip */
+                        static thread_local float hbuf[4096];
+                        for (int j = 0; j < cjn; j++) {
+                            const int k = cj[j], e = act[k];
+                            const sp_frob_packed_tensor *pg = g_w.gup_pt[L], *pd = g_w.down_pt[L];
+                            const uint8_t  *gcod = pg->codes + (size_t)pg->row_off[(size_t)e * (size_t)g_w.slot_gup_rows];
+                            const uint16_t *gbs  = pg->bscale + (size_t)e * g_w.slot_gup_bs_n;
+                            const uint8_t  *dcod = pd->codes + (size_t)pd->row_off[(size_t)e * (size_t)g_w.slot_down_rows];
+                            const uint16_t *dbs  = pd->bscale + (size_t)e * g_w.slot_down_bs_n;
+                            float *gu = ms->cgu_h + (size_t)j * 2 * FFE;
+                            int8_t *hq = (int8_t *)ms->cq_h + (size_t)j * npF;
+                            float *hs = ms->csx_h + (size_t)j * (npF >> 4);
+                            if (sp_moe_cpu_gemv(gcod, gbs, E, 2 * FFE, (const int8_t *)ms->cinq_h, ms->cinsx_h, gu) ||
+                                sp_moe_cpu_gelu(gu, FFE, hbuf) || sp_moe_cpu_quant(hbuf, FFE, hq, hs) ||
+                                sp_moe_cpu_gemv(dcod, dbs, FFE, E, hq, hs, ms->cout_h + (size_t)j * E)) {
+                                sp_set_error("gemma4-MoE: CPU expert (v3) failed"); return -1; }
+                            g_cpu_n++;
+                            cpos[k] = j;
+                            if (oncpu[k] == 1) wt.row[k] = G4G_MAX + j;   /* combine reads the uploaded row */
+                        }
+                        /* ONE upload for all of this layer's CPU experts (rows G4G_MAX + j) */
+                        if (cpu_mode == 1)
+                            cudaMemcpyAsync(ms->gout + (size_t)G4G_MAX * E, ms->cout_h,
+                                            (size_t)cjn * E * sizeof(float), cudaMemcpyHostToDevice, st);
+                    } else {
+                    for (int j = 0; j < cjn; j++) {
+                        const int e = act[cj[j]];
+                        const sp_frob_packed_tensor *pg = g_w.gup_pt[L];
+                        const uint8_t  *gcod = pg->codes + (size_t)pg->row_off[(size_t)e * (size_t)g_w.slot_gup_rows];
+                        const uint16_t *gbs  = pg->bscale + (size_t)e * g_w.slot_gup_bs_n;
+                        if (sp_moe_cpu_gemv(gcod, gbs, E, 2 * FFE, (const int8_t *)ms->cinq_h, ms->cinsx_h,
+                                            ms->cgu_h + (size_t)j * 2 * FFE) != 0) {
+                            sp_set_error("gemma4-MoE: CPU gate_up failed"); return -1; }
+                    }
+                    float *ggu_c = ms->ggu + (size_t)G4G_MAX * 2 * FFE, *gh_c = ms->gh + (size_t)G4G_MAX * FFE;
+                    signed char *qx_c = qxF + (size_t)G4G_MAX * npF; float *sx_c = sxF + (size_t)G4G_MAX * (npF >> 4);
+                    cudaMemcpyAsync(ggu_c, ms->cgu_h, (size_t)cjn * 2 * FFE * sizeof(float), cudaMemcpyHostToDevice, cst_);
+                    k_moe_gelu_split_batch<<<(unsigned)(((size_t)cjn * FFE + 255) / 256), 256, 0, cst_>>>(ggu_c, FFE, cjn, gh_c);
+                    { dim3 qg(1, (unsigned)cjn);
+                      k_quant_act_int8_batched<<<qg, 256, 0, cst_>>>(gh_c, cjn, FFE, npF, qx_c, sx_c); }
+                    cudaMemcpyAsync(ms->cq_h, qx_c, (size_t)cjn * npF, cudaMemcpyDeviceToHost, cst_);
+                    cudaMemcpyAsync(ms->csx_h, sx_c, (size_t)cjn * (npF >> 4) * sizeof(float), cudaMemcpyDeviceToHost, cst_);
+                    cudaEventRecord(cev_, cst_);
+                    if (cudaEventSynchronize(cev_) != cudaSuccess) { sp_set_error("gemma4-MoE: CPU round trip"); return -1; }
+                    for (int j = 0; j < cjn; j++) {
+                        const int k = cj[j], e = act[k];
+                        const sp_frob_packed_tensor *pd = g_w.down_pt[L];
+                        const uint8_t  *dcod = pd->codes + (size_t)pd->row_off[(size_t)e * (size_t)g_w.slot_down_rows];
+                        const uint16_t *dbs  = pd->bscale + (size_t)e * g_w.slot_down_bs_n;
+                        if (sp_moe_cpu_gemv(dcod, dbs, FFE, E, (const int8_t *)ms->cq_h + (size_t)j * npF,
+                                            ms->csx_h + (size_t)j * (npF >> 4), ms->cout_h + (size_t)k * E) != 0) {
+                            sp_set_error("gemma4-MoE: CPU down failed"); return -1; }
+                        g_cpu_n++;
+                        cpos[k] = k;
+                        if (oncpu[k] == 1)
+                            cudaMemcpyAsync(ms->gout + (size_t)k * E, ms->cout_h + (size_t)k * E,
+                                            (size_t)E * sizeof(float), cudaMemcpyHostToDevice, st);
+                    }
+                    }   /* round-trip fallback */
+                    g_cpu_layers++;
+                }
+                k_moe_combine_ord<<<(unsigned)((E + 255) / 256), 256, 0, st>>>(ms->gout, nact, E, wt, dacc);
+                if (_mtm) g_moe_expert_calls += nact;
+                if (grp_ != 2) grp_done = 1;
+                /* STEP C: admit this layer's CPU experts, off the critical path */
+                if (cpu_mode == 1 && ncpu) {
+                    /* DEFERRED (phase D): issuing ~4 copies per miss here cost the host ~110 us
+                     * per miss while the GPU waited for the next layer's launches. Queue them;
+                     * they are issued at the next router sync, after the next layer's graphs
+                     * are already on the stream. g_adm_ready still marks THIS point, and nothing
+                     * enqueued between here and the flush reads a cache slot. */
+                    cudaEventRecord(g_adm_ready, st);
+                    for (int k = 0; k < nact; k++) if (oncpu[k] == 1) moe_admit_enqueue(L, act[k], NE, E, FFE);
+                }
+                /* PARITY for the CPU path: compare the CPU rows against the GPU rows just computed */
+                if (cpu_mode == 2 && ncpu) {
+                    static float *pg_ = NULL; static int pgc_ = 0;
+                    static long long cp_n = 0, cp_bad = 0; static double cp_worst = 0.0, cp_sum = 0.0;
+                    if (pgc_ < G4G_MAX * E) { free(pg_); pg_ = (float *)malloc((size_t)G4G_MAX * E * 4); pgc_ = G4G_MAX * E; }
+                    cudaMemcpyAsync(pg_, ms->gout, (size_t)nact * E * 4, cudaMemcpyDeviceToHost, st);
+                    cudaStreamSynchronize(st);
+                    for (int k = 0; k < nact; k++) if (oncpu[k]) {
+                        double num = 0, den = 0;
+                        for (int i = 0; i < E; i++) {
+                            const double d = (double)pg_[(size_t)k * E + i] - (double)ms->cout_h[(size_t)cpos[k] * E + i];
+                            num += d * d; den += (double)pg_[(size_t)k * E + i] * pg_[(size_t)k * E + i];
+                        }
+                        const double r = den > 0 ? sqrt(num / den) : 0.0;
+                        cp_n++; cp_sum += r; if (r > cp_worst) cp_worst = r;
+                        if (memcmp(pg_ + (size_t)k * E, ms->cout_h + (size_t)cpos[k] * E, (size_t)E * 4) != 0) cp_bad++;
+                    }
+                    if ((cp_n % 500) < (long long)ncpu)
+                        { fprintf(stderr, "    [g4-moe] CPU PARITY: %lld experts, %lld not bit-identical, relL2 mean %.3e worst %.3e\n",
+                                  cp_n, cp_bad, cp_sum / cp_n, cp_worst); fflush(stderr); }
+                }
+                if (cpu_mode == 1 && g_cpu_layers && (g_cpu_layers % 3000) == 0 && ncpu) {
+                    fprintf(stderr, "    [g4-moe] CPU path: %lld experts over %lld layers; admitted %lld, admission skipped %lld\n",
+                            g_cpu_n, g_cpu_layers, g_adm_n, g_adm_skip); fflush(stderr);
+                }
+            }
+        }
+    }
+
+    /* SP_MOE_BUCKET_PIN=1: pack every active expert's rows + weights into one pinned buffer
+     * and send it in TWO copies for the layer. REUSE SAFETY: the pinned buffer is rewritten
+     * only by the next layer's bucketing, which runs after that layer's router
+     * cudaStreamSynchronize — so this layer's copies have completed by then. */
+    static int bpin_ = -1;
+    if (bpin_ < 0) { const char *ev = getenv("SP_MOE_BUCKET_PIN"); bpin_ = (ev && ev[0] == '1') ? 1 : 0; }
+    int bpin = bpin_;
+    int boff[G4_MOE_BKT_MAXE];
+    if (bpin && NE > G4_MOE_BKT_MAXE) bpin = 0;
+    if (grp_done) bpin = 0;
+    if (bpin) {
+        const int need = n_tok * NU;
+        if (ms->bcap < need) {
+            if (ms->brows_h) cudaFreeHost(ms->brows_h);
+            if (ms->bw_h) cudaFreeHost(ms->bw_h);
+            if (ms->brows_d) cudaFree(ms->brows_d);
+            if (ms->bw_d) cudaFree(ms->bw_d);
+            ms->brows_h = NULL; ms->bw_h = NULL; ms->brows_d = NULL; ms->bw_d = NULL; ms->bcap = 0;
+            if (cudaMallocHost(&ms->brows_h, (size_t)need * sizeof(int)) == cudaSuccess &&
+                cudaMallocHost(&ms->bw_h, (size_t)need * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&ms->brows_d, (size_t)need * sizeof(int)) == cudaSuccess &&
+                cudaMalloc(&ms->bw_d, (size_t)need * sizeof(float)) == cudaSuccess) ms->bcap = need;
+            else { cudaGetLastError(); bpin = 0; }
+        }
+    }
+    if (bpin) {
+        int off = 0;
+        for (int e = 0; e < NE; e++) {
+            const int cnt = ms->bkt_n[e];
+            boff[e] = off;
+            if (cnt == 0) continue;
+            const int *rows = ms->bkt  + (size_t)e * (size_t)n_tok;
+            const float *bw = ms->bktw + (size_t)e * (size_t)n_tok;
+            for (int i = 0; i < cnt; i++) { ms->brows_h[off + i] = rows[i]; ms->bw_h[off + i] = bw[i] * dsc[e]; }
+            off += cnt;
+        }
+        if (cudaMemcpyAsync(ms->brows_d, ms->brows_h, (size_t)off * sizeof(int),
+                            cudaMemcpyHostToDevice, st) != cudaSuccess ||
+            cudaMemcpyAsync(ms->bw_d, ms->bw_h, (size_t)off * sizeof(float),
+                            cudaMemcpyHostToDevice, st) != cudaSuccess) {
+            sp_set_error("gemma4-MoE: bucket H2D (pinned)"); return -1; }
+    }
+
+    for (int e = 0; e < NE && !grp_done; e++) {
         const int cnt = ms->bkt_n[e];
         if (cnt == 0) continue;
+        int *d_rows = ms->rows; float *d_w = ms->w;
+        if (bpin) { d_rows = ms->brows_d + boff[e]; d_w = ms->bw_d + boff[e]; }
+        else {
         const int *rows = ms->bkt  + (size_t)e * (size_t)n_tok;
         const float *bw = ms->bktw + (size_t)e * (size_t)n_tok;
         for (int i = 0; i < cnt; i++) { ms->rows_h[i] = rows[i]; ms->w_h[i] = bw[i] * dsc[e]; }
@@ -6403,6 +7000,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
             cudaMemcpyAsync(ms->w, ms->w_h, (size_t)cnt * sizeof(float),
                             cudaMemcpyHostToDevice, st) != cudaSuccess) {
             sp_set_error("gemma4-MoE: bucket H2D"); return -1; }
+        }
 
         DevTensor gu, dw;
         moe_clk::time_point _mt_st;
@@ -6417,18 +7015,43 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
         if (_mtm) { g_moe_stage_ms += moe_ms_since(_mt_st); _mt_st = moe_clk::now(); }
 
         k_moe_gather_rows<<<(unsigned)(((size_t)cnt*E + 255) / 256), 256, 0, st>>>(
-            ms->in, ms->rows, cnt, E, ms->gath);
+            ms->in, d_rows, cnt, E, ms->gath);
         AMMD(&gu, ms->gath, ms->gu, cnt);                       /* [2*FFE x cnt] */
         k_moe_gelu_split_batch<<<(unsigned)(((size_t)cnt*FFE + 255) / 256), 256, 0, st>>>(
             ms->gu, FFE, cnt, ms->h);
         AMMD(&dw, ms->h, ms->out, cnt);                         /* [E x cnt] */
         k_moe_scatter_acc<<<(unsigned)(((size_t)cnt*E + 255) / 256), 256, 0, st>>>(
-            ms->out, ms->rows, ms->w, cnt, E, ms->acc);
+            ms->out, d_rows, d_w, cnt, E, ms->acc);
         if (_mtm) { g_moe_launch_ms += moe_ms_since(_mt_st); g_moe_expert_calls++; }
     }
     if (_mtm) g_moe_expert_ms += moe_ms_since(_mt_exp);
     MBK("expert_loop");
+    if (grp_ == 2 && n_tok == 1 && ms->gacc && ms->gcapE >= E) {
+        /* PARITY: both combines exist now; compare them BITWISE. Diagnostic mode only — this
+         * is a D2H + sync per layer. */
+        static float *pa_ = NULL, *pb_ = NULL; static int pcap_ = 0;
+        static long long p_layers = 0, p_bad_layers = 0, p_bad_elems = 0; static double p_maxrel = 0.0;
+        if (pcap_ < E) { free(pa_); free(pb_); pa_ = (float *)malloc((size_t)E * 4); pb_ = (float *)malloc((size_t)E * 4); pcap_ = E; }
+        cudaMemcpyAsync(pa_, ms->acc, (size_t)E * 4, cudaMemcpyDeviceToHost, st);
+        cudaMemcpyAsync(pb_, ms->gacc, (size_t)E * 4, cudaMemcpyDeviceToHost, st);
+        cudaStreamSynchronize(st);
+        long long bad = 0; double num = 0.0, den = 0.0;
+        for (int i = 0; i < E; i++) {
+            if (memcmp(&pa_[i], &pb_[i], 4) != 0) bad++;
+            const double d = (double)pa_[i] - (double)pb_[i];
+            num += d * d; den += (double)pa_[i] * (double)pa_[i];
+        }
+        p_layers++; if (bad) { p_bad_layers++; p_bad_elems += bad; }
+        const double rel = den > 0 ? sqrt(num / den) : 0.0; if (rel > p_maxrel) p_maxrel = rel;
+        if ((p_layers % 300) == 0 || (bad && p_bad_layers <= 3)) {
+            fprintf(stderr, "    [g4-moe] GROUPED PARITY: %lld layers, %lld not bit-identical (%lld elems), worst relL2 %.3e\n",
+                    p_layers, p_bad_layers, p_bad_elems, p_maxrel);
+            fflush(stderr);
+        }
+    }
 
+    }   /* do_mid */
+    if (ph == 2) return 0;               /* MID ends at the combine; the recombine is TAIL */
     /* recombine: branches SUM (trap #3), post_ffw_norm wraps the sum, residual adds attn_out */
     k_rmsnorm<<<n_tok, 256, 0, st>>>(ms->acc, g_w.post_ffw2[L], E, eps, dnx);
     k_add<<<(unsigned)((nE + 255) / 256), 256, 0, st>>>(ms->mlp, dnx, nE);
@@ -6683,7 +7306,13 @@ static int g4_kv_step_graph(sp_g4_kv *s) {
  * argmax (writes dseq[dpos+1]) for a decode step; skip for a prefill ingest.
  * Always: embed dseq[dpos] → PLE/AltUp → 48-layer stack (store K/V at dpos,
  * windowed attention over [0,dpos]) → optional head → k_incr_pos. */
+static int g4_kv_step_seg(sp_g4_kv *s, int *handled);
 static int g4_kv_step(sp_g4_kv *s, int do_head) {
+    if (do_head && s->moe_on) {           /* PHASE D: segment graphs, when this step is eligible */
+        int handled = 0;
+        const int rc = g4_kv_step_seg(s, &handled);
+        if (handled) return rc;
+    }
     const qwen3_model *m = s->m; const qwen3_config *c = &m->cfg;
     cublasHandle_t cb = g_w.cublas; cudaStream_t st = g_w.stream;
     /* G-CROSS (2026-08-29 audit): the draft paths rebind the SHARED cublas handle to
@@ -6986,6 +7615,226 @@ static int g4_kv_step(sp_g4_kv *s, int do_head) {
  * short-lived one-shot cache must not be handed the process's 2048-slot SWA ring (~490 MB it
  * will never read), which on a full card spills into host memory and slows down EVERY caller,
  * including the conversation the one-shot route exists to protect. */
+
+/* ── PHASE D: g4_kv_step as per-layer SEGMENT GRAPHS (SP_G4_SEG_GRAPH=1), 2026-09-28 ──────────
+ * nsys, CPU-miss path armed: 1,288 launches/token at ~11 us of host each = 14.3 ms of a 40 ms
+ * token, and the GPU idle 12 ms waiting for the host. ~1,000 of those launches are the same
+ * kernels with the same arguments every token. This runs g4_kv_step's exact kernel sequence,
+ * but records the fixed stretches ONCE per session and replays them:
+ *   A[L]  = tail of layer L-1 (recombine norms, PLE block, out_scale) + layer L's pre-attention
+ *           (attn_norm, Wq, q_norm, RoPE, Wk/Wv, k_norm, RoPE, v_norm); A[0] adds embed + PLE
+ *   host  = the KV write (ring slot + undo journal are HOST indices — never baked)
+ *   B[L]  = attention + Wo + post_attn norm + residual + FFN PRE (dense FFN, router, D2Hs)
+ *   host  = FFN MID (router sync, routing, experts, combine) — dynamic by nature
+ *   H     = tail of the last layer + head + softcap + argmax + incr_pos
+ * Every position-dependent kernel in A/B/H reads the DEVICE dpos, as the A1 full-step graph
+ * already relies on. Byte-identity is by construction (same kernels, same arguments, same
+ * order); the gate is the output hash. Any seam, tap or diagnostic active -> the per-step path.
+ * The graphs bake scratch POINTERS, so a reallocation (the batched prefill growing ms) is
+ * detected by key and the graphs are rebuilt. */
+static int g4_kv_step_seg(sp_g4_kv *s, int *handled) {
+    *handled = 0;
+    if (s->seg_mode == 2) return 0;
+    if (s->seg_mode == 0) {
+        const char *e = getenv("SP_G4_SEG_GRAPH");
+        s->seg_mode = (e && e[0] == '1' && s->NL <= 64) ? 1 : 2;
+        if (s->seg_mode == 1) { fprintf(stderr, "    [g4-kv] SEGMENT GRAPHS armed (SP_G4_SEG_GRAPH=1)\n"); fflush(stderr); }
+        if (s->seg_mode == 2) return 0;
+    }
+    /* per-step conditions: any seam/tap/diagnostic -> the ordinary path for this step */
+    static int env_block = -1;
+    if (env_block < 0) {
+        const char *a = getenv("SP_DUMP_KV_DECODE"), *b = getenv("SP_BX_KTIME"), *c = getenv("SP_G4_NAN_PROBE");
+        env_block = (a && *a == '1') || (b && *b == '1') || (c && *c == '1') || moe_timing_on() || moe_bisect_on();
+    }
+    if (env_block || s->cap_active || s->inj_active || s->feat_active || s->steer_active || s->bx_on
+        || s->qcap_active || s->cpu_tail > 0 || s->cpu_tail_full > 0 || g_hd_f) return 0;
+    if (s->seg_warm < 2) { s->seg_warm++; return 0; }      /* let every lazy allocation happen first */
+
+    const qwen3_model *m = s->m;
+    cublasHandle_t cb = g_w.cublas; cudaStream_t st = g_w.stream;
+    cublasSetStream(cb, st);
+    const int E=s->E, NL=s->NL, V=s->V, SW=s->SW, period=s->period, kvfs=s->kvfs;
+    const int PL=s->PL, NLPL=s->NLPL;
+    const int g_nh=s->g_nh,g_nkv=s->g_nkv,g_hd=s->g_hd,s_nh=s->s_nh,s_nkv=s->s_nkv,s_hd=s->s_hd;
+    const float eps=s->eps, embscale=s->embscale, softcap=s->softcap;
+    const float g_base=s->g_base, s_base=s->s_base;
+    const int use_int8=s->use_int8;
+    int *dpos=s->dpos, *dseq=s->dseq;
+    float **dKc=s->dKc, **dVc=s->dVc;
+    const size_t attn_shm = (size_t)s->Pmax * sizeof(float);
+    (void)m;
+
+    /* the scratch pointers the graphs bake */
+    const void *key[8] = { s->moe.rin, s->moe.log, s->moe.in, s->moe.acc, s->moe.mlp, s->moe.logd_h, s->moe.cin_h, s->dx };
+    if (s->seg_ready && memcmp(key, s->seg_key, sizeof(key)) != 0) {
+        for (int i = 0; i < 64; i++) { if (s->segA[i]) cudaGraphExecDestroy(s->segA[i]); if (s->segB[i]) cudaGraphExecDestroy(s->segB[i]); s->segA[i] = s->segB[i] = NULL; }
+        if (s->segH) cudaGraphExecDestroy(s->segH); s->segH = NULL;
+        s->seg_ready = 0;
+        fprintf(stderr, "    [g4-kv] segment graphs: scratch moved, rebuilding\n"); fflush(stderr);
+    }
+    if (!s->moe.logd_h) return 0;                          /* pinned logits not there yet */
+    *handled = 1;
+    const int building = !s->seg_ready;
+
+    #define KMMD(W,X,Y) do { if (!(use_int8 && gemv_w_packed(st,(W),(X),(Y),s->dqx,s->dsx))) { \
+        if (gemm_w_lift(cb, st, (W), (X), (Y), 1, s->dscr)) return -1; } } while (0)
+    /* record fn() into *ex on the build step (and run it), replay *ex afterwards */
+    #define SEG(ex, ...) do { \
+        if (building) { \
+            cudaGraph_t g_ = NULL; \
+            if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { sp_set_error("seg: begin capture"); return -1; } \
+            int rc_ = 0; do { __VA_ARGS__ } while (0); \
+            if (cudaStreamEndCapture(st, &g_) != cudaSuccess || rc_) { if (g_) cudaGraphDestroy(g_); sp_set_error("seg: end capture"); return -1; } \
+            if (cudaGraphInstantiate(&(ex), g_, NULL, NULL, 0) != cudaSuccess) { cudaGraphDestroy(g_); sp_set_error("seg: instantiate"); return -1; } \
+            cudaGraphDestroy(g_); \
+        } \
+        if (cudaGraphLaunch((ex), st) != cudaSuccess) { sp_set_error("seg: launch"); return -1; } \
+    } while (0)
+
+    /* the TAIL of layer L (after its MoE MID): recombine + PLE block + out_scale */
+    #define TAIL_OF(Lt) do { \
+        g_ffn_phase = 3; \
+        const int ffLt = g_w.Wgate[(Lt)].out; \
+        if (g4_ffn_block(s, (Lt), ffLt)) { g_ffn_phase = 0; return -1; } \
+        g_ffn_phase = 0; \
+        if (PL) { \
+            KMMD(&g_w.Wplig[(Lt)], s->dx, s->dpg); \
+            k_altup_gate<<<(unsigned)((PL+255)/256), 256, 0, st>>>(s->dpg, s->dipl, (Lt), NL, PL, 1); \
+            KMMD(&g_w.Wplproj[(Lt)], s->dpg, s->dpp); \
+            k_rmsnorm<<<1, 256, 0, st>>>(s->dpp, g_w.pl_post_norm[(Lt)], E, eps, s->dnx); \
+            k_add<<<(unsigned)((E+255)/256), 256, 0, st>>>(s->dx, s->dnx, (size_t)E); \
+        } \
+        if (g_w.pl_out_scale && g_w.pl_out_scale[(Lt)]) \
+            k_scale_by_dev<<<(unsigned)((E+255)/256), 256, 0, st>>>(s->dx, (size_t)E, g_w.pl_out_scale[(Lt)]); \
+    } while (0)
+
+    if (s->ring_W > 0 && s->jK && s->Jmax > 0) {        /* same host bookkeeping as g4_kv_step */
+        if ((size_t)(s->dpos_host - s->commit_pos) >= (size_t)s->Jmax) {
+            s->commit_pos = s->dpos_host - (s->Jmax - 1);
+            if (s->jcur > s->Jmax - 1) s->jcur = s->Jmax - 1;
+        }
+    }
+    for (int L = 0; L < NL; L++) {
+        const int global = ((L % period) == period - 1);
+        const int nh = global ? g_nh : s_nh, nkv = global ? g_nkv : s_nkv;
+        const int hd = global ? g_hd : s_hd;
+        const int grp = nh / nkv, kvd = nkv * hd;
+        const float rbase = global ? g_base : s_base;
+        const float *ffac = global ? g_w.rope_freqs : NULL;
+        const int win = global ? -1 : SW;
+        const int ffL = g_w.Wgate[L].out;
+        /* ---- A[L] ---- */
+        SEG(s->segA[L], {
+            if (L == 0) {
+                if (g_w.embd) { dim3 grid(1, (E + 255) / 256);
+                    k_embed_scale_at<<<grid, 256, 0, st>>>(g_w.embd, dseq, dpos, E, embscale, s->dx); }
+                else k_embed_packed_at<<<(unsigned)((E+255)/256), 256, 0, st>>>(
+                        g_w.embd_packed.codes, g_w.embd_packed.row_off, g_w.embd_packed.row_scale,
+                        g_w.embd_packed.row_prec, dseq, dpos, E, embscale, s->dx);
+                if (PL) {
+                    k_ple_gather_at<<<(unsigned)((NLPL+255)/256), 256, 0, st>>>(
+                        g_w.pl_tok_embd.codes, g_w.pl_tok_embd.row_off, g_w.pl_tok_embd.row_scale,
+                        g_w.pl_tok_embd.row_prec, dseq, dpos, NLPL, s->dple);
+                    KMMD(&g_w.pl_model_proj, s->dx, s->dipl);
+                    k_altup_ipl<<<NL, 256, 0, st>>>(s->dipl, s->dple, g_w.pl_proj_norm, PL,
+                                                    1.0f / sqrtf((float)E), sqrtf((float)PL),
+                                                    1.0f / sqrtf(2.0f), eps);
+                }
+            } else {
+                TAIL_OF(L - 1);
+            }
+            k_rmsnorm<<<1, 256, 0, st>>>(s->dx, g_w.attn_norm[L], E, eps, s->dnx);
+            KMMD(&g_w.Wq[L], s->dnx, s->dq);
+            k_rmsnorm_head<<<nh, 256, 0, st>>>(s->dq, g_w.q_norm[L], nh, hd, nh*hd, eps);
+            if (ffac) k_rope_freqs_dyn<<<nh, hd/2, 0, st>>>(s->dq, nh, hd, rbase, ffac, dpos);
+            else      k_rope_dyn<<<nh, hd/2, 0, st>>>(s->dq, nh, hd, nh*hd, rbase, dpos);
+            if (L < kvfs) {
+                KMMD(&g_w.Wk[L], s->dnx, s->dk);
+                if (g_w.Wv[L].f32 || g_w.Wv[L].codes) { KMMD(&g_w.Wv[L], s->dnx, s->dv); }
+                else cudaMemcpyAsync(s->dv, s->dk, (size_t)kvd*sizeof(float), cudaMemcpyDeviceToDevice, st);
+                k_rmsnorm_head<<<nkv, 256, 0, st>>>(s->dk, g_w.k_norm[L], nkv, hd, kvd, eps);
+                if (ffac) k_rope_freqs_dyn<<<nkv, hd/2, 0, st>>>(s->dk, nkv, hd, rbase, ffac, dpos);
+                else      k_rope_dyn<<<nkv, hd/2, 0, st>>>(s->dk, nkv, hd, kvd, rbase, dpos);
+                k_rmsnorm_head_noweight<<<nkv, 256, 0, st>>>(s->dv, nkv, hd, kvd, eps);
+            }
+        });
+        /* ---- host: the KV write, verbatim from g4_kv_step ---- */
+        float *Kuse, *Vuse; int kl = L;
+        if (L < kvfs) {
+            if (s->ring_W > 0 && !global) {
+                const size_t ws = (size_t)(s->dpos_host % s->ring_W);
+                const size_t j  = (size_t)(s->dpos_host - s->commit_pos);
+                if (j >= (size_t)s->Jmax) { sp_set_error("g4_kv ring: uncommitted tick span exceeds Jmax"); return -1; }
+                if (G4_KV_FP16_LAYER(s, L)) {
+                    cudaMemcpyAsync(s->jKh[L] + j*kvd, s->dKh[L] + ws*kvd, (size_t)kvd*sizeof(__half), cudaMemcpyDeviceToDevice, st);
+                    cudaMemcpyAsync(s->jVh[L] + j*kvd, s->dVh[L] + ws*kvd, (size_t)kvd*sizeof(__half), cudaMemcpyDeviceToDevice, st);
+                    k_kv_rowwrite_T<__half><<<(unsigned)((kvd+255)/256), 256, 0, st>>>(
+                        s->dKh[L], s->dVh[L], s->dk, s->dv, ws*(size_t)kvd, kvd);
+                } else {
+                    cudaMemcpyAsync(s->jK[L] + j*kvd, dKc[L] + ws*kvd, (size_t)kvd*sizeof(float), cudaMemcpyDeviceToDevice, st);
+                    cudaMemcpyAsync(s->jV[L] + j*kvd, dVc[L] + ws*kvd, (size_t)kvd*sizeof(float), cudaMemcpyDeviceToDevice, st);
+                    cudaMemcpyAsync(dKc[L] + ws*kvd, s->dk, (size_t)kvd*sizeof(float), cudaMemcpyDeviceToDevice, st);
+                    cudaMemcpyAsync(dVc[L] + ws*kvd, s->dv, (size_t)kvd*sizeof(float), cudaMemcpyDeviceToDevice, st);
+                }
+            } else if (G4_KV_FP16_LAYER(s, L)) {
+                k_kv_store_T<__half><<<(unsigned)((kvd+255)/256), 256, 0, st>>>(s->dKh[L], s->dVh[L], s->dk, s->dv, dpos, 0, kvd);
+            } else {
+                k_kv_store_T<float><<<(unsigned)((kvd+255)/256), 256, 0, st>>>(dKc[L], dVc[L], s->dk, s->dv, dpos, 0, kvd);
+            }
+            Kuse = dKc[L]; Vuse = dVc[L]; kl = L;
+        } else {
+            const int src = kvfs - (global ? 1 : 2);
+            Kuse = dKc[src]; Vuse = dVc[src]; kl = src;
+            if (!G4_KV_FP16_LAYER(s, src) && (!Kuse || !Vuse)) { sp_set_error("g4_kv: sharer before owner"); return -1; }
+        }
+        /* ---- B[L] ---- */
+        SEG(s->segB[L], {
+            if (G4_KV_FP16_LAYER(s, kl)) {
+                if (!s->dKh[kl] || !s->dVh[kl]) { sp_set_error("g4_kv: fp16 SWA owner has no half cache"); rc_ = -1; break; }
+                g4_attn_launch<__half>(s, s->dKh[kl], s->dVh[kl], nh, hd, kvd, grp, win, global, dpos, attn_shm, st);
+            } else {
+                if (!Kuse || !Vuse) { sp_set_error("g4_kv: fp32 layer has no float cache"); rc_ = -1; break; }
+                g4_attn_launch<float>(s, Kuse, Vuse, nh, hd, kvd, grp, win, global, dpos, attn_shm, st);
+            }
+            KMMD(&g_w.Wo[L], s->dao, s->dap);
+            k_rmsnorm<<<1, 256, 0, st>>>(s->dap, g_w.post_attn[L], E, eps, s->dnx);
+            k_add<<<(unsigned)((E+255)/256), 256, 0, st>>>(s->dx, s->dnx, (size_t)E);
+            g_ffn_phase = 1;
+            if (g4_ffn_block(s, L, ffL)) { rc_ = -1; }
+            g_ffn_phase = 0;
+        });
+        /* ---- host: MoE MID ---- */
+        g_ffn_phase = 2;
+        const int rcm = g4_ffn_block(s, L, ffL);
+        g_ffn_phase = 0;
+        if (rcm) return -1;
+    }
+    /* ---- H ---- */
+    SEG(s->segH, {
+        TAIL_OF(NL - 1);
+        k_rmsnorm<<<1, 256, 0, st>>>(s->dx, g_w.out_norm, E, eps, s->dnx);
+        if (g_w.head.f32 || g_w.head.codes) { KMMD(&g_w.head, s->dnx, s->dlog); }
+        else if (use_int8 && g_w.embd_packed.codes &&
+                 gemv_w_packed(st, &g_w.embd_packed, s->dnx, s->dlog, s->dqx, s->dsx)) { }
+        else { if (!g_w.embd) { sp_set_error("g4 tied head: no route"); rc_ = -1; break; }
+               if (gemm(cb, g_w.embd, s->dnx, s->dlog, 1, E, V)) { rc_ = -1; break; } }
+        if (softcap > 0.0f)
+            k_softcap<<<(unsigned)(((size_t)V+255)/256), 256, 0, st>>>(s->dlog, (size_t)V, softcap);
+        k_argmax_at<<<1, 256, 0, st>>>(s->dlog, V, dseq, dpos);
+        k_incr_pos<<<1, 1, 0, st>>>(dpos);
+    });
+    if (building) {
+        memcpy(s->seg_key, key, sizeof(key));
+        s->seg_ready = 1;
+        fprintf(stderr, "    [g4-kv] segment graphs built: %d layers x (A, B) + head\n", NL); fflush(stderr);
+    }
+    s->qcap_active = 0;
+    #undef SEG
+    #undef TAIL_OF
+    #undef KMMD
+    return 0;
+}
 static int g_scratch_ring_off = 0;
 
 extern "C" sp_g4_kv *gemma4_kv_open(const qwen3_model *m, int Pmax) {
@@ -10176,7 +11025,15 @@ extern "C" void gemma4_kv_close(sp_g4_kv *s) {
     if (s->tail_hV) { for (int L = 0; L < s->NL; L++) if (s->tail_hV[L]) free(s->tail_hV[L]); free(s->tail_hV); }
     if (s->steer_dev) cudaFree(s->steer_dev);   /* GEODESIC steering vector */
     if (s->gexec) cudaGraphExecDestroy(s->gexec);   /* A1: graph decode teardown */
+    for (int i = 0; i < 64; i++) { if (s->segA[i]) cudaGraphExecDestroy(s->segA[i]); if (s->segB[i]) cudaGraphExecDestroy(s->segB[i]); }
+    if (s->segH) cudaGraphExecDestroy(s->segH);
     if (s->gcap)  cudaGraphDestroy(s->gcap);
+    /* THE ONESHOT VRAM GROWTH (found 2026-09-29): the session's own MoE scratch (s->moe, sized
+     * by its largest batched prefill chunk — ~300 MiB at 2048 tokens) was never freed here, so
+     * every scratch session (/v1/oneshot, capture, recall) leaked it. Measured: +~300 MiB of
+     * VRAM per oneshot in one daemon, until the batched prefill declined for lack of memory. */
+    cudaDeviceSynchronize();
+    moe_scratch_free(&s->moe);
     free(s);
 }
 

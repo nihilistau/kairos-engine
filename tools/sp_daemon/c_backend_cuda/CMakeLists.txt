@@ -68,6 +68,7 @@ endif()
 add_library(sp_cuda_daemon_backend STATIC
     ${ENGINE_ROOT}/src/backends/cuda/cuda_backend.cu
     ${ENGINE_ROOT}/src/backends/cuda/cuda_forward.cu
+    ${ENGINE_ROOT}/src/backends/cuda/moe_cpu_expert.c
     ${ENGINE_ROOT}/lib/shannon-prime-system/core/xbar/xbar_episode.c
     ${CMAKE_CURRENT_SOURCE_DIR}/sp_daemon_cuda_glue.c
 )
@@ -126,3 +127,11 @@ message(STATUS "  output:    ${CMAKE_CURRENT_BINARY_DIR}/(lib)sp_cuda_daemon_bac
 # G-PERF-ATTN (2026-07-12): register/spill visibility. Nobody had ever seen the bx
 # attention kernels' register budget -- and __launch_bounds__(1024) caps Turing at 64.
 target_compile_options(sp_cuda_daemon_backend PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+
+# step B (2026-09-28): the CPU expert kernel is the ONLY TU built for AVX-512; its entry
+# points check CPUID before running any of it.
+if(MSVC)
+    set_source_files_properties(${ENGINE_ROOT}/src/backends/cuda/moe_cpu_expert.c PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/O2")
+else()
+    set_source_files_properties(${ENGINE_ROOT}/src/backends/cuda/moe_cpu_expert.c PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vnni;-mavx512vl;-mf16c;-O3")
+endif()

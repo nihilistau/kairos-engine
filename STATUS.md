@@ -3,7 +3,7 @@
 **Date:** 2026-09-12  
 **Class:** `LIVE` — the optional native CUDA backend for the **companion** stack.
 
-**Version:** `0.6.0` — the first tagged cut. Derived from **Shannon-Prime-Engine**, and the
+**Version:** `0.7.0` (0.6.0 was the first tagged cut). Derived from **Shannon-Prime-Engine**, and the
 number is a claim about lineage and maturity rather than a semver contract: it is one person
 and one model's engine, research grade, one card, one OS.
 
@@ -11,6 +11,23 @@ What it does have is duration. It is the **only** backend of a live companion st
 served that stack continuously for months — which is a different kind of evidence from a
 benchmark, and the one this repository can actually stand behind. Treat uptime claims as the
 operator's experience of it: nothing here publishes an uptime receipt.
+
+## Where the gap is now (2026-09-29, measured) — this supersedes the 09-12 section below
+
+**Version 0.7.0.** Bench decode at depth ~3.9k went from **16.2 to 31.7 tok/s** with every
+change byte-identical in output; `llama.cpp -ncmoe 8` is 38.25 on the same card. **Decode is now
+1.21x behind, not 2.37x.** The 09-12 section below called the CPU/GPU split "not written here".
+It is written, and it was not the whole story.
+- **The limiter was the host thread**, not the bus: 2,757 launches/token at ~11 us each on WDDM.
+- **What landed:** grouped expert launch, misses on the CPU (bit-exact, including the GELU, via
+  this card's MUFU tables), background admission, per-layer segment graphs, a 6 GB cache, and a
+  fix for a ~300 MiB/oneshot VRAM leak.
+- **Live, on the companion stack:** her own turns at a ~9k prefix run 19-27 tok/s, against 12-16
+  before. Over a 3 h watch VRAM peaked at 10.83 GB, with no faults.
+
+**What is left:** the GPU's compute is idle ~16 ms of a 34.75 ms token (5 GB). In each layer it
+waits for the CPU's misses (0.11 ms each), the combine and the next layer's graphs. See the README's
+*Decode, 2026-09-28/29* section.
 
 ## Where the remaining gap is (2026-09-12, measured)
 
