@@ -37,6 +37,7 @@
 #include <cuda_fp16.h>
 
 #include <mutex>
+#include <atomic>
 #include <chrono>
 /* ── THE SHARED THINGS, AND ONLY THE SHARED THINGS (2026-08-23) ───────────────
  * This was ONE FORWARD AT A TIME: a recursive mutex taken at thirteen entry points,
@@ -66,6 +67,50 @@ static std::mutex g_moe_shared_mtx;
  * pieces can be captured into CUDA graphs: 1 = PRE (dense FFN, router, the D2Hs), 2 = MID (the
  * sync, host routing, experts, combine), 3 = TAIL (the recombine norms). 0 = all, as before. */
 static thread_local int g_ffn_phase = 0;
+/* HOST-FREE LAYER, "no other forward in flight" (2026-10-19, after P2.2; plan Global Constraints,
+ * map R12). Every forward that can run an n_tok == 1 FFN (session decode steps, seg path or not,
+ * the whole-step graph replay, the oneshot gemma4_decode_cuda, probe/prefill with one token) holds
+ * a G4FwdGuard for its whole length. The outermost guard on a thread counts it in g_fwd_inflight
+ * and bumps g_fwd_epoch on entry; the destructor decrements, so every return path (early returns
+ * included) releases it. Host-side atomics only: nothing is launched and nothing is captured.
+ * Those forwards share k_hf_spec's per-layer row (g_hf_spec_*) and P2's mapped list and rows. A
+ * layer's P1/P2 measurement is valid only over a WINDOW with no other forward in it: opened at the
+ * guard's entry and at the end of each n_tok == 1 MID (hf_win_open), so it starts before the next
+ * layer's k_hf_spec is issued; checked (hf_win_valid) where the P1/P2 work would run. Valid iff no
+ * other forward was in flight when it opened, none is now, and none has entered since (epoch).
+ * Output never depends on it: it only gates measurement work (k_hf_spec, P1's parity count, the
+ * P2.2 shadow and compare), never today's MID. */
+static std::atomic<int>                g_fwd_inflight(0);
+static std::atomic<unsigned long long> g_fwd_epoch(0);
+static thread_local int                g_fwd_depth = 0;
+static thread_local int                g_hf_win_ok = 0;
+static thread_local unsigned long long g_hf_win_epoch = 0;
+static inline void hf_win_open(void) {
+    g_hf_win_epoch = g_fwd_epoch.load();
+    g_hf_win_ok = (g_fwd_inflight.load() == 1);
+}
+static inline int hf_win_valid(void) {
+    return g_hf_win_ok && g_fwd_inflight.load() == 1 && g_fwd_epoch.load() == g_hf_win_epoch;
+}
+/* called only when the window is invalid, so the valid path makes no CUDA call */
+static inline int hf_capturing(cudaStream_t st) {
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(st, &cs) != cudaSuccess) { cudaGetLastError(); return 0; }
+    return cs != cudaStreamCaptureStatusNone;
+}
+struct G4FwdGuard {
+    int counted, outer;
+    explicit G4FwdGuard(int on) : counted(on ? 1 : 0), outer(0) {
+        if (!counted) return;
+        if (g_fwd_depth++ == 0) { outer = 1; g_fwd_epoch.fetch_add(1); g_fwd_inflight.fetch_add(1); hf_win_open(); }
+    }
+    ~G4FwdGuard() {
+        if (!counted) return;
+        --g_fwd_depth;
+        if (outer) g_fwd_inflight.fetch_sub(1);
+    }
+    G4FwdGuard(const G4FwdGuard &) = delete; G4FwdGuard &operator=(const G4FwdGuard &) = delete;
+};
 /* ADR-013's bisect syncs (MBK) ran on EVERY decode token at L == 0 — ~11 full drains per token.
  * They are a fault-localisation tool: SP_G4_MOE_BISECT=1 arms them. */
 static int moe_bisect_on(void) {
@@ -2394,6 +2439,13 @@ typedef struct g4_moe_scratch_s {
     float *cin_h, *cout_h; int ccapE;
     float *cgu_h, *csx_h, *cinsx_h; signed char *cq_h, *cinq_h;   /* v2 bit-exact round trip */
     float *logd_h;   /* phase D: pinned [NE] router logits for n_tok == 1 (graph-capturable D2H) */
+    /* host-free layer P2.2 (hf_p2 = 2 only): the list-driven shadow's own device buffers, sized
+     * by moe_grp_prealloc beside the grouped ones: gate_up [8][2FFE], GELU [8][FFE], int8 input
+     * E + [8][FFE], block scales E/16 + [8][FFE/16], outputs [16][E], the shadow acc [E]. */
+    float *hf_gu, *hf_h, *hf_out, *hf_sx, *hf_acc; signed char *hf_qx; int hfcapE, hfcapF;
+    /* device copies the shadow's hot kernels read instead of mapped memory (spec row [16], the
+     * combine list), and a failed-allocation mark that lives and dies with THIS scratch */
+    int *hf_spec; void *hf_list; int hf_failed;
 } g4_moe_scratch;
 static void moe_scratch_free(g4_moe_scratch *ms);   /* defined with the MoE kernels */
 /* ── THE ONE FFN (ADR-013). ───────────────────────────────────────────────────
@@ -2572,6 +2624,7 @@ static void g4_dump_kv_tap(const char *who, const char *stage, int L, int P,
  * + final norm + (tied) head + logit softcap; out_x = logits [n_tok x n_vocab]. */
 extern "C" int gemma4_cuda_probe(const qwen3_model *m, const int32_t *tokens,
                                  int n_tok, int n_layers, int attn_only, float *out_x) {
+    G4FwdGuard fwd_guard_(n_tok == 1);   /* a one-token probe runs an n_tok == 1 FFN (see g_fwd_inflight) */
     /* THIS CALL'S OWN scratch. A one-shot owner: zeroed here, freed at every exit. */
     g4_moe_scratch g4_ms = {0};
     if (!m || !g4_arch_like(m->cfg.arch)) { sp_set_error("gemma4_cuda_probe: not gemma4"); return 1; }
@@ -3537,6 +3590,7 @@ static int xbar_mf_check(const sp_xbar_manifest *mf, int nl_used, int npos,
  *     activation int8 quant) — gate top-1 vs the knobs-off GPU decode. */
 extern "C" int gemma4_decode_cuda(const qwen3_model *m, int32_t *seq,
                                   int n_prompt, int n_gen, int eos_id) {
+    G4FwdGuard fwd_guard_(1);            /* its decode loop runs n_tok == 1 FFNs (see g_fwd_inflight) */
     /* THIS CALL'S OWN scratch (/v1/capture arrives here). Freed at `done:`. */
     g4_moe_scratch g4_ms = {0};
     if (!m || !g4_arch_like(m->cfg.arch)) { sp_set_error("gemma4_decode_cuda: not gemma4"); return -1; }
@@ -5626,17 +5680,16 @@ struct G4MoeGrp {
     int                       oslot[G4G_MAX];   /* step B: row k's output goes to slot oslot[k] */
 };
 struct G4MoeW { float w[G4G_MAX]; int row[G4G_MAX]; };   /* row: which gout row slot k reads */
-__global__ void k_gemv_q4b_dp4a_grp(G4MoeGrp g, int bs_nblk, int in,
-                                    const signed char *qx_all, int qx_stride,
-                                    const float *sxb_all, int sx_stride,
-                                    float *y_all, int y_stride, int out) {
-    const int k = blockIdx.y;
-    const unsigned char *codes = g.codes[k];
-    const unsigned long long *row_off = g.ro[k];
-    const unsigned short *bscale = g.bs[k];
-    const signed char *qx = qx_all + (size_t)k * (size_t)qx_stride;
-    const float *sxb = sxb_all + (size_t)k * (size_t)sx_stride;
-    float *y = y_all + (size_t)g.oslot[k] * (size_t)y_stride;
+/* P2.2 (2026-10-19): the grouped GEMV body, ONE source for k_gemv_q4b_dp4a_grp and the
+ * list-driven k_gemv_q4b_dp4a_grp_hf below. It is k_gemv_q4b_dp4a_v2's body token for token
+ * (the CPU replica in moe_cpu_expert.h reproduces its FFMA sequence); forceinline so each kernel
+ * compiles it in place. The cuobjdump -sass inner-loop diff of the two kernels is part of the
+ * plan's Task P2.2 and of its commit message. */
+__device__ __forceinline__ void g4_gemv_q4b_dp4a_body(const unsigned char *codes,
+                                                      const unsigned long long *row_off,
+                                                      const unsigned short *bscale, int bs_nblk, int in,
+                                                      const signed char *qx, const float *sxb,
+                                                      float *y, int out) {
     /* --- verbatim k_gemv_q4b_dp4a_v2 body from here --- */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int j = blockIdx.x * (blockDim.x >> 5) + warp;
@@ -5661,11 +5714,81 @@ __global__ void k_gemv_q4b_dp4a_grp(G4MoeGrp g, int bs_nblk, int in,
     for (int o = 16; o > 0; o >>= 1) facc += __shfl_down_sync(0xffffffffu, facc, o);
     if (lane == 0) y[j] = facc;
 }
+__global__ void k_gemv_q4b_dp4a_grp(G4MoeGrp g, int bs_nblk, int in,
+                                    const signed char *qx_all, int qx_stride,
+                                    const float *sxb_all, int sx_stride,
+                                    float *y_all, int y_stride, int out) {
+    const int k = blockIdx.y;
+    const unsigned char *codes = g.codes[k];
+    const unsigned long long *row_off = g.ro[k];
+    const unsigned short *bscale = g.bs[k];
+    const signed char *qx = qx_all + (size_t)k * (size_t)qx_stride;
+    const float *sxb = sxb_all + (size_t)k * (size_t)sx_stride;
+    float *y = y_all + (size_t)g.oslot[k] * (size_t)y_stride;
+    g4_gemv_q4b_dp4a_body(codes, row_off, bscale, bs_nblk, in, qx, sxb, y, out);
+}
+/* HOST-FREE LAYER P2.2 (parity only, hf_p2 = 2): the grouped GEMV driven by the device top-8
+ * speculation instead of a host pointer table. grid.y is fixed at 8 (r = spec rank); the slot is
+ * k_hf_spec's row entry spec_row[8 + r] (read from g_ec_dmap, which never shows a pending slot);
+ * a block whose slot is < 0 (not resident, or no table) exits at once. Pointers are the per-session
+ * slot bases plus slot * stride, exactly moe_resident's hit-branch arithmetic; row_off is the
+ * shared slot_*_ro the grouped path uses. Output row r of y_all; activation row r when
+ * qx_stride/sx_stride are non-zero (the down projection), row 0 for all when they are 0. */
+__global__ void k_gemv_q4b_dp4a_grp_hf(const int *spec_row,
+                                       const unsigned char *codes_base, size_t slot_bytes,
+                                       const unsigned short *bs_base, size_t slot_bs_n,
+                                       const unsigned long long *row_off, int bs_nblk, int in,
+                                       const signed char *qx_all, int qx_stride,
+                                       const float *sxb_all, int sx_stride,
+                                       float *y_all, int y_stride, int out) {
+    const int r = blockIdx.y;
+    /* spec_row is DEVICE memory (k_hf22_stage copied k_hf_spec's mapped row there first). Read
+     * straight from the mapped row, this load was a system-scope PCIe read in every warp of every
+     * block - ~34k per layer, and the shadow cost ~24 ms per layer (bench 2026-10-19). */
+    const int slot = spec_row[8 + r];
+    if (slot < 0) return;
+    const unsigned char *codes = codes_base + (size_t)slot * slot_bytes;
+    const unsigned short *bscale = bs_base + (size_t)slot * slot_bs_n;
+    const signed char *qx = qx_all + (size_t)r * (size_t)qx_stride;
+    const float *sxb = sxb_all + (size_t)r * (size_t)sx_stride;
+    float *y = y_all + (size_t)r * (size_t)y_stride;
+    g4_gemv_q4b_dp4a_body(codes, row_off, bscale, bs_nblk, in, qx, sxb, y, out);
+}
 __global__ void k_moe_combine_ord(const float *outs, int n, int E, G4MoeW w, float *acc) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= E) return;
     float a = acc[i];
     for (int k = 0; k < n; k++) a = __fadd_rn(a, __fmul_rn(w.w[k], outs[(size_t)w.row[k] * E + i]));
+    acc[i] = a;
+}
+/* P2.2's combine list, in P2's mapped block (g4_hf2.list): n entries in ASCENDING expert id over
+ * the TRUE top-8, w = the host float product the real combine uses, row < 8 = the speculation rank
+ * whose GPU output (gout_hf row) holds that expert, row >= 8 = mapped CPU row (row - 8). */
+struct g4_hf2_list { int n; float w[8]; int row[8]; };
+/* P2.2: one warp copies n ints of mapped memory (k_hf_spec's row) into device memory, with
+ * ld.global.cv, so the shadow's GEMV blocks read a device copy instead of the host bus */
+__global__ void k_hf22_stage(const int *src, int *dst, int n) {
+    const int i = threadIdx.x;
+    if (i < n) dst[i] = __ldcv(&src[i]);
+}
+/* k_moe_combine_ord's loop and arithmetic, list-driven. The list and the CPU rows may be mapped
+ * host memory written by the host, so every read of them is ld.global.cv (__ldcv), never a cached
+ * line. In P2.2's parity flow they are device copies (a DMA from the pinned mapped block, stream-
+ * ordered after the host's writes); SP_G4_HF_P2_ZEROCOPY=1 passes the mapped pointers instead.
+ * Rows < 8 come from gout_hf (device memory, written by k_gemv_q4b_dp4a_grp_hf in stream order). */
+__global__ void k_moe_combine_ord_hf(float *acc, const g4_hf2_list *list, const float *gout_hf,
+                                     const float *rows_mapped, int E) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= E) return;
+    const int n = __ldcv(&list->n);
+    float a = acc[i];
+    for (int k = 0; k < n; k++) {
+        const float w = __ldcv(&list->w[k]);
+        const int row = __ldcv(&list->row[k]);
+        const float o = (row < 8) ? gout_hf[(size_t)row * E + i]
+                                  : __ldcv(&rows_mapped[(size_t)(row - 8) * E + i]);
+        a = __fadd_rn(a, __fmul_rn(w, o));
+    }
     acc[i] = a;
 }
 
@@ -5970,7 +6093,7 @@ static int hf_on(void) {
 struct g4_hf2 {
     unsigned int       ctr, pub, done, err;
     unsigned long long t_b_end[G4_HF_MAXL], t_grp_in[G4_HF_MAXL], t_comb_out[G4_HF_MAXL];
-    struct { int n; float w[8]; int row[8]; } list;
+    g4_hf2_list        list;   /* P2.2: k_moe_combine_ord_hf's list (same layout as P2.0's) */
     /* P2.1: a fourth stamp, "hits finished": right after the grouped resident down-projection,
      * before any CPU-row upload or the combine. Splits the MID span into GPU work and GPU wait. */
     unsigned long long t_hits_out[G4_HF_MAXL];
@@ -6002,7 +6125,8 @@ static void hf2_init(int E) {
     g_hf2_rows_d = (float *)((char *)d + G4_HF2_ROWS_OFF);
     fprintf(stderr, "    [g4-hf2] P2.0 (SP_G4_HF_P2=%d): mapped block %zu B; %s. Serving is not built: "
                     "output unchanged\n", g_hf2_mode, bytes,
-            g_hf2_mode == 2 ? "GPU timing of the decode MID ON (printed every 256 tokens)" : "timing off");
+            g_hf2_mode == 2 ? "GPU timing of the decode MID ON (printed every 256 tokens); "
+                              "P2.2 list-driven shadow + bitwise parity ON" : "timing off");
     fflush(stderr);
 }
 static inline int hf2_timing(int L) { return g_hf2_mode == 2 && g_hf2_d && L >= 0 && L < G4_HF_MAXL; }
@@ -6013,6 +6137,12 @@ static long long g_hf2_tok = 0, g_hf2_tl = 0, g_hf2_lay = 0;
 static double    g_hf2_idle_ns = 0.0, g_hf2_span_ns = 0.0, g_hf2_hits_ns = 0.0, g_hf2_wait_ns = 0.0;
 /* P2.1 parity counters (hf_p2=2; see g_ec_dmap below), printed with the timing line */
 static long long g_hf2_pvis = 0, g_hf2_pvis_spec = 0, g_hf2_vis = 0, g_hf2_npub = 0, g_hf2_ninv = 0;
+/* P2.2 parity counters (hf_p2=2; see hf22_parity): layers compared, bit-identical, differ, skipped,
+ * worst relL2; and the list's rows by source (GPU rank row, today's CPU row, an extra CPU row) */
+static long long g_hf22_layers = 0, g_hf22_same = 0, g_hf22_diff = 0, g_hf22_skip = 0;
+static long long g_hf22_conc = 0;   /* of the skipped: another forward in this layer's window (hf_win_valid) */
+static long long g_hf22_rgpu = 0, g_hf22_rcpu = 0, g_hf22_rextra = 0;
+static double    g_hf22_worst = 0.0;
 static void hf2_account(int L) {
     volatile g4_hf2 *h = g_hf2_h;
     if (g_hf2_pend >= 0) {
@@ -6040,6 +6170,10 @@ static void hf2_account(int L) {
             fprintf(stderr, "    [g4-hf2] P2.1 table: pending-visible %lld, victim-in-spec %lld, "
                             "published %lld, invalidated %lld (pending-visible in the spec row %lld)\n",
                     g_hf2_pvis, g_hf2_vis, g_hf2_npub, g_hf2_ninv, g_hf2_pvis_spec);
+            fprintf(stderr, "    [g4-hf2] P2.2 parity: layers %lld, bit-identical %lld, differ %lld, skipped %lld "
+                            "(concurrent %lld), worst relL2 %.3e (list rows: GPU %lld, CPU %lld, extra CPU %lld)\n",
+                    g_hf22_layers, g_hf22_same, g_hf22_diff, g_hf22_skip, g_hf22_conc, g_hf22_worst,
+                    g_hf22_rgpu, g_hf22_rcpu, g_hf22_rextra);
             fflush(stderr);
         }
     }
@@ -6619,6 +6753,9 @@ static void moe_scratch_free(g4_moe_scratch *ms) {
     if (ms->bw_d) cudaFree(ms->bw_d);
     { void *gd[] = { ms->ggu, ms->gh, ms->gout, ms->gsx, ms->gacc, ms->gqx };
       for (size_t i = 0; i < sizeof(gd)/sizeof(gd[0]); i++) if (gd[i]) cudaFree(gd[i]); }
+    { void *hd[] = { ms->hf_gu, ms->hf_h, ms->hf_out, ms->hf_sx, ms->hf_acc, ms->hf_qx,   /* P2.2 */
+                     ms->hf_spec, ms->hf_list };
+      for (size_t i = 0; i < sizeof(hd)/sizeof(hd[0]); i++) if (hd[i]) cudaFree(hd[i]); }
     { void *hp[] = { ms->cin_h, ms->cout_h, ms->cgu_h, ms->csx_h, ms->cinsx_h, ms->cq_h, ms->cinq_h, ms->logd_h };
       for (size_t i = 0; i < sizeof(hp)/sizeof(hp[0]); i++) if (hp[i]) cudaFreeHost(hp[i]); }
     memset(ms, 0, sizeof(*ms));
@@ -6874,10 +7011,49 @@ static int moe_cpu_rt_ensure(void) {
  * round-trip stream, under the grouped gate's own static conditions. Same buffers, same sizes,
  * same kernels: only WHEN they are allocated moves. MID keeps its first-use allocation as the
  * fallback, so a skipped or failed prealloc behaves exactly as before. */
+/* P2.2 (hf_p2 = 2): the list-driven shadow's buffers (see g4_moe_scratch). Zeroed once, so the
+ * rows a block skipped (spec slot < 0) hold finite values for the 8-row GELU and quant, which run
+ * over them; those rows are never read by the combine. 0 = sized, -1 = failed (all freed). */
+static void moe_hf_release(g4_moe_scratch *ms) {
+    void *hd[] = { ms->hf_gu, ms->hf_h, ms->hf_out, ms->hf_sx, ms->hf_acc, ms->hf_qx, ms->hf_spec, ms->hf_list };
+    for (size_t i = 0; i < sizeof(hd)/sizeof(hd[0]); i++) if (hd[i]) cudaFree(hd[i]);
+    ms->hf_gu = ms->hf_h = ms->hf_out = ms->hf_sx = ms->hf_acc = NULL; ms->hf_qx = NULL;
+    ms->hf_spec = NULL; ms->hf_list = NULL;
+    ms->hfcapE = ms->hfcapF = 0;
+}
+static int moe_hf_alloc(g4_moe_scratch *ms, int E, int FFE) {
+    moe_hf_release(ms);
+    const size_t ngu = (size_t)G4G_MAX * 2 * FFE, nh = (size_t)G4G_MAX * FFE, nout = (size_t)2 * G4G_MAX * E;
+    const size_t qxb = (size_t)E + (size_t)G4G_MAX * FFE;
+    const size_t sxn = (size_t)(E >> 4) + (size_t)G4G_MAX * (FFE >> 4);
+    if (cudaMalloc(&ms->hf_gu,  ngu * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&ms->hf_h,   nh * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&ms->hf_out, nout * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&ms->hf_acc, (size_t)E * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&ms->hf_sx,  sxn * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&ms->hf_qx,  qxb) == cudaSuccess &&
+        cudaMalloc((void **)&ms->hf_spec, 16 * sizeof(int)) == cudaSuccess &&
+        cudaMalloc(&ms->hf_list, sizeof(g4_hf2_list)) == cudaSuccess &&
+        cudaMemset(ms->hf_spec, 0xff, 16 * sizeof(int)) == cudaSuccess &&
+        cudaMemset(ms->hf_list, 0, sizeof(g4_hf2_list)) == cudaSuccess &&
+        cudaMemset(ms->hf_gu, 0, ngu * sizeof(float)) == cudaSuccess &&
+        cudaMemset(ms->hf_h, 0, nh * sizeof(float)) == cudaSuccess &&
+        cudaMemset(ms->hf_out, 0, nout * sizeof(float)) == cudaSuccess &&
+        cudaMemset(ms->hf_sx, 0, sxn * sizeof(float)) == cudaSuccess &&
+        cudaMemset(ms->hf_qx, 0, qxb) == cudaSuccess) { ms->hfcapE = E; ms->hfcapF = FFE; return 0; }
+    cudaGetLastError();
+    moe_hf_release(ms);
+    ms->hf_failed = 1;
+    fprintf(stderr, "    [g4-hf2] P2.2: shadow buffers unavailable for this scratch - its layers count as skipped\n"); fflush(stderr);
+    return -1;
+}
 static void moe_grp_prealloc(cudaStream_t st, g4_moe_scratch *ms, int E, int FFE,
                              int use_int8, int cpu_mode) {
+    /* P2.2: with hf_p2 = 2 the shadow's buffers belong to the same "sized" (hf2_on() is 0 or 1
+     * otherwise, so this term is 1 and the hot-path test is unchanged) */
+    const int hf_sized = (hf2_on() != 2) || ms->hf_failed || (ms->hfcapE >= E && ms->hfcapF >= FFE);
     const int sized = (ms->gcapE >= E && ms->gcapF >= FFE);
-    if (sized && (!cpu_mode || (g_cpu_rt_st && g_cpu_rt_ev))) return;      /* the hot path */
+    if (sized && hf_sized && (!cpu_mode || (g_cpu_rt_st && g_cpu_rt_ev))) return;      /* the hot path */
     static int grp_env = -1;
     if (grp_env < 0) { const char *ev = getenv("SP_G4_MOE_GROUPED");
         grp_env = (ev && (ev[0] == '1' || ev[0] == '2')) ? 1 : 0; }
@@ -6889,6 +7065,153 @@ static void moe_grp_prealloc(cudaStream_t st, g4_moe_scratch *ms, int E, int FFE
         cudaGetLastError(); return; }                 /* under a capture: MID's fallback does it */
     if (!sized) moe_grp_alloc(ms, E, FFE);
     if (cpu_mode) moe_cpu_rt_ensure();
+    /* P2.2: once per scratch. A failure is marked IN the scratch (hf_failed), so it is said once
+     * and not retried every token, and it is forgotten with the scratch (moe_scratch_free zeroes
+     * it). Until 2026-10-19 this was a thread_local "last scratch tried" POINTER: a oneshot
+     * session is calloc'd and freed per call, the allocator hands the next one the same address,
+     * the pointer matched, and the new session never got its buffers - the shadow and its parity
+     * stopped silently after a few forwards. */
+    if (!hf_sized) moe_hf_alloc(ms, E, FFE);
+}
+
+/* ── HOST-FREE LAYER P2.2: the list-driven shadow (hf_p2 = 2 only; plan Task P2.2) ─────────────
+ * Today's MID still runs and serves, unchanged. In addition, per decode layer on the segment-graph
+ * path, when P2 would be eligible:
+ *   (a) hf22_launch, at the top of MID, right after B[L] and BEFORE moe_admit_flush and MID's sync:
+ *       quant(in) -> k_gemv_q4b_dp4a_grp_hf gate_up (grid.y 8, slot = k_hf_spec's row) ->
+ *       8-row GELU -> 8-row quant -> grp_hf down -> hf_out rows 0..7. Issued before the flush, so
+ *       any eviction the flush makes records g_ev_evict (P2.1) behind these readers.
+ *   (b) hf22_parity, after today's combine: the host builds the list over the TRUE top-8 in
+ *       ASCENDING expert id. An expert the speculation named at rank r with slot >= 0 reads GPU row
+ *       r; every other one is a CPU row 8 + j. w[k] is today's float wt.w[k] (bktw * dsc).
+ *   (c) CPU rows: today's cout_h row when today's CPU computed that expert; when today's host
+ *       found it resident (a GPU hit today) but the speculation did not compute it, the CPU v3
+ *       expert (sp_moe_cpu_* on cin_h, exactly today's CPU-path chain) computes it here.
+ *   (d) k_moe_combine_ord_hf into the zeroed hf_acc; D2H both accs, sync, bitwise memcmp, relL2
+ *       (the SP_G4_MOE_GROUPED=2 template).
+ *   (e) "[g4-hf2] P2.2 parity: ..." with P2.1's line every 256 tokens (hf2_account).
+ * MUTANT, test-only (unmapped, so serve.py strips it): SP_G4_HF_P2_MUTANT_RANK_ORDER=1 builds the
+ * list in the host's top-8 RANK order instead of ascending id; parity must then show differ > 0. */
+static int       g_hf22_mut = -1;   /* the counters live beside P2.1's (hf2_account prints them) */
+static int hf22_mutant_rank(void) {
+    if (g_hf22_mut < 0) { const char *e = getenv("SP_G4_HF_P2_MUTANT_RANK_ORDER");
+        g_hf22_mut = (e && *e == '1') ? 1 : 0;
+        if (g_hf22_mut) { fprintf(stderr, "    [g4-hf2] P2.2: MUTANT SP_G4_HF_P2_MUTANT_RANK_ORDER=1 "
+                                          "(combine list in rank order; parity must differ)\n"); fflush(stderr); } }
+    return g_hf22_mut;
+}
+static int hf22_launch(cudaStream_t st, g4_moe_scratch *ms, int L, int E, int FFE, int NE, int NU,
+                       int use_int8, int cpu_mode, int cpu_in_ok) {
+    if (g_hf2_mode != 2 || !g_hf2_h || !g_hf_spec_d || !g_hf_spec_h || !g_ec_dmap_dev) return 0;
+    if (NU > 8 || NE > 1024 || L < 0 || L >= G4_HF_MAXL) return 0;
+    if (!(cpu_mode == 1 && cpu_in_ok && g_mufu_ok) || !use_int8) return 0;
+    if (g_ec_slots < 4 * G4G_MAX || g_w.slot_gup_prec != 4 || g_w.slot_down_prec != 4
+        || !g_w.slot_gup_bs_n || !g_w.slot_down_bs_n || (E & 31) != 0 || (FFE & 31) != 0) return 0;
+    if (!g_ec_gup_codes || !g_ec_down_codes || !g_ec_gup_bs || !g_ec_down_bs) return 0;
+    if (g_w.slot_gup_nblk != (E >> 5) || g_w.slot_down_nblk != (FFE >> 5)) return 0;
+    if (ms->hfcapE < E || ms->hfcapF < FFE || !ms->hf_gu) return 0;
+    /* another forward in this layer's window shares the spec row and P2's list: no shadow */
+    if (!hf_win_valid()) { g_hf22_skip++; g_hf22_conc++; return 0; }
+    const int npE = E, npF = FFE;
+    signed char *qxE = ms->hf_qx, *qxF = ms->hf_qx + npE;
+    float *sxE = ms->hf_sx, *sxF = ms->hf_sx + (npE >> 4);
+    const int *spec = g_hf_spec_d + (size_t)L * 16;
+    k_quant_act_int8<<<1, 256, 0, st>>>(ms->in, E, npE, qxE, sxE);
+    { dim3 gr((unsigned)((2 * FFE + 7) / 8), (unsigned)G4G_MAX);
+      k_gemv_q4b_dp4a_grp_hf<<<gr, 256, 0, st>>>(spec, g_ec_gup_codes, g_w.slot_gup_bytes,
+                                                 g_ec_gup_bs, g_w.slot_gup_bs_n, g_w.slot_gup_ro,
+                                                 E >> 5, E, qxE, 0, sxE, 0, ms->hf_gu, 2 * FFE, 2 * FFE); }
+    k_moe_gelu_split_batch<<<(unsigned)(((size_t)G4G_MAX * FFE + 255) / 256), 256, 0, st>>>(
+        ms->hf_gu, FFE, G4G_MAX, ms->hf_h);
+    { dim3 qg(1, (unsigned)G4G_MAX);
+      k_quant_act_int8_batched<<<qg, 256, 0, st>>>(ms->hf_h, G4G_MAX, FFE, npF, qxF, sxF); }
+    { dim3 gr((unsigned)((E + 7) / 8), (unsigned)G4G_MAX);
+      k_gemv_q4b_dp4a_grp_hf<<<gr, 256, 0, st>>>(spec, g_ec_down_codes, g_w.slot_down_bytes,
+                                                 g_ec_down_bs, g_w.slot_down_bs_n, g_w.slot_down_ro,
+                                                 FFE >> 5, FFE, qxF, npF, sxF, npF >> 4, ms->hf_out, E, E); }
+    return 1;
+}
+/* (c)'s extra CPU row: today's CPU-path v3 chain for expert e, from cin_h, into dst. 0 = done. */
+static int hf22_cpu_expert(g4_moe_scratch *ms, int L, int e, int E, int FFE, float *dst) {
+    static thread_local float hbuf[4096];
+    if (FFE > 4096) return -1;
+    const sp_frob_packed_tensor *pg = g_w.gup_pt[L], *pd = g_w.down_pt[L];
+    const uint8_t  *gcod = pg->codes + (size_t)pg->row_off[(size_t)e * (size_t)g_w.slot_gup_rows];
+    const uint16_t *gbs  = pg->bscale + (size_t)e * g_w.slot_gup_bs_n;
+    const uint8_t  *dcod = pd->codes + (size_t)pd->row_off[(size_t)e * (size_t)g_w.slot_down_rows];
+    const uint16_t *dbs  = pd->bscale + (size_t)e * g_w.slot_down_bs_n;
+    float *gu = ms->cgu_h;                       /* today's CPU loop is done with these this layer */
+    int8_t *hq = (int8_t *)ms->cq_h; float *hs = ms->csx_h;
+    if (sp_moe_cpu_quant(ms->cin_h, E, (int8_t *)ms->cinq_h, ms->cinsx_h) ||
+        sp_moe_cpu_gemv(gcod, gbs, E, 2 * FFE, (const int8_t *)ms->cinq_h, ms->cinsx_h, gu) ||
+        sp_moe_cpu_gelu(gu, FFE, hbuf) || sp_moe_cpu_quant(hbuf, FFE, hq, hs) ||
+        sp_moe_cpu_gemv(dcod, dbs, FFE, E, hq, hs, dst)) return -1;
+    return 0;
+}
+/* (b)-(d). act[]/oncpu[]/cpos[]/wt are today's grouped path's, after its combine into dacc. */
+static void hf22_parity(cudaStream_t st, g4_moe_scratch *ms, int L, int E, int FFE, int NU,
+                        int nact, const int *act, const int *oncpu, const int *cpos,
+                        const G4MoeW *wt, const float *dacc) {
+    /* re-check: a forward that entered after this layer's launches may have rewritten the spec
+     * row (or will write P2's list and rows) */
+    if (!hf_win_valid()) { g_hf22_skip++; g_hf22_conc++; return; }
+    const volatile int *sp = (const volatile int *)g_hf_spec_h + (size_t)L * 16;
+    int sp_e[8], sp_s[8];
+    for (int r = 0; r < 8; r++) { sp_e[r] = r < NU ? sp[r] : -1; sp_s[r] = r < NU ? sp[8 + r] : -1; }
+    /* the order the list is built in: ascending e (act[] is), or the host's rank (the mutant) */
+    int ord[G4G_MAX], no = 0;
+    if (hf22_mutant_rank()) {
+        for (int t = 0; t < NU && no < nact; t++)
+            for (int k = 0; k < nact; k++) if (act[k] == ms->idx_h[t]) { ord[no++] = k; break; }
+        if (no != nact) { g_hf22_skip++; return; }
+    } else { for (int k = 0; k < nact; k++) ord[no++] = k; }
+    volatile g4_hf2 *h = g_hf2_h;
+    float w_[G4G_MAX]; int row_[G4G_MAX]; int j = 0;
+    long long rg = 0, rc = 0, rx = 0;
+    for (int q = 0; q < nact; q++) {
+        const int k = ord[q], e = act[k];
+        int r = -1;
+        for (int t = 0; t < NU && t < 8; t++) if (sp_e[t] == e) { r = t; break; }
+        w_[q] = wt->w[k];
+        if (r >= 0 && sp_s[r] >= 0) { row_[q] = r; rg++; continue; }      /* the GPU computed it */
+        float *dst = g_hf2_rows_h + (size_t)j * E;
+        if (oncpu[k] == 1) {                         /* today's CPU computed it: its cout_h row */
+            memcpy(dst, ms->cout_h + (size_t)cpos[k] * E, (size_t)E * sizeof(float)); rc++;
+        } else {                                     /* a GPU hit today the speculation missed */
+            if (hf22_cpu_expert(ms, L, e, E, FFE, dst)) { g_hf22_skip++; return; }
+            rx++;
+        }
+        row_[q] = 8 + j; j++;
+    }
+    for (int q = 0; q < nact; q++) { h->list.w[q] = w_[q]; h->list.row[q] = row_[q]; }
+    h->list.n = nact;
+    _mm_sfence();
+    k_moe_zero<<<(unsigned)((E + 255) / 256), 256, 0, st>>>(ms->hf_acc, E);
+    k_moe_combine_ord_hf<<<(unsigned)((E + 255) / 256), 256, 0, st>>>(
+        ms->hf_acc, &g_hf2_d->list, ms->hf_out, g_hf2_rows_d, E);
+    static float *pa_ = NULL, *pb_ = NULL; static int pcap_ = 0;
+    if (pcap_ < E) { free(pa_); free(pb_); pa_ = (float *)malloc((size_t)E * 4); pb_ = (float *)malloc((size_t)E * 4);
+                     pcap_ = (pa_ && pb_) ? E : 0; }
+    if (!pcap_) { g_hf22_skip++; return; }
+    cudaMemcpyAsync(pa_, dacc, (size_t)E * 4, cudaMemcpyDeviceToHost, st);
+    cudaMemcpyAsync(pb_, ms->hf_acc, (size_t)E * 4, cudaMemcpyDeviceToHost, st);
+    if (cudaStreamSynchronize(st) != cudaSuccess) { cudaGetLastError(); g_hf22_skip++; return; }
+    /* and at the compare: everything the shadow read has executed by this sync */
+    if (!hf_win_valid()) { g_hf22_skip++; g_hf22_conc++; return; }
+    long long bad = 0; double num = 0.0, den = 0.0;
+    for (int i = 0; i < E; i++) {
+        if (memcmp(&pa_[i], &pb_[i], 4) != 0) bad++;
+        const double d = (double)pa_[i] - (double)pb_[i];
+        num += d * d; den += (double)pa_[i] * (double)pa_[i];
+    }
+    g_hf22_layers++; g_hf22_rgpu += rg; g_hf22_rcpu += rc; g_hf22_rextra += rx;
+    if (bad) g_hf22_diff++; else g_hf22_same++;
+    const double rel = den > 0 ? sqrt(num / den) : 0.0; if (rel > g_hf22_worst) g_hf22_worst = rel;
+    if (bad && g_hf22_diff <= 3) {
+        fprintf(stderr, "    [g4-hf2] P2.2 parity DIFFERS at L=%d: %lld of %d elems, relL2 %.3e "
+                        "(GPU rows %lld, CPU rows %lld, extra CPU rows %lld)\n", L, bad, E, rel, rg, rc, rx);
+        fflush(stderr);
+    }
 }
 
 static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ffL,
@@ -6917,6 +7240,10 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
 
     const int ph = (n_tok == 1 && moe_on) ? g_ffn_phase : 0;
     const int do_pre = (ph == 0 || ph == 1), do_mid = (ph == 0 || ph == 2);
+    /* the next layer's P1/P2 window opens when this n_tok == 1 MID ends, on every return path
+     * (before the next layer's k_hf_spec is issued; see g_fwd_inflight) */
+    struct HfWinReopen { int on; ~HfWinReopen() { if (on) hf_win_open(); } }
+        hf_win_reopen_ = { n_tok == 1 && moe_on && do_mid };
     /* ── the DENSE FFN (on a MoE model this is the per-layer SHARED expert) ── */
     if (do_pre) {
     MBK("entry");
@@ -6979,7 +7306,11 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                                              1.0f / sqrtf((float)E), ms->rin);
     MBK("router_prep");
     AMMD(&g_w.Wrouter[L], ms->rin, ms->log, n_tok);   /* [NE x n_tok] col-major */
-    if (n_tok == 1 && g_hf_spec_d && NE <= 1024 && NU <= 8 && L < G4_HF_MAXL)   /* P1: speculate */
+    /* P1: speculate. Not while another forward is in this layer's window (hf_win_valid): it would
+     * share the row. Under a capture (ph 1 = segB, or a whole-step graph) it is always recorded,
+     * since the graph outlives this check; the replaying forward's own window gates its readers. */
+    if (n_tok == 1 && g_hf_spec_d && NE <= 1024 && NU <= 8 && L < G4_HF_MAXL
+        && (ph == 1 || hf_win_valid() || hf_capturing(st)))
         k_hf_spec<<<1, NE, 0, st>>>(ms->log, NE, NU,
                                     g_ec_dmap_dev ? g_ec_dmap_dev + (size_t)L * NE        /* P2.1 */
                                     : g_ec_map_dev ? g_ec_map_dev + (size_t)L * NE : NULL,
@@ -7049,6 +7380,12 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     /* P2.0 stamp (a), B[L]'s last node: captured into segB[L] with this fixed destination */
     if (ph == 1 && hf2_timing(L)) k_hf2_stamp<<<1, 1, 0, st>>>(&g_hf2_d->t_b_end[L]);
     if (ph == 1) return 0;               /* PRE ends at the D2Hs; the sync belongs to MID */
+    /* P2.2 (hf_p2 = 2): the list-driven shadow's hit GEMVs, right after B[L], before the flush
+     * (whose evictions then order their copies behind these readers) and before MID's sync */
+    int hf22_on = 0;
+    if (ph == 2 && n_tok == 1 && g_hf2_mode == 2)
+        hf22_on = hf22_launch(st, ms, L, E, FFE, NE, NU, use_int8, cpu_mode, cpu_in_ok);
+    int hf22_done = 0;
     if (do_mid) {
     moe_admit_flush(st);                 /* the previous layer's admissions, off the GPU's critical path */
     {   cudaError_t ce = cudaStreamSynchronize(st);
@@ -7077,7 +7414,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
         /* (P2.1: the spec row is also allocated for P2 alone, so P1's parity is gated on hf_on();
          *  with P2's device table on, "resident" means resident in g_ec_dmap, the table the
          *  speculation read.) */
-        if (n_tok == 1 && g_hf_spec_h && hf_on() && NU <= 8 && L < G4_HF_MAXL) {
+        if (n_tok == 1 && g_hf_spec_h && hf_on() && NU <= 8 && L < G4_HF_MAXL && hf_win_valid()) {
             const int *sp = g_hf_spec_h + (size_t)L * 16;
             int set_bad = 0, ord_bad = 0, res_bad = 0;
             for (int k = 0; k < NU; k++) {
@@ -7378,6 +7715,11 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                 k_moe_combine_ord<<<(unsigned)((E + 255) / 256), 256, 0, st>>>(ms->gout, nact, E, wt, dacc);
                 if (hf2t) { k_hf2_stamp<<<1, 1, 0, st>>>(&g_hf2_d->t_comb_out[L]);  /* P2.0 stamp (c) */
                             g_hf2_pend = L; }
+                /* P2.2 (hf_p2 = 2): the list, the CPU rows, combine_hf and the bitwise compare */
+                if (hf22_on && cpu_mode == 1 && g_mufu_ok) {
+                    hf22_parity(st, ms, L, E, FFE, NU, nact, act, oncpu, cpos, &wt, dacc);
+                    hf22_done = 1;
+                }
                 if (_mtm) g_moe_expert_calls += nact;
                 if (grp_ != 2) grp_done = 1;
                 /* STEP C: admit this layer's CPU experts, off the critical path */
@@ -7418,6 +7760,8 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
             }
         }
     }
+
+    if (hf22_on && !hf22_done) g_hf22_skip++;   /* P2.2: launched, but today's grouped path declined */
 
     /* SP_MOE_BUCKET_PIN=1: pack every active expert's rows + weights into one pinned buffer
      * and send it in TWO copies for the layer. REUSE SAFETY: the pinned buffer is rewritten
@@ -7732,6 +8076,7 @@ static int g4_kv_launch_full(sp_g4_kv *s, int do_head) {
  * the first time, then replay the exec graph per call. If not armed, the caller
  * stays on the per-step g4_kv_step. Returns 0/-1. do_head must be 1 (decode). */
 static int g4_kv_step_graph(sp_g4_kv *s) {
+    G4FwdGuard fwd_guard_(1);            /* a decode step, replayed or not (see g_fwd_inflight) */
     cudaStream_t st = g_w.stream;
     if (s->graph_mode < 0) {
         static int want = -1;
@@ -7784,6 +8129,7 @@ static int g4_kv_step_graph(sp_g4_kv *s) {
  * windowed attention over [0,dpos]) → optional head → k_incr_pos. */
 static int g4_kv_step_seg(sp_g4_kv *s, int *handled);
 static int g4_kv_step(sp_g4_kv *s, int do_head) {
+    G4FwdGuard fwd_guard_(1);            /* every session step, seg path or not (see g_fwd_inflight) */
     if (do_head && s->moe_on) {           /* PHASE D: segment graphs, when this step is eligible */
         int handled = 0;
         const int rc = g4_kv_step_seg(s, &handled);
@@ -9167,6 +9513,7 @@ static int g4_ck(const char *where) {
  * OWNS the snapshot->reset->restore dance (routes.rs, the proven full-rebatch pattern);
  * calling this on a persist cache without that dance recreates G-PK2-BATCHRING. */
 extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, int n, int P) {
+    G4FwdGuard fwd_guard_(n == 1);       /* a one-token batch runs an n_tok == 1 FFN (see g_fwd_inflight) */
     if (!s || !toks || n <= 0 || P < 0) { sp_set_error("gemma4_kv_prefill_batched: bad args"); return -1; }
     if (P == 0) {
         if (s->dpos_host != 0) { sp_set_error("gemma4_kv_prefill_batched: not cold (dpos!=0)"); return -1; }

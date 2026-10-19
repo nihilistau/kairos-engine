@@ -681,12 +681,71 @@ pub fn parse_sig_hex(hex: &str) -> Option<[u64; 4]> {
     Some(words)
 }
 
+/// Where a row's episode actually is on disk.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EpisodeDir {
+    /// The row's own `dir` exists (or is empty — a row with no episode, left as it was).
+    AsWritten,
+    /// The row's `dir` does not exist but `<SP_EPS_DIR>/<basename>` does.
+    Moved(String),
+    /// Neither exists. The episode's KV is not on this machine.
+    Missing,
+}
+
+/// THE EPISODE ROOT MOVED (2026-09-06; found stale 2026-10-19): the operator moved her episode store from
+/// F:/shannon-eps to C:/shannon-eps because F: is 27 GB. Registry rows are append-only
+/// and carry an ABSOLUTE `dir`, so 1,287 rows still named F:, where nothing is left —
+/// and every ep.k / ep.l5 / ep.okf.md load below fell into an `unwrap_or` with no log.
+/// The row is never rewritten; the path is resolved here, at read, by basename under
+/// the configured root. An episode whose dir exists nowhere is reported by `Missing`.
+pub fn resolve_episode_dir(dir: &str, eps_root: Option<&str>) -> EpisodeDir {
+    if dir.is_empty() || Path::new(dir).is_dir() {
+        return EpisodeDir::AsWritten;
+    }
+    let root = eps_root.map(|r| r.trim().trim_end_matches(['/', '\\'])).unwrap_or("");
+    if !root.is_empty() {
+        if let Some(base) = Path::new(dir).file_name().and_then(|b| b.to_str()) {
+            let moved = format!("{}/{}", root, base);
+            if Path::new(&moved).is_dir() {
+                return EpisodeDir::Moved(moved);
+            }
+        }
+    }
+    EpisodeDir::Missing
+}
+
+/// What `load_registry_report` did with each row's `dir`.
+#[derive(Debug, Default, Clone)]
+pub struct EpisodeDirCensus {
+    pub as_written: usize,
+    pub resolved: usize,
+    /// Names of rows skipped because their episode exists nowhere.
+    pub missing: Vec<String>,
+}
+
 /// Load the recall registry (JSONL: one episode per line). Tolerant: skips blank /
 /// malformed lines, returns the episodes that parsed. Each row needs at minimum
-/// `dir`, `npos`, `sig_bits`; `name`/`topic` are decorative.
+/// `dir`, `npos`, `sig_bits`; `name`/`topic` are decorative. Logs the episode-dir
+/// census once (it is called once per boot).
 pub fn load_registry(path: &Path) -> std::io::Result<Vec<Episode>> {
+    let root = std::env::var("SP_EPS_DIR").ok();
+    let (eps, census) = load_registry_report(path, root.as_deref())?;
+    let shown: Vec<&str> = census.missing.iter().take(8).map(|s| s.as_str()).collect();
+    tracing::info!(
+        "B3 EPISODE DIRS: {} as written, {} resolved under SP_EPS_DIR={:?}, {} missing everywhere (skipped{}{})",
+        census.as_written, census.resolved, root.as_deref().unwrap_or(""), census.missing.len(),
+        if shown.is_empty() { "" } else { ": " }, shown.join(", ")
+    );
+    Ok(eps)
+}
+
+/// `load_registry` with the root passed in and the census returned. Rows whose episode
+/// is `Missing` are left out of the result — selecting one could only end in a failed
+/// replay — and named in the census.
+pub fn load_registry_report(path: &Path, eps_root: Option<&str>) -> std::io::Result<(Vec<Episode>, EpisodeDirCensus)> {
     let text = std::fs::read_to_string(path)?;
     let mut out = Vec::new();
+    let mut census = EpisodeDirCensus::default();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -707,6 +766,16 @@ pub fn load_registry(path: &Path) -> std::io::Result<Vec<Episode>> {
             Some(s) => s,
             None => continue,
         };
+        let resolved = match resolve_episode_dir(dir, eps_root) {
+            EpisodeDir::AsWritten => { census.as_written += 1; dir.to_string() }
+            EpisodeDir::Moved(p) => { census.resolved += 1; p }
+            EpisodeDir::Missing => {
+                census.missing.push(Path::new(dir).file_name()
+                    .and_then(|b| b.to_str()).unwrap_or(dir).to_string());
+                continue;
+            }
+        };
+        let dir = resolved.as_str();
         // B3-v2: load the episode's stored global-owner K (ep.k) for the q·K selector.
         let (gk, gk_ng) = load_episode_global_k(dir, npos).unwrap_or((Vec::new(), 0));
         // L5 RECALL: load the episode's L5 query-key sidecar (ep.l5), if present.
@@ -770,7 +839,38 @@ pub fn load_registry(path: &Path) -> std::io::Result<Vec<Episode>> {
             }
         }
     }
-    Ok(out)
+    Ok((out, census))
+}
+
+#[cfg(test)]
+mod epdir_tests {
+    use super::*;
+    #[test]
+    fn moved_resolves_missing_skips_registry_untouched() {
+        let base = std::env::temp_dir().join(format!("epdir_{}", std::process::id()));
+        let (old, new) = (base.join("old-root"), base.join("new-root"));
+        std::fs::create_dir_all(old.join("ep-here")).unwrap();
+        std::fs::create_dir_all(new.join("ep-moved")).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let sig = "0".repeat(64);
+        let o = old.to_str().unwrap().replace('\\', "/");
+        let reg = base.join("registry.jsonl");
+        let body = format!(
+            "{{\"dir\":\"{o}/ep-here\",\"npos\":0,\"sig_bits\":\"{sig}\"}}\n\
+             {{\"dir\":\"{o}/ep-moved\",\"npos\":0,\"sig_bits\":\"{sig}\"}}\n\
+             {{\"dir\":\"{o}/ep-lost\",\"npos\":0,\"sig_bits\":\"{sig}\"}}\n");
+        std::fs::write(&reg, &body).unwrap();
+        let root = new.to_str().unwrap().replace('\\', "/");
+        let (eps, c) = load_registry_report(&reg, Some(&root)).unwrap();
+        assert_eq!(eps.len(), 2, "the missing episode is skipped");
+        assert_eq!(eps[1].dir, format!("{root}/ep-moved"), "the moved episode loads from the new root");
+        assert_eq!((c.as_written, c.resolved), (1, 1));
+        assert_eq!(c.missing, vec!["ep-lost".to_string()], "skipped by name");
+        assert_eq!(std::fs::read_to_string(&reg).unwrap(), body, "the registry is never written");
+        let (eps0, c0) = load_registry_report(&reg, None).unwrap();
+        assert_eq!((eps0.len(), c0.missing.len()), (1, 2), "no root: nothing resolves");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 /// A1: rewrite the registry JSONL marking (NOT deleting) rows whose "text" == victim with
