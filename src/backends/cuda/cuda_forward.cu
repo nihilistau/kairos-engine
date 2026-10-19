@@ -7109,13 +7109,16 @@ static int hf22_launch(cudaStream_t st, g4_moe_scratch *ms, int L, int E, int FF
         || !g_w.slot_gup_bs_n || !g_w.slot_down_bs_n || (E & 31) != 0 || (FFE & 31) != 0) return 0;
     if (!g_ec_gup_codes || !g_ec_down_codes || !g_ec_gup_bs || !g_ec_down_bs) return 0;
     if (g_w.slot_gup_nblk != (E >> 5) || g_w.slot_down_nblk != (FFE >> 5)) return 0;
-    if (ms->hfcapE < E || ms->hfcapF < FFE || !ms->hf_gu) return 0;
+    /* from here on a decline is counted: a shadow that stops must show in "skipped" */
+    if (ms->hfcapE < E || ms->hfcapF < FFE || !ms->hf_gu || !ms->hf_spec || !ms->hf_list) { g_hf22_skip++; return 0; }
     /* another forward in this layer's window shares the spec row and P2's list: no shadow */
     if (!hf_win_valid()) { g_hf22_skip++; g_hf22_conc++; return 0; }
     const int npE = E, npF = FFE;
     signed char *qxE = ms->hf_qx, *qxF = ms->hf_qx + npE;
     float *sxE = ms->hf_sx, *sxF = ms->hf_sx + (npE >> 4);
-    const int *spec = g_hf_spec_d + (size_t)L * 16;
+    /* the speculation row, copied once into device memory: the GEMV blocks read that copy */
+    k_hf22_stage<<<1, 32, 0, st>>>(g_hf_spec_d + (size_t)L * 16, ms->hf_spec, 16);
+    const int *spec = ms->hf_spec;
     k_quant_act_int8<<<1, 256, 0, st>>>(ms->in, E, npE, qxE, sxE);
     { dim3 gr((unsigned)((2 * FFE + 7) / 8), (unsigned)G4G_MAX);
       k_gemv_q4b_dp4a_grp_hf<<<gr, 256, 0, st>>>(spec, g_ec_gup_codes, g_w.slot_gup_bytes,
@@ -7187,8 +7190,22 @@ static void hf22_parity(cudaStream_t st, g4_moe_scratch *ms, int L, int E, int F
     h->list.n = nact;
     _mm_sfence();
     k_moe_zero<<<(unsigned)((E + 255) / 256), 256, 0, st>>>(ms->hf_acc, E);
-    k_moe_combine_ord_hf<<<(unsigned)((E + 255) / 256), 256, 0, st>>>(
-        ms->hf_acc, &g_hf2_d->list, ms->hf_out, g_hf2_rows_d, E);
+    /* The combine reads device copies: one DMA of the list and one of the j CPU rows (into
+     * hf_out rows 8..), stream-ordered after the host's writes above. Read zero-copy, the list
+     * was a system-scope PCIe read per warp per entry. SP_G4_HF_P2_ZEROCOPY=1 (test-only,
+     * unmapped) keeps the mapped reads, to measure what P2.3's zero-copy combine would cost. */
+    static int zc_ = -1;
+    if (zc_ < 0) { const char *ev = getenv("SP_G4_HF_P2_ZEROCOPY"); zc_ = (ev && *ev == '1') ? 1 : 0;
+        if (zc_) { fprintf(stderr, "    [g4-hf2] P2.2: SP_G4_HF_P2_ZEROCOPY=1 - combine_hf reads the mapped list and rows\n"); fflush(stderr); } }
+    const g4_hf2_list *lst = &g_hf2_d->list; const float *crow = g_hf2_rows_d;
+    if (!zc_) {
+        if (cudaMemcpyAsync(ms->hf_list, (const void *)&g_hf2_h->list, sizeof(g4_hf2_list), cudaMemcpyHostToDevice, st) != cudaSuccess
+            || (j > 0 && cudaMemcpyAsync(ms->hf_out + (size_t)G4G_MAX * E, g_hf2_rows_h, (size_t)j * E * sizeof(float),
+                                         cudaMemcpyHostToDevice, st) != cudaSuccess)) {
+            cudaGetLastError(); g_hf22_skip++; return; }
+        lst = (const g4_hf2_list *)ms->hf_list; crow = ms->hf_out + (size_t)G4G_MAX * E;
+    }
+    k_moe_combine_ord_hf<<<(unsigned)((E + 255) / 256), 256, 0, st>>>(ms->hf_acc, lst, ms->hf_out, crow, E);
     static float *pa_ = NULL, *pb_ = NULL; static int pcap_ = 0;
     if (pcap_ < E) { free(pa_); free(pb_); pa_ = (float *)malloc((size_t)E * 4); pb_ = (float *)malloc((size_t)E * 4);
                      pcap_ = (pa_ && pb_) ? E : 0; }

@@ -693,8 +693,8 @@ pub enum EpisodeDir {
 }
 
 /// THE EPISODE ROOT MOVED (2026-09-06; found stale 2026-10-19): the operator moved her episode store from
-/// F:/shannon-eps to C:/shannon-eps because F: is 27 GB. Registry rows are append-only
-/// and carry an ABSOLUTE `dir`, so 1,287 rows still named F:, where nothing is left —
+/// the old disk to a new root because the old one was too small. Registry rows are append-only
+/// and carry an ABSOLUTE `dir`, so 1,287 rows still named the old root, where nothing is left —
 /// and every ep.k / ep.l5 / ep.okf.md load below fell into an `unwrap_or` with no log.
 /// The row is never rewritten; the path is resolved here, at read, by basename under
 /// the configured root. An episode whose dir exists nowhere is reported by `Missing`.
