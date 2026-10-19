@@ -25,6 +25,38 @@ operator's experience of it: nothing here publishes an uptime receipt.
 - **Next step, P0 passed:** a mapped-memory handshake measured 2.1 us round trip and 4.3 us/layer in a CUDA graph. The design keeps the host's serial per-layer work off the GPU's path; see the README.
 - **Warning:** two host hangs during the A/B at 6 GB. Each was a GPU TDR in a batched prefill, followed by a failed driver recovery. The cause is unknown. Upstream moved to a 5.5 GB cache and `TdrDelay = 10`, and the re-run was clean; see the README.
 
+## Against llama.cpp 0.7.0 (2026-10-19, measured)
+
+llama.cpp `0.7.0-dev` (build b11721) has a GPU cache for MoE experts kept in host memory
+(`--moe-cache-mib`). Same card, same 4.2k-token prompt, 128 greedy tokens; llama.cpp on a
+Q4_K_M GGUF (larger experts than this engine's Q4_0, so the gaps favour llama.cpp slightly):
+
+| expert cache | this engine | llama.cpp `-cmoe --moe-cache-mib`, pinned |
+|---|---:|---:|
+| 4.0 GB | **21.6** tok/s | 16.5 (72% hit) |
+| 5.5 GB | **28.3** | 20.6 (80% hit) |
+| 6.0 GB | **29.4** | 22.6 (83% hit) |
+| llama.cpp `-ncmoe 14`, no cache | | **34.4** |
+
+- **Against llama.cpp's cache, this engine is 1.30-1.37x faster.** Its policy hits more often,
+  and its misses are computed on the CPU, not uploaded over PCIe.
+- **llama.cpp's `-ncmoe` mode is still 1.17x ahead on decode and 1.36x on prefill (340 vs ~250
+  tok/s).** It replaces the 09-12 baseline (38.25 on a Q4_0 GGUF no longer on disk) as the number
+  to beat.
+- **Output byte-identical at all three sizes.** The 128-token figures sit below the 255-token
+  headline below, because the first tokens decode while the cache warms.
+- **Pinned vs pageable:** llama.cpp's default mmap load costs it 20% here. This engine registers
+  its arena per tensor (60 ranges, 12.85 GB, none refused) and is not exposed.
+
+Offline replays the same day found no eviction change worth making:
+- Exposed time ranks policies exactly as misses do. The whole miss term is ~0.9 ms of a ~35 ms
+  token at 5.5 GB.
+- A reuse-distance policy beats LRU and loses to the deployed decayed frequency by 3-6%.
+- For speculative decoding, expert traffic breaks even only above 1.57 accepted tokens per verify
+  at k=2 and 2.39 at k=4. MTP as measured is below both.
+
+The receipt is in the source tree: `docs/BENCH-2026-10-19-llama-cache-and-replays.md`.
+
 ## Where the gap is now (2026-09-29, measured) — this supersedes the 09-12 section below
 
 **Version 0.7.0.** Bench decode at depth ~3.9k went from **16.2 to 31.7 tok/s** with every

@@ -466,7 +466,7 @@ The next design removes that from the GPU's path, and keeps the output byte-iden
 - **Waiting:** the GPU waits on a mapped flag, not a host sync.
 - **Combine:** it runs in today's order.
 
-The projection is ~43-48 tok/s against `llama.cpp`'s 38.25. It is a projection, and the build
+The projection is ~43-48 tok/s against `llama.cpp`'s 38.25. (2026-10-19: the number to beat on this card is now `llama.cpp -ncmoe 14` at 34.4 tok/s, with a Q4_K_M GGUF; llama.cpp's new `--moe-cache-mib` path is slower than this engine at every cache size. See STATUS.)The projection is ~43-48 tok/s against `llama.cpp`'s 38.25. It is a projection, and the build
 order in the source tree's `docs/DESIGN-2026-09-29-host-free-layer.md` makes each step a pair of runs.
 
 **An operational warning from the same day.** Twice during these A/Bs the host machine hung. In
