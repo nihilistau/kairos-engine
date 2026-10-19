@@ -80,6 +80,7 @@ static int moe_bisect_on(void) {
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <immintrin.h>   /* _mm_sfence: P2.1's device slot table (g_ec_dmap) */
 
 /* ── ADR-012: THE K/V CACHE ELEMENT TYPE ─────────────────────────────────────────────
  *
@@ -5939,7 +5940,10 @@ static int                *g_ec_map = NULL;   /* [NL*NE] -> slot, or -1         
  *     launch the hit experts from;
  *   - in MID, after the exact moe_topk_host, the host compares the two and counts set, order
  *     and residency disagreements (g_hf_*), printed every 256 decode tokens.
- * Off (unset/0): g_ec_map is a plain malloc, no kernel runs, nothing is compared. */
+ * Off (unset/0): g_ec_map is a plain malloc, no kernel runs, nothing is compared.
+ * With SP_G4_HF_P2 on as well (P2.1), g_ec_map stays a plain malloc and k_hf_spec reads P2's
+ * separate device table g_ec_dmap instead (see it below g_ec_hit): g_ec_map publishes a slot at
+ * copy ISSUE, before the copy lands, which is hazard A once the GPU acts on the speculation. */
 static int                 g_hf = -1;
 static int                *g_ec_map_dev = NULL;
 static int                *g_hf_spec_h = NULL, *g_hf_spec_d = NULL;   /* [G4_HF_MAXL][16] */
@@ -5956,8 +5960,9 @@ static int hf_on(void) {
  *     P2.3/P2.4; nothing reads them yet.
  *   - With 2 it also times the decode MID on the GPU: k_hf2_stamp writes %globaltimer at the end
  *     of B[L] (captured into the segment graph with a fixed per-L destination, as k_hf_spec is),
- *     just before the grouped resident GEMVs, and just after k_moe_combine_ord. The host reads a
- *     layer's three stamps only after a later stream sync covers them (the next layer's MID sync,
+ *     just before the grouped resident GEMVs, and just after k_moe_combine_ord (P2.1 adds a fourth,
+ *     t_hits_out, after the grouped down-projection). The host reads a
+ *     layer's stamps only after a later stream sync covers them (the next layer's MID sync,
  *     or the next token's first), and prints the per-token GPU idle every 256 decode tokens.
  *     Segment-graph decode only (g_ffn_phase 1/2): ph 0 is also every other forward, on other
  *     threads, whose stamps would land in the same words.
@@ -5966,6 +5971,9 @@ struct g4_hf2 {
     unsigned int       ctr, pub, done, err;
     unsigned long long t_b_end[G4_HF_MAXL], t_grp_in[G4_HF_MAXL], t_comb_out[G4_HF_MAXL];
     struct { int n; float w[8]; int row[8]; } list;
+    /* P2.1: a fourth stamp, "hits finished": right after the grouped resident down-projection,
+     * before any CPU-row upload or the combine. Splits the MID span into GPU work and GPU wait. */
+    unsigned long long t_hits_out[G4_HF_MAXL];
 };
 #define G4_HF2_ROWS_OFF ((sizeof(g4_hf2) + 255) & ~(size_t)255)   /* rows[8][E] floats follow */
 static int     g_hf2_mode = -1;
@@ -5998,30 +6006,40 @@ static void hf2_init(int E) {
     fflush(stderr);
 }
 static inline int hf2_timing(int L) { return g_hf2_mode == 2 && g_hf2_d && L >= 0 && L < G4_HF_MAXL; }
-/* MID, after its stream sync: account the previous MID-stamped layer, whose three stamps that
+/* MID, after its stream sync: account the previous MID-stamped layer, whose four stamps that
  * sync covers. At L == 0 the previous layer was the last token's last one: a token boundary. */
 static int       g_hf2_pend = -1;
 static long long g_hf2_tok = 0, g_hf2_tl = 0, g_hf2_lay = 0;
-static double    g_hf2_idle_ns = 0.0, g_hf2_span_ns = 0.0;
+static double    g_hf2_idle_ns = 0.0, g_hf2_span_ns = 0.0, g_hf2_hits_ns = 0.0, g_hf2_wait_ns = 0.0;
+/* P2.1 parity counters (hf_p2=2; see g_ec_dmap below), printed with the timing line */
+static long long g_hf2_pvis = 0, g_hf2_pvis_spec = 0, g_hf2_vis = 0, g_hf2_npub = 0, g_hf2_ninv = 0;
 static void hf2_account(int L) {
     volatile g4_hf2 *h = g_hf2_h;
     if (g_hf2_pend >= 0) {
         const int p = g_hf2_pend;
         const unsigned long long b = h->t_b_end[p], gi = h->t_grp_in[p], co = h->t_comb_out[p];
-        if (b && gi >= b && co >= gi) {
+        const unsigned long long ho = h->t_hits_out[p];
+        if (b && gi >= b && ho >= gi && co >= ho) {
             g_hf2_idle_ns += (double)(gi - b); g_hf2_span_ns += (double)(co - b);
+            g_hf2_hits_ns += (double)(ho - gi); g_hf2_wait_ns += (double)(co - ho);
             g_hf2_tl++; g_hf2_lay++;
         }
-        h->t_b_end[p] = 0; h->t_grp_in[p] = 0; h->t_comb_out[p] = 0;
+        h->t_b_end[p] = 0; h->t_grp_in[p] = 0; h->t_comb_out[p] = 0; h->t_hits_out[p] = 0;
         g_hf2_pend = -1;
     }
     if (L == 0 && g_hf2_tl > 0) {
         g_hf2_tl = 0; g_hf2_tok++;
         if (g_hf2_tok % 256 == 0) {
+            const double nt = (double)g_hf2_tok;
             fprintf(stderr, "    [g4-hf2] P2.0 timing: %lld tokens, GPU idle before hits %.2f ms/token, "
-                            "MID span %.2f ms/token (B-end -> combine-end; %lld layers)\n",
-                    g_hf2_tok, g_hf2_idle_ns / 1e6 / (double)g_hf2_tok,
-                    g_hf2_span_ns / 1e6 / (double)g_hf2_tok, g_hf2_lay);
+                            "MID span %.2f ms/token (B-end -> combine-end; %lld layers), "
+                            "hits GPU %.2f ms/token (grp_in -> hits_out), "
+                            "wait for host %.2f ms/token (hits_out -> combine-end)\n",
+                    g_hf2_tok, g_hf2_idle_ns / 1e6 / nt, g_hf2_span_ns / 1e6 / nt, g_hf2_lay,
+                    g_hf2_hits_ns / 1e6 / nt, g_hf2_wait_ns / 1e6 / nt);
+            fprintf(stderr, "    [g4-hf2] P2.1 table: pending-visible %lld, victim-in-spec %lld, "
+                            "published %lld, invalidated %lld (pending-visible in the spec row %lld)\n",
+                    g_hf2_pvis, g_hf2_vis, g_hf2_npub, g_hf2_ninv, g_hf2_pvis_spec);
             fflush(stderr);
         }
     }
@@ -6034,6 +6052,124 @@ static unsigned char      *g_ec_pend = NULL;  /* [slots] */
 static int                 g_ec_slots = 0;
 static unsigned long long  g_ec_clock = 0;
 static long long           g_ec_hit = 0, g_ec_miss = 0;
+/* HOST-FREE LAYER, P2.1 (2026-10-19; plan Task P2.1, map section 3 "a simpler protocol").
+ * Only when hf2_on() != 0; nothing serves from it yet, and every output bit is unchanged.
+ *   - g_ec_dmap is a SEPARATE mapped table [NL*NE] -> slot or -1, the one k_hf_spec reads
+ *     (g_ec_dmap_dev). g_ec_map goes back to a plain host malloc (host-private), even with P1 on.
+ *   - It never shows a pending slot (hazard A): a key is PUBLISHED (dmap[key] = slot) only by
+ *     hf2_reap_locked, once g_ec_pev[slot] - recorded after the last copy into the slot, on
+ *     whichever stream issued it - reports cudaSuccess. Until then the slot sits on g_ec_unpub.
+ *   - Eviction INVALIDATES FIRST (hazard B): dmap[old_key] = -1, _mm_sfence, then g_ev_evict is
+ *     recorded at the tail of the decode stream and the copy stream waits on it, then the copy.
+ *     A k_hf_spec that ran before the store has its readers queued before g_ev_evict; one that
+ *     runs after it reads -1.
+ *   - hf_p2=2 counts (printed with the P2.0 timing line): pending-visible (a dmap entry pointing
+ *     at a slot whose copy has not landed; MUST stay 0), victim-in-spec (the hazard-B rate),
+ *     publishes and invalidations.
+ *   - MUTANT, test-only (unmapped, so serve.py strips it): SP_G4_HF_P2_MUTANT_EARLY_PUBLISH=1
+ *     publishes dmap at copy ISSUE time, as g_ec_map always has. pending-visible must then go
+ *     above 0 on a bench run (var/bench/run_p21_1019.py, arm P21-mutant).
+ * Allocated once per process and never freed: segment graphs bake k_hf_spec's map pointer
+ * (P2.0's precedent for its own mapped block). */
+static int        *g_ec_dmap = NULL, *g_ec_dmap_dev = NULL;
+static long long   g_ec_dmap_n = 0;
+static cudaEvent_t g_ev_evict = NULL;
+static int        *g_ec_unpub = NULL, g_ec_unpub_n = 0;   /* slots copied, not yet published */
+static unsigned char *g_ec_unpub_f = NULL;                /* [slots] on g_ec_unpub?          */
+static int         g_hf2_mut = -1;
+static int         g_hf2_vict[64], g_hf2_vict_n = 0;      /* this flush's victims, for counter (b) */
+static inline int hf2_dmap_on(void) { return g_ec_dmap != NULL && g_ec_unpub != NULL; }
+static int hf2_mutant_early(void) {
+    if (g_hf2_mut < 0) { const char *e = getenv("SP_G4_HF_P2_MUTANT_EARLY_PUBLISH");
+        g_hf2_mut = (e && *e == '1') ? 1 : 0; }
+    return g_hf2_mut;
+}
+/* All of these: caller holds the MoE lock. */
+static void hf2_unpub_add(int slot) {
+    if (!hf2_dmap_on() || slot < 0 || slot >= g_ec_slots || g_ec_unpub_f[slot]) return;
+    g_ec_unpub_f[slot] = 1; g_ec_unpub[g_ec_unpub_n++] = slot;
+}
+/* invalidate the slot's current key before it changes owner; st is the decode stream the copy
+ * must follow (NULL: the caller's copy is itself on the decode stream, no event needed) */
+static void hf2_invalidate(int slot, cudaStream_t st, cudaStream_t cps, int from_flush) {
+    if (!hf2_dmap_on()) return;
+    if (g_ec_unpub_f[slot]) {        /* its old key must never be published after this point */
+        int w = 0;
+        for (int i = 0; i < g_ec_unpub_n; i++) if (g_ec_unpub[i] != slot) g_ec_unpub[w++] = g_ec_unpub[i];
+        g_ec_unpub_n = w; g_ec_unpub_f[slot] = 0;
+    }
+    const int old = g_ec_key[slot];
+    if (old >= 0 && old < g_ec_dmap_n) {
+        ((volatile int *)g_ec_dmap)[old] = -1;
+        g_hf2_ninv++;
+        /* counter (b) is about the flush's admissions (before service; hazard B). The miss path
+         * in moe_resident copies on a stream already ordered behind any queued reader. */
+        if (from_flush && g_hf2_vict_n < 64) g_hf2_vict[g_hf2_vict_n++] = slot;
+    }
+    _mm_sfence();
+    if (st && cps && g_ev_evict) {
+        cudaEventRecord(g_ev_evict, st);
+        cudaStreamWaitEvent(cps, g_ev_evict, 0);
+    }
+}
+/* the copy into slot (now owning key) has been ISSUED and g_ec_pev[slot] recorded after it */
+static void hf2_issued(int slot, long long key) {
+    if (!hf2_dmap_on()) return;
+    if (hf2_mutant_early() && key >= 0 && key < g_ec_dmap_n)
+        ((volatile int *)g_ec_dmap)[key] = slot;           /* MUTANT: today's g_ec_map timing */
+    hf2_unpub_add(slot);
+}
+/* PUBLISH: every slot whose last copy has landed gets its key into dmap */
+static void hf2_reap_locked(void) {
+    if (!hf2_dmap_on()) return;
+    int w = 0;
+    for (int i = 0; i < g_ec_unpub_n; i++) {
+        const int s = g_ec_unpub[i];
+        const int key = g_ec_key[s];
+        if (key < 0) { g_ec_unpub_f[s] = 0; continue; }              /* emptied: nothing to publish */
+        if (!g_ec_pev || !g_ec_pev[s]) { g_ec_unpub_f[s] = 0; continue; }   /* no event: never publish */
+        if (cudaEventQuery(g_ec_pev[s]) != cudaSuccess) { g_ec_unpub[w++] = s; continue; }
+        if (key < g_ec_dmap_n) { ((volatile int *)g_ec_dmap)[key] = s; g_hf2_npub++; }
+        g_ec_unpub_f[s] = 0;
+    }
+    g_ec_unpub_n = w;
+    _mm_sfence();
+}
+/* SEED: every resident slot is queued for publication; the reap publishes the landed ones */
+static void hf2_seed_locked(void) {
+    if (!hf2_dmap_on()) return;
+    for (int s = 0; s < g_ec_slots; s++) if (g_ec_key[s] >= 0) hf2_unpub_add(s);
+    hf2_reap_locked();
+}
+/* hf_p2=2, at service time (after MID's sync, so spec row L is visible). Takes the MoE lock.
+ *   (a) pending-visible: a dmap entry that points at a slot whose copy has not landed. Checked
+ *       for the spec row's experts, as the plan states (g_hf2_pvis_spec), AND over the
+ *       publication queue. The second half is what can see the mutant: the flush admits LAYER
+ *       L-1's misses, so the spec row of L never names a key that is still in flight.
+ *   (b) victim-in-spec: this flush's eviction victims that spec row L had resolved (hazard B). */
+static void hf2_parity(int L, int NE, int NU) {
+    G4_MOE_SHARED_LOCK();
+    if (!hf2_dmap_on() || !g_ec_pev || !g_ec_pend) { g_hf2_vict_n = 0; return; }
+    const volatile int *sp = (const volatile int *)g_hf_spec_h + (size_t)L * 16;
+    const volatile int *dm = (const volatile int *)g_ec_dmap;
+    for (int k = 0; k < NU; k++) {
+        const int e = sp[k];
+        if (e < 0 || e >= NE) continue;
+        const long long key = (long long)L * NE + e;
+        if (key >= g_ec_dmap_n) continue;
+        const int s = dm[key];
+        if (s >= 0 && s < g_ec_slots && g_ec_pend[s] && g_ec_pev[s]
+            && cudaEventQuery(g_ec_pev[s]) != cudaSuccess) { g_hf2_pvis_spec++; g_hf2_pvis++; }
+    }
+    for (int i = 0; i < g_ec_unpub_n; i++) {
+        const int s = g_ec_unpub[i], key = g_ec_key[s];
+        if (key < 0 || key >= g_ec_dmap_n || dm[key] != s || !g_ec_pev[s]) continue;
+        if (cudaEventQuery(g_ec_pev[s]) != cudaSuccess) g_hf2_pvis++;
+    }
+    for (int i = 0; i < g_hf2_vict_n; i++)
+        for (int r = 0; r < NU; r++) if (sp[8 + r] == g_hf2_vict[i]) { g_hf2_vis++; break; }
+    g_hf2_vict_n = 0;
+}
 /* EVICTION POLICY (2026-09-29, SP_MOE_EVICT_HL). Unset/0 = LRU, byte-for-byte the old scan.
  * > 0 = decayed-frequency eviction with that half-life in DECODE TOKENS: every access of
  * (L,e) — GPU hit, GPU miss, or a miss the CPU serves — adds 1 to its score, and the score
@@ -6084,6 +6220,14 @@ static void moe_cache_free(void) {
     free(g_ec_key); free(g_ec_use); free(g_ec_ks); g_ec_ks = NULL;
     if (g_ec_map_dev) { cudaFreeHost(g_ec_map); g_ec_map_dev = NULL; } else free(g_ec_map);
     if (g_hf_spec_h) { cudaFreeHost(g_hf_spec_h); g_hf_spec_h = g_hf_spec_d = NULL; }
+    /* P2.1: every slot changes owner to "nobody", so every key is invalidated. The table
+     * itself is kept (graphs may hold its pointer); only the host-side queue goes. */
+    if (g_ec_dmap) {
+        for (long long i = 0; i < g_ec_dmap_n; i++) ((volatile int *)g_ec_dmap)[i] = -1;
+        _mm_sfence();
+    }
+    free(g_ec_unpub); free(g_ec_unpub_f); g_ec_unpub = NULL; g_ec_unpub_f = NULL; g_ec_unpub_n = 0;
+    g_hf2_vict_n = 0;
     g_ev_hlt = 0.0; g_ev_unit = 1.0; g_ev_base = 0; g_ev_all = 0;
     if (g_ec_pev) { for (int i = 0; i < g_ec_slots; i++) if (g_ec_pev[i]) cudaEventDestroy(g_ec_pev[i]); }
     free(g_ec_pev); free(g_ec_pend); g_ec_pev = NULL; g_ec_pend = NULL;
@@ -6117,7 +6261,37 @@ static void moe_cache_init(int NL, int NE, size_t gup_b, size_t gup_bsn,
     if (ok && down_bsn && cudaMalloc(&g_ec_down_bs, (size_t)slots * down_bsn * sizeof(unsigned short)) != cudaSuccess) ok = 0;
     g_ec_key = (int *)malloc((size_t)slots * sizeof(int));
     g_ec_use = (unsigned long long *)malloc((size_t)slots * sizeof(unsigned long long));
-    if (hf_on()) {      /* P1: the slot table mapped, so the GPU reads it zero-copy */
+    if (hf2_on()) {     /* P2.1: g_ec_map stays host-private; the GPU reads g_ec_dmap instead */
+        int ok2 = 1;
+        if (!g_ec_dmap || g_ec_dmap_n < all) {     /* once per process; never freed (see g_ec_dmap) */
+            int *h = NULL, *d = NULL;
+            if (cudaHostAlloc((void **)&h, (size_t)all * sizeof(int), cudaHostAllocMapped) != cudaSuccess
+                || cudaHostGetDevicePointer((void **)&d, h, 0) != cudaSuccess) {
+                cudaGetLastError(); if (h) cudaFreeHost(h); ok2 = 0;
+            } else { g_ec_dmap = h; g_ec_dmap_dev = d; g_ec_dmap_n = all; }
+        }
+        if (ok2 && !g_ev_evict && cudaEventCreateWithFlags(&g_ev_evict, cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError(); g_ev_evict = NULL; ok2 = 0;
+        }
+        if (ok2 && (cudaHostAlloc((void **)&g_hf_spec_h, (size_t)G4_HF_MAXL * 16 * sizeof(int), cudaHostAllocMapped) != cudaSuccess
+                    || cudaHostGetDevicePointer((void **)&g_hf_spec_d, g_hf_spec_h, 0) != cudaSuccess)) {
+            cudaGetLastError();
+            if (g_hf_spec_h) cudaFreeHost(g_hf_spec_h);
+            g_hf_spec_h = g_hf_spec_d = NULL; ok2 = 0;
+        }
+        if (ok2) {
+            for (long long i = 0; i < g_ec_dmap_n; i++) g_ec_dmap[i] = -1;
+            fprintf(stderr, "    [g4-hf2] P2.1: device slot table g_ec_dmap mapped (%lld entries): published only "
+                            "after a slot's copy lands, invalidated before eviction%s%s\n", all,
+                    hf2_on() == 2 ? "; parity counters ON" : "",
+                    hf2_mutant_early() ? "; MUTANT SP_G4_HF_P2_MUTANT_EARLY_PUBLISH=1 (publish at issue)" : "");
+        } else {
+            fprintf(stderr, "    [g4-hf2] P2.1: device slot table unavailable - k_hf_spec off\n");
+            g_ec_dmap = NULL; g_ec_dmap_dev = NULL; g_ec_dmap_n = 0;   /* a partial alloc is leaked, not freed */
+        }
+        if (hf_on()) fprintf(stderr, "    [g4-hf] P1 with P2 on: g_ec_map stays host-private; "
+                                     "the speculation reads g_ec_dmap\n");
+    } else if (hf_on()) {      /* P1: the slot table mapped, so the GPU reads it zero-copy */
         if (cudaHostAlloc((void **)&g_ec_map, (size_t)all * sizeof(int), cudaHostAllocMapped) != cudaSuccess
             || cudaHostGetDevicePointer((void **)&g_ec_map_dev, g_ec_map, 0) != cudaSuccess
             || cudaHostAlloc((void **)&g_hf_spec_h, (size_t)G4_HF_MAXL * 16 * sizeof(int), cudaHostAllocMapped) != cudaSuccess
@@ -6144,6 +6318,15 @@ static void moe_cache_init(int NL, int NE, size_t gup_b, size_t gup_bsn,
         if (cudaEventCreateWithFlags(&g_ec_pev[i], cudaEventDisableTiming) != cudaSuccess) g_ec_pev[i] = NULL;
     for (long long i = 0; i < all; i++) g_ec_map[i] = -1;
     g_ec_slots = slots;
+    if (g_ec_dmap) {    /* P2.1: the publication queue, then seed (an empty cache: nothing resident yet) */
+        g_ec_unpub = (int *)malloc((size_t)slots * sizeof(int));
+        g_ec_unpub_f = (unsigned char *)calloc((size_t)slots, 1);
+        g_ec_unpub_n = 0;
+        if (!g_ec_unpub || !g_ec_unpub_f) {
+            free(g_ec_unpub); free(g_ec_unpub_f); g_ec_unpub = NULL; g_ec_unpub_f = NULL;
+            fprintf(stderr, "    [g4-hf2] P2.1: publication queue alloc failed - dmap stays all -1\n");
+        } else { G4_MOE_SHARED_LOCK(); hf2_seed_locked(); }
+    }
     {   const char *ev = getenv("SP_MOE_EVICT_HL");
         const double hl = (ev && *ev) ? atof(ev) : 0.0;
         if (hl > 0.0) {
@@ -6181,6 +6364,9 @@ static int moe_resident(int L, int e, int NE, int E, int FFE, cudaStream_t st,
     if (slot < 0) {                                   /* MISS: LRU victim */
         g_ec_miss++;
         const int victim = moe_ev_victim();
+        /* P2.1: invalidate first. The copy below is on st; when st is not the decode stream
+         * (pass 1 of the overlap), it also waits for the decode stream's tail. */
+        if (hf2_dmap_on()) hf2_invalidate(victim, st == g_w.stream ? (cudaStream_t)NULL : g_w.stream, st, 0);
         if (g_ec_key[victim] >= 0) g_ec_map[g_ec_key[victim]] = -1;
         if (g_ec_pend && g_ec_pend[victim]) {           /* an admission is still filling it */
             if (g_ec_pev[victim]) cudaStreamWaitEvent(st, g_ec_pev[victim], 0);
@@ -6197,6 +6383,10 @@ static int moe_resident(int L, int e, int NE, int E, int FFE, cudaStream_t st,
                       db, g_w.slot_down_bs_n, g_w.slot_down_nblk,
                       g_w.slot_down_ro, g_w.slot_down_rp, g_w.slot_down_prec, st, dw)) return -1;
         g_ec_key[victim] = (int)key; g_ec_map[key] = victim; slot = victim;
+        if (hf2_dmap_on()) {    /* P2.1: an event after the stream-ordered copy; the reap publishes on it */
+            if (g_ec_pev && g_ec_pev[victim]) cudaEventRecord(g_ec_pev[victim], st);
+            hf2_issued(victim, key);
+        }
     } else {                                          /* HIT: pointer math only */
         g_ec_hit++;
         if (g_ec_pend && g_ec_pend[slot]) {             /* filled asynchronously: wait for it */
@@ -6297,15 +6487,17 @@ static int moe_cpu_mode(int E, int FFE) {
 }
 static std::mutex g_admq_mtx;
 static int g_admq_n = 0, g_admq[64][5];
-static void moe_admit_async(int L, int e, int NE, int E, int FFE);
+static void moe_admit_async(int L, int e, int NE, int E, int FFE, cudaStream_t st);
 static void moe_admit_enqueue(int L, int e, int NE, int E, int FFE) {
     std::lock_guard<std::mutex> lk(g_admq_mtx);
     if (g_admq_n < 64) { int *q = g_admq[g_admq_n++]; q[0] = L; q[1] = e; q[2] = NE; q[3] = E; q[4] = FFE; }
 }
-static void moe_admit_flush(void) {
+/* st: the decode stream (MID's). Only P2.1's g_ev_evict uses it. */
+static void moe_admit_flush(cudaStream_t st) {
     int n, q[64][5];
     { std::lock_guard<std::mutex> lk(g_admq_mtx); n = g_admq_n; memcpy(q, g_admq, sizeof(int) * 5 * (size_t)n); g_admq_n = 0; }
-    for (int i = 0; i < n; i++) moe_admit_async(q[i][0], q[i][1], q[i][2], q[i][3], q[i][4]);
+    if (hf2_dmap_on()) { G4_MOE_SHARED_LOCK(); hf2_reap_locked(); }   /* P2.1: publish what has landed */
+    for (int i = 0; i < n; i++) moe_admit_async(q[i][0], q[i][1], q[i][2], q[i][3], q[i][4], st);
 }
 /* resident AND not still being filled? (the CPU path never waits on an admission) */
 static int moe_ready_now(int L, int e, int NE) {
@@ -6327,7 +6519,7 @@ static int moe_ready_now(int L, int e, int NE) {
  * after g_adm_ready (recorded on the compute stream by the caller, so no queued kernel can
  * still be reading the victim), and the slot stays pending until its event fires. Capped by
  * copies in flight: an admission queue that outruns the bus only adds latency to itself. */
-static void moe_admit_async(int L, int e, int NE, int E, int FFE) {
+static void moe_admit_async(int L, int e, int NE, int E, int FFE, cudaStream_t st) {
     G4_MOE_SHARED_LOCK();
     const long long key = (long long)L * NE + e;
     if (g_ec_map[key] >= 0 || g_admit_cap <= 0) return;
@@ -6337,8 +6529,12 @@ static void moe_admit_async(int L, int e, int NE, int E, int FFE) {
         if (sl >= 0 && g_ec_pend[sl] && g_ec_pev[sl] && cudaEventQuery(g_ec_pev[sl]) != cudaSuccess) inflight++;
         else { if (sl >= 0) g_ec_pend[sl] = 0; g_adm_ring[i] = -1; if (free_i < 0) free_i = i; }
     }
+    if (hf2_dmap_on()) hf2_reap_locked();   /* P2.1: the ring's landed copies publish here too */
     if (inflight >= g_admit_cap || free_i < 0) { g_adm_skip++; return; }
     const int victim = moe_ev_victim();
+    /* P2.1: invalidate FIRST - dmap[old] = -1, sfence, g_ev_evict at the decode stream's tail,
+     * and the copy stream waits on it - so no reader queued before this point sees the copy */
+    if (hf2_dmap_on()) hf2_invalidate(victim, st, g_adm_cps, 1);
     if (g_ec_key[victim] >= 0) g_ec_map[g_ec_key[victim]] = -1;
     unsigned char  *gc = g_ec_gup_codes  + (size_t)victim * g_w.slot_gup_bytes;
     unsigned char  *dc = g_ec_down_codes + (size_t)victim * g_w.slot_down_bytes;
@@ -6357,6 +6553,7 @@ static void moe_admit_async(int L, int e, int NE, int E, int FFE) {
     }
     if (g_ec_pev[victim]) { cudaEventRecord(g_ec_pev[victim], g_adm_cps); g_ec_pend[victim] = 1; }
     g_ec_key[victim] = (int)key; g_ec_map[key] = victim; g_ec_use[victim] = ++g_ec_clock;
+    hf2_issued(victim, key);   /* P2.1: queued for publication after g_ec_pev[victim] (mutant: now) */
     g_adm_ring[free_i] = victim;
     g_adm_n++;
 }
@@ -6783,7 +6980,9 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     MBK("router_prep");
     AMMD(&g_w.Wrouter[L], ms->rin, ms->log, n_tok);   /* [NE x n_tok] col-major */
     if (n_tok == 1 && g_hf_spec_d && NE <= 1024 && NU <= 8 && L < G4_HF_MAXL)   /* P1: speculate */
-        k_hf_spec<<<1, NE, 0, st>>>(ms->log, NE, NU, g_ec_map_dev ? g_ec_map_dev + (size_t)L * NE : NULL,
+        k_hf_spec<<<1, NE, 0, st>>>(ms->log, NE, NU,
+                                    g_ec_dmap_dev ? g_ec_dmap_dev + (size_t)L * NE        /* P2.1 */
+                                    : g_ec_map_dev ? g_ec_map_dev + (size_t)L * NE : NULL,
                                     g_hf_spec_d + (size_t)L * 16);
     k_rmsnorm<<<n_tok, 256, 0, st>>>(dx, g_w.pre_ffw2[L], E, eps, ms->in);
     k_moe_zero<<<(unsigned)((nE + 255) / 256), 256, 0, st>>>(ms->acc, (int)nE);
@@ -6851,7 +7050,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     if (ph == 1 && hf2_timing(L)) k_hf2_stamp<<<1, 1, 0, st>>>(&g_hf2_d->t_b_end[L]);
     if (ph == 1) return 0;               /* PRE ends at the D2Hs; the sync belongs to MID */
     if (do_mid) {
-    moe_admit_flush();                   /* the previous layer's admissions, off the GPU's critical path */
+    moe_admit_flush(st);                 /* the previous layer's admissions, off the GPU's critical path */
     {   cudaError_t ce = cudaStreamSynchronize(st);
         if (ce != cudaSuccess) {
             char eb[192]; snprintf(eb, sizeof eb,
@@ -6859,6 +7058,8 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
             fprintf(stderr, "    [g4-moe] %s\n", eb); fflush(stderr);
             sp_set_error(eb); return -1; } }
     if (ph == 2 && hf2_timing(L)) hf2_account(L);   /* P2.0: the sync above covers the last stamps */
+    /* P2.1 parity counters: the sync above made spec row L visible */
+    if (n_tok == 1 && g_hf2_mode == 2 && g_hf_spec_h && NU <= 8 && L < G4_HF_MAXL) hf2_parity(L, NE, NU);
     if (_mtm) { g_moe_sync_ms += moe_ms_since(_mt_sync); g_moe_sync_n++;
                 _mt_exp = moe_clk::now(); _mt_route = _mt_exp; }
     { static int first_ = 1; if (first_) { first_ = 0;
@@ -6873,7 +7074,10 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
          * above made the mapped row visible. Residency is compared for the experts both chose;
          * a residency mismatch means the table moved between PRE (the kernel read it) and here
          * (moe_admit_flush runs in between), which is the window P2's protocol has to close. */
-        if (n_tok == 1 && g_hf_spec_h && NU <= 8 && L < G4_HF_MAXL) {
+        /* (P2.1: the spec row is also allocated for P2 alone, so P1's parity is gated on hf_on();
+         *  with P2's device table on, "resident" means resident in g_ec_dmap, the table the
+         *  speculation read.) */
+        if (n_tok == 1 && g_hf_spec_h && hf_on() && NU <= 8 && L < G4_HF_MAXL) {
             const int *sp = g_hf_spec_h + (size_t)L * 16;
             int set_bad = 0, ord_bad = 0, res_bad = 0;
             for (int k = 0; k < NU; k++) {
@@ -6881,7 +7085,8 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                 int f = -1;
                 for (int j = 0; j < NU; j++) if (sp[j] == ms->idx_h[k]) { f = j; break; }
                 if (f < 0) { set_bad = 1; continue; }
-                const int host_slot = g_ec_map[(long long)L * NE + ms->idx_h[k]];
+                const int host_slot = g_ec_dmap ? ((volatile int *)g_ec_dmap)[(long long)L * NE + ms->idx_h[k]]
+                                                : g_ec_map[(long long)L * NE + ms->idx_h[k]];
                 if ((sp[8 + f] >= 0) != (host_slot >= 0)) res_bad = 1;
             }
             g_hf_layers++; g_hf_set += set_bad; g_hf_ord += ord_bad; g_hf_res += res_bad;
@@ -7093,6 +7298,9 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                       k_gemv_q4b_dp4a_grp<<<gr, 256, 0, st>>>(gdw_t, FFE >> 5, FFE, qxF, npF, sxF, npF >> 4,
                                                               ms->gout, E, E); }
                 }
+                /* P2.1 stamp (d), "hits finished": after the grouped resident down-projection,
+                 * before any CPU-row upload or the combine (with no hits, right after (b)) */
+                if (hf2t) k_hf2_stamp<<<1, 1, 0, st>>>(&g_hf2_d->t_hits_out[L]);
                 if (ncpu) {
                     /* The GPU is already running the resident experts; the CPU does the rest,
                      * BIT-EXACT: its GEMVs reproduce k_gemv_q4b_dp4a_v2, and the GELU + requant
