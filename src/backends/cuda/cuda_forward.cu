@@ -1834,6 +1834,7 @@ static inline int g4_arch_is_moe(int a) { return a == SP_ARCH_GEMMA4_MOE; }
  * known; defined next to the MoE seam further down. */
 static void moe_cache_init(int NL, int NE, size_t gup_b, size_t gup_bsn,
                            size_t down_b, size_t down_bsn);
+static void hf2_init(int E);   /* host-free layer P2's mapped block; defined beside hf_on */
 static CudaWeights g_w = {};
 
 /* dequant a GGUF weight tensor [out x in] to device f32 [out*in], row-major. */
@@ -2284,6 +2285,7 @@ static int build_weights(const qwen3_model *m, CudaWeights *w) {
                 w->moe_NU);
         moe_cache_init(L, NE, w->slot_gup_bytes, w->slot_gup_bs_n,
                        w->slot_down_bytes, w->slot_down_bs_n);
+        hf2_init(E);         /* P2's mapped block; a no-op unless SP_G4_HF_P2 is 1 or 2 */
     }
 
     /* ETA.1 Gemma4 model-level AltUp tensors. ETA.5b: per_layer_token_embd is
@@ -5736,6 +5738,13 @@ __global__ void k_hf_spec(const float *log, int NE, int NU, const int *map_L, in
     for (int j = 0; j < NE; j++) { const float w = log[j]; r += (w > v) || (w == v && j < i); }
     if (r < NU) { out[r] = i; out[8 + r] = map_L ? map_L[i] : -2; }
 }
+/* P2.0 timing (see g4_hf2 below): one thread writes the GPU's global nanosecond timer into a
+ * mapped word. It reads nothing the forward computes and writes nothing the forward reads. */
+__global__ void k_hf2_stamp(unsigned long long *dst) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    *(volatile unsigned long long *)dst = t;
+}
 
 static void moe_topk_host(const float *logits, int NE, int NU, int *idx, float *wt) {
     float mx = logits[0];
@@ -5939,6 +5948,83 @@ static long long           g_hf_layers = 0, g_hf_set = 0, g_hf_ord = 0, g_hf_res
 static int hf_on(void) {
     if (g_hf < 0) { const char *e = getenv("SP_G4_HF_P1"); g_hf = (e && *e == '1') ? 1 : 0; }
     return g_hf;
+}
+/* HOST-FREE LAYER, P2.0 (2026-10-19; docs/superpowers/plans/2026-10-19-host-free-layer-p2.md).
+ * No behaviour change. SP_G4_HF_P2: 0 off (default), 1 serve, 2 parity; read once.
+ *   - P2.0 builds neither serving nor parity. With 1 or 2 it allocates the mapped block below
+ *     (hf2_init, at weight build), whose handshake words, combine list and CPU rows are for
+ *     P2.3/P2.4; nothing reads them yet.
+ *   - With 2 it also times the decode MID on the GPU: k_hf2_stamp writes %globaltimer at the end
+ *     of B[L] (captured into the segment graph with a fixed per-L destination, as k_hf_spec is),
+ *     just before the grouped resident GEMVs, and just after k_moe_combine_ord. The host reads a
+ *     layer's three stamps only after a later stream sync covers them (the next layer's MID sync,
+ *     or the next token's first), and prints the per-token GPU idle every 256 decode tokens.
+ *     Segment-graph decode only (g_ffn_phase 1/2): ph 0 is also every other forward, on other
+ *     threads, whose stamps would land in the same words.
+ * The block is allocated once per process and never freed: segment graphs bake its pointers. */
+struct g4_hf2 {
+    unsigned int       ctr, pub, done, err;
+    unsigned long long t_b_end[G4_HF_MAXL], t_grp_in[G4_HF_MAXL], t_comb_out[G4_HF_MAXL];
+    struct { int n; float w[8]; int row[8]; } list;
+};
+#define G4_HF2_ROWS_OFF ((sizeof(g4_hf2) + 255) & ~(size_t)255)   /* rows[8][E] floats follow */
+static int     g_hf2_mode = -1;
+static g4_hf2 *g_hf2_h = NULL, *g_hf2_d = NULL;
+static float  *g_hf2_rows_h = NULL, *g_hf2_rows_d = NULL;
+static int hf2_on(void) {
+    if (g_hf2_mode < 0) { const char *e = getenv("SP_G4_HF_P2");
+        g_hf2_mode = (e && (e[0] == '1' || e[0] == '2')) ? e[0] - '0' : 0; }
+    return g_hf2_mode;
+}
+static void hf2_init(int E) {
+    if (!hf2_on() || g_hf2_h || E <= 0) return;
+    const size_t bytes = G4_HF2_ROWS_OFF + (size_t)8 * (size_t)E * sizeof(float);
+    void *h = NULL, *d = NULL;
+    if (cudaHostAlloc(&h, bytes, cudaHostAllocMapped) != cudaSuccess
+        || cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+        cudaGetLastError();
+        if (h) cudaFreeHost(h);
+        g_hf2_mode = 0;
+        fprintf(stderr, "    [g4-hf2] P2: mapped block unavailable - P2 off\n"); fflush(stderr);
+        return;
+    }
+    memset(h, 0, bytes);
+    g_hf2_h = (g4_hf2 *)h; g_hf2_d = (g4_hf2 *)d;
+    g_hf2_rows_h = (float *)((char *)h + G4_HF2_ROWS_OFF);
+    g_hf2_rows_d = (float *)((char *)d + G4_HF2_ROWS_OFF);
+    fprintf(stderr, "    [g4-hf2] P2.0 (SP_G4_HF_P2=%d): mapped block %zu B; %s. Serving is not built: "
+                    "output unchanged\n", g_hf2_mode, bytes,
+            g_hf2_mode == 2 ? "GPU timing of the decode MID ON (printed every 256 tokens)" : "timing off");
+    fflush(stderr);
+}
+static inline int hf2_timing(int L) { return g_hf2_mode == 2 && g_hf2_d && L >= 0 && L < G4_HF_MAXL; }
+/* MID, after its stream sync: account the previous MID-stamped layer, whose three stamps that
+ * sync covers. At L == 0 the previous layer was the last token's last one: a token boundary. */
+static int       g_hf2_pend = -1;
+static long long g_hf2_tok = 0, g_hf2_tl = 0, g_hf2_lay = 0;
+static double    g_hf2_idle_ns = 0.0, g_hf2_span_ns = 0.0;
+static void hf2_account(int L) {
+    volatile g4_hf2 *h = g_hf2_h;
+    if (g_hf2_pend >= 0) {
+        const int p = g_hf2_pend;
+        const unsigned long long b = h->t_b_end[p], gi = h->t_grp_in[p], co = h->t_comb_out[p];
+        if (b && gi >= b && co >= gi) {
+            g_hf2_idle_ns += (double)(gi - b); g_hf2_span_ns += (double)(co - b);
+            g_hf2_tl++; g_hf2_lay++;
+        }
+        h->t_b_end[p] = 0; h->t_grp_in[p] = 0; h->t_comb_out[p] = 0;
+        g_hf2_pend = -1;
+    }
+    if (L == 0 && g_hf2_tl > 0) {
+        g_hf2_tl = 0; g_hf2_tok++;
+        if (g_hf2_tok % 256 == 0) {
+            fprintf(stderr, "    [g4-hf2] P2.0 timing: %lld tokens, GPU idle before hits %.2f ms/token, "
+                            "MID span %.2f ms/token (B-end -> combine-end; %lld layers)\n",
+                    g_hf2_tok, g_hf2_idle_ns / 1e6 / (double)g_hf2_tok,
+                    g_hf2_span_ns / 1e6 / (double)g_hf2_tok, g_hf2_lay);
+            fflush(stderr);
+        }
+    }
 }
 /* step C (2026-09-28): a slot being filled by an ASYNC admission copy is "pending" until its
  * event completes. Any user of a pending slot makes its stream wait on that event; the CPU
@@ -6554,6 +6640,60 @@ static int moe_overlap_on(void) {
     return 1;
 }
 
+/* MID's grouped-path device scratch: the exact buffers and sizes MID allocated on first use
+ * until P2.0. Rows [0, G4G_MAX) serve the GPU experts, [G4G_MAX, 2*G4G_MAX) the CPU round trip.
+ * 0 = sized, -1 = failed (all freed, gcap 0, so the grouped path declines as before). */
+static int moe_grp_alloc(g4_moe_scratch *ms, int E, int FFE) {
+    const int npE = E, npF = FFE;
+    void *gd[] = { ms->ggu, ms->gh, ms->gout, ms->gsx, ms->gacc, ms->gqx };
+    for (size_t i = 0; i < sizeof(gd)/sizeof(gd[0]); i++) if (gd[i]) cudaFree(gd[i]);
+    ms->ggu = ms->gh = ms->gout = ms->gsx = ms->gacc = NULL; ms->gqx = NULL;
+    ms->gcapE = ms->gcapF = 0;
+    const size_t qxb = (size_t)npE + (size_t)2 * G4G_MAX * npF;
+    const size_t sxn = (size_t)(npE >> 4) + (size_t)2 * G4G_MAX * (npF >> 4);
+    if (cudaMalloc(&ms->ggu,  (size_t)2 * G4G_MAX * 2 * FFE * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&ms->gh,   (size_t)2 * G4G_MAX * FFE * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&ms->gout, (size_t)2 * G4G_MAX * E * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&ms->gacc, (size_t)E * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&ms->gsx,  sxn * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&ms->gqx,  qxb) == cudaSuccess) { ms->gcapE = E; ms->gcapF = FFE; return 0; }
+    cudaGetLastError();
+    return -1;
+}
+/* The CPU path's GELU round-trip stream (used only when the MUFU tables are missing). */
+static cudaStream_t g_cpu_rt_st = NULL;
+static cudaEvent_t  g_cpu_rt_ev = NULL;
+static int moe_cpu_rt_ensure(void) {
+    if (g_cpu_rt_st && g_cpu_rt_ev) return 0;
+    if (!g_cpu_rt_st) { int lo = 0, hi = 0; cudaDeviceGetStreamPriorityRange(&lo, &hi);
+        if (cudaStreamCreateWithPriority(&g_cpu_rt_st, cudaStreamNonBlocking, hi) != cudaSuccess) {
+            g_cpu_rt_st = NULL; cudaGetLastError(); return -1; } }
+    if (cudaEventCreateWithFlags(&g_cpu_rt_ev, cudaEventDisableTiming) != cudaSuccess) {
+        g_cpu_rt_ev = NULL; cudaGetLastError(); return -1; }
+    return 0;
+}
+/* P2.0 (R9): allocation inside MID synchronizes, and P2.4 cannot tolerate that. So the first
+ * decode step's PRE (never under a capture: checked) sizes MID's scratch and creates the
+ * round-trip stream, under the grouped gate's own static conditions. Same buffers, same sizes,
+ * same kernels: only WHEN they are allocated moves. MID keeps its first-use allocation as the
+ * fallback, so a skipped or failed prealloc behaves exactly as before. */
+static void moe_grp_prealloc(cudaStream_t st, g4_moe_scratch *ms, int E, int FFE,
+                             int use_int8, int cpu_mode) {
+    const int sized = (ms->gcapE >= E && ms->gcapF >= FFE);
+    if (sized && (!cpu_mode || (g_cpu_rt_st && g_cpu_rt_ev))) return;      /* the hot path */
+    static int grp_env = -1;
+    if (grp_env < 0) { const char *ev = getenv("SP_G4_MOE_GROUPED");
+        grp_env = (ev && (ev[0] == '1' || ev[0] == '2')) ? 1 : 0; }
+    if (!(grp_env || cpu_mode) || !use_int8 || g_ec_slots < 4 * G4G_MAX
+        || g_w.slot_gup_prec != 4 || g_w.slot_down_prec != 4
+        || !g_w.slot_gup_bs_n || !g_w.slot_down_bs_n || (E & 31) != 0 || (FFE & 31) != 0) return;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(st, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
+        cudaGetLastError(); return; }                 /* under a capture: MID's fallback does it */
+    if (!sized) moe_grp_alloc(ms, E, FFE);
+    if (cpu_mode) moe_cpu_rt_ensure();
+}
+
 static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ffL,
                         int n_tok, float eps, int use_int8,
                         float *dx, float *dnx, float *dg, float *dup, float *ddn,
@@ -6697,6 +6837,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
             cudaMemcpyAsync(ms->cin_h, ms->in, (size_t)E * sizeof(float), cudaMemcpyDeviceToHost, st) == cudaSuccess)
             cpu_in_ok = 1;
     }
+    if (n_tok == 1 && do_pre) moe_grp_prealloc(st, ms, E, FFE, use_int8, cpu_mode);   /* P2.0 */
     /* n_tok == 1: logits go to a PINNED buffer (a graph can capture that D2H; pageable, it cannot) */
     if (n_tok == 1 && !ms->logd_h) {
         if (cudaMallocHost(&ms->logd_h, (size_t)NE * sizeof(float)) != cudaSuccess) { ms->logd_h = NULL; cudaGetLastError(); }
@@ -6706,6 +6847,8 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
         cudaMemcpyAsync(logh, ms->log, (size_t)n_tok * (size_t)NE * sizeof(float),
                         cudaMemcpyDeviceToHost, st) != cudaSuccess) {
         sp_set_error("gemma4-MoE: router logits D2H"); return -1; }
+    /* P2.0 stamp (a), B[L]'s last node: captured into segB[L] with this fixed destination */
+    if (ph == 1 && hf2_timing(L)) k_hf2_stamp<<<1, 1, 0, st>>>(&g_hf2_d->t_b_end[L]);
     if (ph == 1) return 0;               /* PRE ends at the D2Hs; the sync belongs to MID */
     if (do_mid) {
     moe_admit_flush();                   /* the previous layer's admissions, off the GPU's critical path */
@@ -6715,6 +6858,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                 "gemma4-MoE: fault by router sync at L=%d : %s", L, cudaGetErrorString(ce));
             fprintf(stderr, "    [g4-moe] %s\n", eb); fflush(stderr);
             sp_set_error(eb); return -1; } }
+    if (ph == 2 && hf2_timing(L)) hf2_account(L);   /* P2.0: the sync above covers the last stamps */
     if (_mtm) { g_moe_sync_ms += moe_ms_since(_mt_sync); g_moe_sync_n++;
                 _mt_exp = moe_clk::now(); _mt_route = _mt_exp; }
     { static int first_ = 1; if (first_) { first_ = 0;
@@ -6895,21 +7039,10 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
             act[nact++] = e;
         }
         const int npE = E, npF = FFE;          /* both %32 == 0, so npad == in */
+        /* P2.0: moe_grp_prealloc (in PRE, outside any capture) normally sized these already;
+         * this first-use allocation is the fallback for when it could not run or failed. */
         if (nact > 0 && (ms->gcapE < E || ms->gcapF < FFE)) {
-            void *gd[] = { ms->ggu, ms->gh, ms->gout, ms->gsx, ms->gacc, ms->gqx };
-            for (size_t i = 0; i < sizeof(gd)/sizeof(gd[0]); i++) if (gd[i]) cudaFree(gd[i]);
-            ms->ggu = ms->gh = ms->gout = ms->gsx = ms->gacc = NULL; ms->gqx = NULL;
-            ms->gcapE = ms->gcapF = 0;
-            /* rows [0, G4G_MAX) serve the GPU experts, [G4G_MAX, 2*G4G_MAX) the CPU round trip */
-            const size_t qxb = (size_t)npE + (size_t)2 * G4G_MAX * npF;
-            const size_t sxn = (size_t)(npE >> 4) + (size_t)2 * G4G_MAX * (npF >> 4);
-            if (cudaMalloc(&ms->ggu,  (size_t)2 * G4G_MAX * 2 * FFE * sizeof(float)) == cudaSuccess &&
-                cudaMalloc(&ms->gh,   (size_t)2 * G4G_MAX * FFE * sizeof(float)) == cudaSuccess &&
-                cudaMalloc(&ms->gout, (size_t)2 * G4G_MAX * E * sizeof(float)) == cudaSuccess &&
-                cudaMalloc(&ms->gacc, (size_t)E * sizeof(float)) == cudaSuccess &&
-                cudaMalloc(&ms->gsx,  sxn * sizeof(float)) == cudaSuccess &&
-                cudaMalloc(&ms->gqx,  qxb) == cudaSuccess) { ms->gcapE = E; ms->gcapF = FFE; }
-            else { cudaGetLastError(); nact = -1; }
+            if (moe_grp_alloc(ms, E, FFE)) nact = -1;
         }
         if (nact > 0) {
             /* which experts go to the CPU: in serve mode, those not ready on the GPU right now */
@@ -6945,6 +7078,8 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                 float *sxE = ms->gsx, *sxF = ms->gsx + (npE >> 4);
                 float *dacc = (grp_ == 2) ? ms->gacc : ms->acc;
                 if (grp_ == 2) k_moe_zero<<<(unsigned)((E + 255) / 256), 256, 0, st>>>(ms->gacc, E);
+                const int hf2t = (ph == 2 && hf2_timing(L));
+                if (hf2t) k_hf2_stamp<<<1, 1, 0, st>>>(&g_hf2_d->t_grp_in[L]);     /* P2.0 stamp (b) */
                 if (nh > 0) {
                     k_quant_act_int8<<<1, 256, 0, st>>>(ms->in, E, npE, qxE, sxE);
                     { dim3 gr((unsigned)((2 * FFE + 7) / 8), (unsigned)nh);
@@ -6964,11 +7099,9 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                      * between them run on the GPU (CUDA tanhf is MUFU-based and cannot be
                      * matched on the CPU) via a short round trip on a high-priority stream.
                      * CPU rows live at [G4G_MAX, 2*G4G_MAX) of ggu/gh/qxF/sxF. */
-                    static cudaStream_t cst_ = NULL; static cudaEvent_t cev_ = NULL;
-                    if (!cst_) { int lo = 0, hi = 0; cudaDeviceGetStreamPriorityRange(&lo, &hi);
-                        if (cudaStreamCreateWithPriority(&cst_, cudaStreamNonBlocking, hi) != cudaSuccess ||
-                            cudaEventCreateWithFlags(&cev_, cudaEventDisableTiming) != cudaSuccess) {
-                            sp_set_error("gemma4-MoE: CPU round-trip stream"); return -1; } }
+                    /* P2.0: created by moe_cpu_rt_ensure in PRE; this is the first-use fallback */
+                    if (moe_cpu_rt_ensure()) { sp_set_error("gemma4-MoE: CPU round-trip stream"); return -1; }
+                    cudaStream_t cst_ = g_cpu_rt_st; cudaEvent_t cev_ = g_cpu_rt_ev;
                     int cj[G4G_MAX], cjn = 0;
                     for (int k = 0; k < nact; k++) if (oncpu[k]) cj[cjn++] = k;
                     sp_moe_cpu_quant(ms->cin_h, E, (int8_t *)ms->cinq_h, ms->cinsx_h);
@@ -7035,6 +7168,8 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                     g_cpu_layers++;
                 }
                 k_moe_combine_ord<<<(unsigned)((E + 255) / 256), 256, 0, st>>>(ms->gout, nact, E, wt, dacc);
+                if (hf2t) { k_hf2_stamp<<<1, 1, 0, st>>>(&g_hf2_d->t_comb_out[L]);  /* P2.0 stamp (c) */
+                            g_hf2_pend = L; }
                 if (_mtm) g_moe_expert_calls += nact;
                 if (grp_ != 2) grp_done = 1;
                 /* STEP C: admit this layer's CPU experts, off the critical path */
