@@ -16,7 +16,8 @@
 //! Null floor: this module is only reached when a chat turn sets
 //! `auto_recall:true` and the registry loaded. Default off ⇒ byte-untouched.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 pub const SEED: u64 = 0x5350_524F_4A2B;
 pub const R_BITS: usize = 256;
@@ -688,7 +689,10 @@ pub enum EpisodeDir {
     AsWritten,
     /// The row's `dir` does not exist but `<SP_EPS_DIR>/<basename>` does.
     Moved(String),
-    /// Neither exists. The episode's KV is not on this machine.
+    /// The cold tier moved it: the move ledger names the basename and
+    /// `<SP_EPS_COLD_DIR>/<basename>` exists (D2, harness/maintenance/eps_cold.py).
+    Cold(String),
+    /// None of those exist. The episode's KV is not on this machine.
     Missing,
 }
 
@@ -698,20 +702,68 @@ pub enum EpisodeDir {
 /// and every ep.k / ep.l5 / ep.okf.md load below fell into an `unwrap_or` with no log.
 /// The row is never rewritten; the path is resolved here, at read, by basename under
 /// the configured root. An episode whose dir exists nowhere is reported by `Missing`.
-pub fn resolve_episode_dir(dir: &str, eps_root: Option<&str>) -> EpisodeDir {
+/// D2: a third step, the cold root, taken only for a basename the move ledger names.
+/// The ledger is the one place the daemon learns where an episode went.
+pub fn resolve_episode_dir(dir: &str, eps_root: Option<&str>, cold_root: Option<&str>,
+                           moved: &HashSet<String>) -> EpisodeDir {
     if dir.is_empty() || Path::new(dir).is_dir() {
         return EpisodeDir::AsWritten;
     }
-    let root = eps_root.map(|r| r.trim().trim_end_matches(['/', '\\'])).unwrap_or("");
-    if !root.is_empty() {
-        if let Some(base) = Path::new(dir).file_name().and_then(|b| b.to_str()) {
-            let moved = format!("{}/{}", root, base);
-            if Path::new(&moved).is_dir() {
-                return EpisodeDir::Moved(moved);
-            }
+    let base = match ep_basename(dir) {
+        Some(b) => b,
+        None => return EpisodeDir::Missing,
+    };
+    let norm = |r: Option<&str>| r.map(|r| r.trim().trim_end_matches(['/', '\\']).to_string()).unwrap_or_default();
+    let hot = norm(eps_root);
+    if !hot.is_empty() {
+        let p = format!("{}/{}", hot, base);
+        if Path::new(&p).is_dir() {
+            return EpisodeDir::Moved(p);
+        }
+    }
+    let cold = norm(cold_root);
+    if !cold.is_empty() && moved.contains(&ep_key(base)) {
+        let p = format!("{}/{}", cold, base);
+        if Path::new(&p).is_dir() {
+            return EpisodeDir::Cold(p);
         }
     }
     EpisodeDir::Missing
+}
+
+/// How two episode names compare: case-folded on Windows (its filesystems fold case),
+/// exact elsewhere. The harness twin is `epdir.ep_key` (os.path.normcase).
+pub fn ep_key(base: &str) -> String {
+    if cfg!(windows) { base.to_lowercase() } else { base.to_string() }
+}
+
+/// The last component of a row's `dir`, whichever separator wrote it. A Windows-written
+/// backslash path read on Linux has no '/', and `Path::file_name` would return all of it.
+pub fn ep_basename(dir: &str) -> Option<&str> {
+    let t = dir.trim_end_matches(['/', '\\']);
+    let b = t.rsplit(['/', '\\']).next().unwrap_or("");
+    if b.is_empty() { None } else { Some(b) }
+}
+
+/// The move ledger, beside the registry (the harness twin is `epdir.ledger_path`).
+pub fn eps_moves_path(registry: &Path) -> PathBuf {
+    registry.parent().unwrap_or(Path::new(".")).join("eps-moves.jsonl")
+}
+
+/// The `ep` of every ledger row, by `ep_key`. Malformed lines are skipped; no ledger is
+/// an empty set (the cold tier never ran).
+pub fn load_moved_names(ledger: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if let Ok(text) = std::fs::read_to_string(ledger) {
+        for line in text.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                if let Some(ep) = v.get("ep").and_then(|x| x.as_str()) {
+                    out.insert(ep_key(ep));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// What `load_registry_report` did with each row's `dir`.
@@ -719,6 +771,8 @@ pub fn resolve_episode_dir(dir: &str, eps_root: Option<&str>) -> EpisodeDir {
 pub struct EpisodeDirCensus {
     pub as_written: usize,
     pub resolved: usize,
+    /// Rows found in the cold tier through the move ledger.
+    pub cold: usize,
     /// Names of rows skipped because their episode exists nowhere.
     pub missing: Vec<String>,
 }
@@ -729,11 +783,14 @@ pub struct EpisodeDirCensus {
 /// census once (it is called once per boot).
 pub fn load_registry(path: &Path) -> std::io::Result<Vec<Episode>> {
     let root = std::env::var("SP_EPS_DIR").ok();
-    let (eps, census) = load_registry_report(path, root.as_deref())?;
+    let cold = std::env::var("SP_EPS_COLD_DIR").ok().filter(|s| !s.trim().is_empty());
+    let moved = load_moved_names(&eps_moves_path(path));
+    let (eps, census) = load_registry_report(path, root.as_deref(), cold.as_deref(), &moved)?;
     let shown: Vec<&str> = census.missing.iter().take(8).map(|s| s.as_str()).collect();
     tracing::info!(
-        "B3 EPISODE DIRS: {} as written, {} resolved under SP_EPS_DIR={:?}, {} missing everywhere (skipped{}{})",
-        census.as_written, census.resolved, root.as_deref().unwrap_or(""), census.missing.len(),
+        "B3 EPISODE DIRS: {} as written, {} resolved under SP_EPS_DIR={:?}, {} in the cold tier under SP_EPS_COLD_DIR={:?}, {} missing everywhere (skipped{}{})",
+        census.as_written, census.resolved, root.as_deref().unwrap_or(""), census.cold,
+        cold.as_deref().unwrap_or(""), census.missing.len(),
         if shown.is_empty() { "" } else { ": " }, shown.join(", ")
     );
     Ok(eps)
@@ -742,7 +799,7 @@ pub fn load_registry(path: &Path) -> std::io::Result<Vec<Episode>> {
 /// `load_registry` with the root passed in and the census returned. Rows whose episode
 /// is `Missing` are left out of the result — selecting one could only end in a failed
 /// replay — and named in the census.
-pub fn load_registry_report(path: &Path, eps_root: Option<&str>) -> std::io::Result<(Vec<Episode>, EpisodeDirCensus)> {
+pub fn load_registry_report(path: &Path, eps_root: Option<&str>, cold_root: Option<&str>, moved: &HashSet<String>) -> std::io::Result<(Vec<Episode>, EpisodeDirCensus)> {
     let text = std::fs::read_to_string(path)?;
     let mut out = Vec::new();
     let mut census = EpisodeDirCensus::default();
@@ -766,12 +823,12 @@ pub fn load_registry_report(path: &Path, eps_root: Option<&str>) -> std::io::Res
             Some(s) => s,
             None => continue,
         };
-        let resolved = match resolve_episode_dir(dir, eps_root) {
+        let resolved = match resolve_episode_dir(dir, eps_root, cold_root, moved) {
             EpisodeDir::AsWritten => { census.as_written += 1; dir.to_string() }
             EpisodeDir::Moved(p) => { census.resolved += 1; p }
+            EpisodeDir::Cold(p) => { census.cold += 1; p }
             EpisodeDir::Missing => {
-                census.missing.push(Path::new(dir).file_name()
-                    .and_then(|b| b.to_str()).unwrap_or(dir).to_string());
+                census.missing.push(ep_basename(dir).unwrap_or(dir).to_string());
                 continue;
             }
         };
@@ -861,14 +918,54 @@ mod epdir_tests {
              {{\"dir\":\"{o}/ep-lost\",\"npos\":0,\"sig_bits\":\"{sig}\"}}\n");
         std::fs::write(&reg, &body).unwrap();
         let root = new.to_str().unwrap().replace('\\', "/");
-        let (eps, c) = load_registry_report(&reg, Some(&root)).unwrap();
+        let (eps, c) = load_registry_report(&reg, Some(&root), None, &HashSet::new()).unwrap();
         assert_eq!(eps.len(), 2, "the missing episode is skipped");
         assert_eq!(eps[1].dir, format!("{root}/ep-moved"), "the moved episode loads from the new root");
         assert_eq!((c.as_written, c.resolved), (1, 1));
         assert_eq!(c.missing, vec!["ep-lost".to_string()], "skipped by name");
         assert_eq!(std::fs::read_to_string(&reg).unwrap(), body, "the registry is never written");
-        let (eps0, c0) = load_registry_report(&reg, None).unwrap();
+        let (eps0, c0) = load_registry_report(&reg, None, None, &HashSet::new()).unwrap();
         assert_eq!((eps0.len(), c0.missing.len()), (1, 2), "no root: nothing resolves");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod eps_cold_tests {
+    use super::*;
+    #[test]
+    fn cold_resolves_through_the_ledger_only() {
+        let base = std::env::temp_dir().join(format!("epcold_{}", std::process::id()));
+        let (hot, cold) = (base.join("hot"), base.join("cold"));
+        std::fs::create_dir_all(hot.join("ep-hot")).unwrap();
+        std::fs::create_dir_all(cold.join("ep-cold")).unwrap();
+        std::fs::create_dir_all(cold.join("ep-stray")).unwrap();
+        let h = hot.to_str().unwrap().replace('\\', "/");
+        let c = cold.to_str().unwrap().replace('\\', "/");
+        let gone = base.join("gone").to_str().unwrap().replace('\\', "/");
+        let reg = base.join("registry.jsonl");
+        std::fs::write(eps_moves_path(&reg), "{\"ep\":\"ep-cold\",\"how\":\"move\"}\nnot json\n").unwrap();
+        let moved = load_moved_names(&eps_moves_path(&reg));
+        assert_eq!(resolve_episode_dir(&format!("{gone}/ep-hot"), Some(&h), Some(&c), &moved),
+                   EpisodeDir::Moved(format!("{h}/ep-hot")), "the hot root first");
+        assert_eq!(resolve_episode_dir(&format!("{gone}/ep-cold"), Some(&h), Some(&c), &moved),
+                   EpisodeDir::Cold(format!("{c}/ep-cold")), "the ledger names it, the cold root has it");
+        assert_eq!(resolve_episode_dir(&format!("{gone}/ep-stray"), Some(&h), Some(&c), &moved),
+                   EpisodeDir::Missing, "a cold dir the ledger does not name is not found");
+        assert_eq!(resolve_episode_dir(&format!("{gone}/ep-cold"), Some(&h), None, &moved),
+                   EpisodeDir::Missing, "no cold root: the tier is off");
+        let bs = format!("{}\\ep-cold", gone.replace('/', "\\"));
+        assert_eq!(resolve_episode_dir(&bs, Some(&h), Some(&c), &moved),
+                   EpisodeDir::Cold(format!("{c}/ep-cold")), "a backslash-written dir, on any OS");
+        if cfg!(windows) {
+            assert_eq!(resolve_episode_dir(&format!("{gone}/EP-COLD"), Some(&h), Some(&c), &moved),
+                       EpisodeDir::Cold(format!("{c}/EP-COLD")), "case-agnostic on Windows");
+        }
+        let sig = "0".repeat(64);
+        std::fs::write(&reg, format!("{{\"dir\":\"{gone}/ep-cold\",\"npos\":0,\"sig_bits\":\"{sig}\"}}\n")).unwrap();
+        let (eps, census) = load_registry_report(&reg, Some(&h), Some(&c), &moved).unwrap();
+        assert_eq!((eps.len(), census.cold), (1, 1), "the census counts it");
+        assert_eq!(eps[0].dir, format!("{c}/ep-cold"), "the Episode carries the cold path");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
