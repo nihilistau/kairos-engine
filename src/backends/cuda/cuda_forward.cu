@@ -5725,6 +5725,18 @@ static inline DevTensor moe_expert_view(const DevTensor *W, int e, int rows) {
  * expert GEMVs cannot be enqueued without knowing it. That costs one D2H sync per
  * layer per token — the reason this path is correct-not-fast, and the reason it
  * cannot be graph-captured. Stage 4 replaces it. */
+/* P1 speculation (see g_hf above). One block, one thread per expert: an expert's rank is the
+ * number of experts with a larger logit, ties to the lower id (moe_topk_host's order: softmax
+ * is monotone in the logit, so its top-NU is this one unless rounding ties two probabilities).
+ * Writes out[rank] = id and out[8 + rank] = its slot (-1 not resident, -2 no table). */
+__global__ void k_hf_spec(const float *log, int NE, int NU, const int *map_L, int *out) {
+    const int i = threadIdx.x;
+    if (i >= NE) return;
+    const float v = log[i]; int r = 0;
+    for (int j = 0; j < NE; j++) { const float w = log[j]; r += (w > v) || (w == v && j < i); }
+    if (r < NU) { out[r] = i; out[8 + r] = map_L ? map_L[i] : -2; }
+}
+
 static void moe_topk_host(const float *logits, int NE, int NU, int *idx, float *wt) {
     float mx = logits[0];
     for (int i = 1; i < NE; i++) if (logits[i] > mx) mx = logits[i];
@@ -5909,6 +5921,25 @@ static unsigned short     *g_ec_gup_bs    = NULL, *g_ec_down_bs    = NULL;
 static int                *g_ec_key = NULL;   /* [slots] -> L*NE+e, or -1 (empty)  */
 static unsigned long long *g_ec_use = NULL;   /* [slots] LRU stamp                 */
 static int                *g_ec_map = NULL;   /* [NL*NE] -> slot, or -1            */
+/* HOST-FREE LAYER, P1 (2026-10-19; docs/DESIGN-2026-09-29-host-free-layer.md). Measurement
+ * only, no behaviour change. SP_G4_HF_P1=1:
+ *   - g_ec_map is allocated MAPPED PINNED, so the GPU reads the live slot table zero-copy
+ *     through g_ec_map_dev: the device mirror, with no second copy to drift;
+ *   - after each decode layer's router GEMV, k_hf_spec writes the top-NU by LOGIT and each
+ *     one's slot into a mapped [16] row per layer (g_hf_spec_*): the speculation P2 will
+ *     launch the hit experts from;
+ *   - in MID, after the exact moe_topk_host, the host compares the two and counts set, order
+ *     and residency disagreements (g_hf_*), printed every 256 decode tokens.
+ * Off (unset/0): g_ec_map is a plain malloc, no kernel runs, nothing is compared. */
+static int                 g_hf = -1;
+static int                *g_ec_map_dev = NULL;
+static int                *g_hf_spec_h = NULL, *g_hf_spec_d = NULL;   /* [G4_HF_MAXL][16] */
+#define G4_HF_MAXL 64
+static long long           g_hf_layers = 0, g_hf_set = 0, g_hf_ord = 0, g_hf_res = 0;
+static int hf_on(void) {
+    if (g_hf < 0) { const char *e = getenv("SP_G4_HF_P1"); g_hf = (e && *e == '1') ? 1 : 0; }
+    return g_hf;
+}
 /* step C (2026-09-28): a slot being filled by an ASYNC admission copy is "pending" until its
  * event completes. Any user of a pending slot makes its stream wait on that event; the CPU
  * path instead treats a pending slot as a miss, so decode never waits on an admission. */
@@ -5964,7 +5995,9 @@ static int moe_ev_victim(void) {            /* caller holds the MoE lock */
 static void moe_cache_free(void) {
     void *d[] = { g_ec_gup_codes, g_ec_down_codes, g_ec_gup_bs, g_ec_down_bs };
     for (size_t i = 0; i < sizeof(d)/sizeof(d[0]); i++) if (d[i]) cudaFree(d[i]);
-    free(g_ec_key); free(g_ec_use); free(g_ec_map); free(g_ec_ks); g_ec_ks = NULL;
+    free(g_ec_key); free(g_ec_use); free(g_ec_ks); g_ec_ks = NULL;
+    if (g_ec_map_dev) { cudaFreeHost(g_ec_map); g_ec_map_dev = NULL; } else free(g_ec_map);
+    if (g_hf_spec_h) { cudaFreeHost(g_hf_spec_h); g_hf_spec_h = g_hf_spec_d = NULL; }
     g_ev_hlt = 0.0; g_ev_unit = 1.0; g_ev_base = 0; g_ev_all = 0;
     if (g_ec_pev) { for (int i = 0; i < g_ec_slots; i++) if (g_ec_pev[i]) cudaEventDestroy(g_ec_pev[i]); }
     free(g_ec_pev); free(g_ec_pend); g_ec_pev = NULL; g_ec_pend = NULL;
@@ -5998,7 +6031,22 @@ static void moe_cache_init(int NL, int NE, size_t gup_b, size_t gup_bsn,
     if (ok && down_bsn && cudaMalloc(&g_ec_down_bs, (size_t)slots * down_bsn * sizeof(unsigned short)) != cudaSuccess) ok = 0;
     g_ec_key = (int *)malloc((size_t)slots * sizeof(int));
     g_ec_use = (unsigned long long *)malloc((size_t)slots * sizeof(unsigned long long));
-    g_ec_map = (int *)malloc((size_t)all * sizeof(int));
+    if (hf_on()) {      /* P1: the slot table mapped, so the GPU reads it zero-copy */
+        if (cudaHostAlloc((void **)&g_ec_map, (size_t)all * sizeof(int), cudaHostAllocMapped) != cudaSuccess
+            || cudaHostGetDevicePointer((void **)&g_ec_map_dev, g_ec_map, 0) != cudaSuccess
+            || cudaHostAlloc((void **)&g_hf_spec_h, (size_t)G4_HF_MAXL * 16 * sizeof(int), cudaHostAllocMapped) != cudaSuccess
+            || cudaHostGetDevicePointer((void **)&g_hf_spec_d, g_hf_spec_h, 0) != cudaSuccess) {
+            cudaGetLastError();
+            fprintf(stderr, "    [g4-hf] P1: mapped slot table unavailable - P1 off\n");
+            if (g_ec_map) cudaFreeHost(g_ec_map);
+            if (g_hf_spec_h) cudaFreeHost(g_hf_spec_h);
+            g_ec_map = NULL; g_ec_map_dev = NULL; g_hf_spec_h = g_hf_spec_d = NULL; g_hf = 0;
+        } else {
+            fprintf(stderr, "    [g4-hf] P1 ARMED: slot table mapped (%lld entries), device top-%d "
+                            "speculation + parity against moe_topk_host\n", all, 8);
+        }
+    }
+    if (!g_ec_map) g_ec_map = (int *)malloc((size_t)all * sizeof(int));
     if (!ok || !g_ec_key || !g_ec_use || !g_ec_map) {
         fprintf(stderr, "    [g4-moe] expert cache alloc failed - pure streaming\n");
         moe_cache_free(); return;
@@ -6594,6 +6642,9 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                                              1.0f / sqrtf((float)E), ms->rin);
     MBK("router_prep");
     AMMD(&g_w.Wrouter[L], ms->rin, ms->log, n_tok);   /* [NE x n_tok] col-major */
+    if (n_tok == 1 && g_hf_spec_d && NE <= 1024 && NU <= 8 && L < G4_HF_MAXL)   /* P1: speculate */
+        k_hf_spec<<<1, NE, 0, st>>>(ms->log, NE, NU, g_ec_map_dev ? g_ec_map_dev + (size_t)L * NE : NULL,
+                                    g_hf_spec_d + (size_t)L * 16);
     k_rmsnorm<<<n_tok, 256, 0, st>>>(dx, g_w.pre_ffw2[L], E, eps, ms->in);
     k_moe_zero<<<(unsigned)((nE + 255) / 256), 256, 0, st>>>(ms->acc, (int)nE);
 
@@ -6674,6 +6725,34 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     memset(ms->bkt_n, 0, (size_t)NE * sizeof(int));
     for (int t = 0; t < n_tok; t++) {
         moe_topk_host(logh + (size_t)t * (size_t)NE, NE, NU, ms->idx_h, ms->wt_h);
+        /* P1 PARITY: the device speculation against the exact host selection. The MID sync
+         * above made the mapped row visible. Residency is compared for the experts both chose;
+         * a residency mismatch means the table moved between PRE (the kernel read it) and here
+         * (moe_admit_flush runs in between), which is the window P2's protocol has to close. */
+        if (n_tok == 1 && g_hf_spec_h && NU <= 8 && L < G4_HF_MAXL) {
+            const int *sp = g_hf_spec_h + (size_t)L * 16;
+            int set_bad = 0, ord_bad = 0, res_bad = 0;
+            for (int k = 0; k < NU; k++) {
+                if (sp[k] != ms->idx_h[k]) ord_bad = 1;
+                int f = -1;
+                for (int j = 0; j < NU; j++) if (sp[j] == ms->idx_h[k]) { f = j; break; }
+                if (f < 0) { set_bad = 1; continue; }
+                const int host_slot = g_ec_map[(long long)L * NE + ms->idx_h[k]];
+                if ((sp[8 + f] >= 0) != (host_slot >= 0)) res_bad = 1;
+            }
+            g_hf_layers++; g_hf_set += set_bad; g_hf_ord += ord_bad; g_hf_res += res_bad;
+            if (set_bad && g_hf_set <= 10) {
+                fprintf(stderr, "    [g4-hf] P1 set disagreement at L=%d: spec", L);
+                for (int k = 0; k < NU; k++) fprintf(stderr, " %d", sp[k]);
+                fprintf(stderr, " | host");
+                for (int k = 0; k < NU; k++) fprintf(stderr, " %d", ms->idx_h[k]);
+                fprintf(stderr, "\n");
+            }
+            if (g_hf_layers % (256LL * 30) == 0)
+                fprintf(stderr, "    [g4-hf] P1 parity: %lld decode layers, top-%d set disagrees %lld, "
+                                "order %lld, residency moved %lld\n",
+                        g_hf_layers, NU, g_hf_set, g_hf_ord, g_hf_res);
+        }
         /* ── EXPERT-ROUTE TRACE (SP_MOE_TRACE=1) ─────────────────────────────────
          * The measurement that decides whether MTP speculative decode can pay on
          * this model. Speculation wins when verifying k drafts costs ~one forward —
