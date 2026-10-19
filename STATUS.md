@@ -48,6 +48,12 @@ Q4_K_M GGUF (larger experts than this engine's Q4_0, so the gaps favour llama.cp
 - **Pinned vs pageable:** llama.cpp's default mmap load costs it 20% here. This engine registers
   its arena per tensor (60 ranges, 12.85 GB, none refused) and is not exposed.
 
+**Fixed the same day:** a batched prefill that failed inside cuBLAS left its CUDA error pending,
+and the per-token fallback's first check aborted on it, so the request failed although it had a
+fallback. The error is now consumed on the failure path. The daemon also logs its real VRAM
+budget from DXGI (`cudaMemGetInfo` reads 0 on WDDM): about 11.1 of the card's 12 GB, leaving
+~1.5 GB of headroom at a 5.5 GB cache.
+
 Offline replays the same day found no eviction change worth making:
 - Exposed time ranks policies exactly as misses do. The whole miss term is ~0.9 ms of a ~35 ms
   token at 5.5 GB.

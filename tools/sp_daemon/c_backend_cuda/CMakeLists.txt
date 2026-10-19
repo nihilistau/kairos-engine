@@ -69,6 +69,7 @@ add_library(sp_cuda_daemon_backend STATIC
     ${ENGINE_ROOT}/src/backends/cuda/cuda_backend.cu
     ${ENGINE_ROOT}/src/backends/cuda/cuda_forward.cu
     ${ENGINE_ROOT}/src/backends/cuda/moe_cpu_expert.c
+    ${ENGINE_ROOT}/src/backends/cuda/vram_budget_win.c
     ${ENGINE_ROOT}/lib/shannon-prime-system/core/xbar/xbar_episode.c
     ${CMAKE_CURRENT_SOURCE_DIR}/sp_daemon_cuda_glue.c
 )

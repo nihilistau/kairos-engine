@@ -8682,6 +8682,36 @@ static void g4_prefill_attn_flat(const float *dq, const float *K, const float *V
  * WHERE. This syncs and names the phase it is placed at, so the last checkpoint
  * that PASSES localizes the fault. Always on: a sync at a phase boundary is
  * negligible against a 2900-token prefill, and silence here has already cost days. */
+/* THE BUDGET, NOT cudaMemGetInfo (2026-10-19). On WDDM cudaMemGetInfo says free = 0 for this
+ * process (the batched guard below explains), so the engine had no number for how much VRAM
+ * it could still take. The binding limit is the per-process budget the OS hands out, which
+ * moves with everything else on the card. DXGI reports it (vram_budget_win.c). Two cold-boot
+ * failures of the first batched prefill on 2026-10-19 carried no budget at all; these lines
+ * make the next one carry it. Read-only: nothing here changes what runs. */
+extern "C" int sp_vram_budget_mib(const unsigned char luid[8], long long *budget_mib,
+                                  long long *usage_mib);
+static int g4_budget(long long *budget_mib, long long *usage_mib) {
+    static unsigned char luid[8]; static int have = -1;
+    if (have < 0) {
+        cudaDeviceProp pr; int dev = 0; have = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&pr, dev) == cudaSuccess) {
+            memcpy(luid, pr.luid, 8); have = 1;
+        }
+    }
+    return (have == 1) ? sp_vram_budget_mib(luid, budget_mib, usage_mib) : -1;
+}
+static void g4_budget_note(const char *where, size_t need_b) {
+    long long b = -1, u = -1;
+    if (g4_budget(&b, &u) == 0)
+        fprintf(stderr, "    [g4-kv] VRAM budget at %s: budget %lld MiB, usage %lld MiB, "
+                        "headroom %lld MiB, batched scratch %zu MiB\n",
+                where, b, u, b - u, need_b >> 20);
+    else
+        fprintf(stderr, "    [g4-kv] VRAM budget at %s: unknown (DXGI unavailable), "
+                        "batched scratch %zu MiB\n", where, need_b >> 20);
+    fflush(stderr);
+}
+
 static int g4_ck(const char *where) {
     /* Announce the FIRST time each phase is reached, pass or fail. A checkpoint that
      * only speaks on error cannot distinguish "this phase ran clean" from "this phase
@@ -8758,6 +8788,7 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
     /* ADR-011: the batched path uses g_w.Wgate/Wup/Wdown[L] (GPU), which are NOT resident for the
      * CPU-tail layers — decline so the per-token path (which routes those FFNs to the CPU) runs. */
     if (s->cpu_tail > 0) { sp_set_error("gemma4_kv_prefill_batched: declined (CPU-tail offload)"); return -1; }
+    size_t bp_need = 0;                     /* this batch's scratch estimate, for the failure line */
     /* PK2 wave-6 VRAM GUARD: the batched path materializes O(n) f32 activation scratch
      * (~15 n×E/n×FF buffers + the ring retained copies). On a 12GB card this oversubscribes
      * VRAM for large n and/or a large resident KV cache (PMAX), producing WDDM paging thrash
@@ -8773,6 +8804,14 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
         if (s->ring_W > 0) per_tok += (size_t)(4*KVb);      /* retained shared-owner copies */
         if (s->PL) per_tok += (size_t)(2*s->NL*s->PL + s->PL + Ebuf);
         const size_t need = per_tok * (size_t)n * sizeof(float);
+        bp_need = need;
+        /* Say the budget the first time, and whenever the headroom is within 512 MiB of this
+         * batch's scratch: the regime the 2026-10-19 cold-boot failures would have been in, if
+         * the guess is right. Silent otherwise, so a normal evening adds one line. */
+        { static int first = 1; long long bb = -1, uu = -1;
+          const int tight = (g4_budget(&bb, &uu) == 0) && ((long long)(need >> 20) + 512 > bb - uu);
+          if (first || tight) g4_budget_note(first ? "batched prefill (first)" : "batched prefill (tight)", need);
+          first = 0; }
         size_t freeb = 0, totalb = 0;
         if (cudaMemGetInfo(&freeb, &totalb) == cudaSuccess) {
             static long margin_mb = -1;
@@ -8881,6 +8920,19 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
         if (cudaMalloc(&dqxb,(size_t)n*padmax)!=cudaSuccess){ sp_set_error("batch-prefill dp4a qx OOM"); goto bdone; }
         BA(dsxb,(size_t)n*(padmax>>4));
     }
+    /* FAULT INJECTION for the fallback above (2026-10-19, a test knob, unmapped on purpose:
+     * serve.py strips it, so only a harness that launches the daemon directly can set it).
+     * SP_G4_INJECT_BATCHED_FAIL=1 fails this process's FIRST batched prefill the way the
+     * cold-boot failures did: a real allocation failure leaves cudaErrorMemoryAllocation
+     * pending, then the batch gives up. A oneshot must then complete on the per-token path. */
+    { static int inj = -1;
+      if (inj < 0) { const char *e = getenv("SP_G4_INJECT_BATCHED_FAIL"); inj = (e && *e == '1') ? 1 : 0; }
+      if (inj == 1) {
+          inj = 0; void *junk = NULL;
+          if (cudaMalloc(&junk, (size_t)1 << 46) == cudaSuccess) cudaFree(junk);
+          sp_set_error("batch-prefill: injected failure (SP_G4_INJECT_BATCHED_FAIL)");
+          goto bdone;
+      } }
     #define MMB(W,X,Y) do { if (!(dp4a_pf && gemm_q4b_dp4a_batched(st,(W),(X),(Y),n,dqxb,dsxb))) { \
         if (gemm_w_lift(cb,st,(W),(X),(Y),n,dscr)) goto bdone; } } while(0)
     /* embed dseq via arena gather (the dense reference model: no resident f32 embd) + sqrt(E) scale. */
@@ -9271,6 +9323,24 @@ bdone:
     if (dKg)cudaFree(dKg); if(dVg)cudaFree(dVg); if(dKs)cudaFree(dKs); if(dVs)cudaFree(dVs);
     if (dKcomb)cudaFree(dKcomb); if(dVcomb)cudaFree(dVcomb);
     free(hple);
+    /* THE FALLBACK MUST START CLEAN (2026-10-19). A failure in here is meant to be graceful:
+     * the caller drops to the per-token path, slow and never wrong. But the CUDA error that
+     * caused it (cuBLAS failing an allocation records cudaErrorMemoryAllocation) was left
+     * pending: the after-free check below runs only when nothing failed. The per-token path's
+     * first checkpoint (`prefill_pertok:entry`) then read that stale error and aborted the whole
+     * request. Logged twice on 2026-10-19: `cublasSgemm FAILED status=13`, then
+     * `CUDA fault detected at phase 'prefill_pertok:entry': out of memory`, and HTTP 500 for a
+     * request that had a working fallback. Drain the stream and consume the error here, and say
+     * what it was and what the budget was. A sticky error (an illegal address) stays sticky,
+     * and the next checkpoint still names it. */
+    if (rc != 0) {
+        const cudaError_t se = cudaStreamSynchronize(g_w.stream);
+        const cudaError_t le = cudaGetLastError();
+        fprintf(stderr, "    [g4-kv] BATCH-PREFILL failed (%s); stream sync: %s; pending CUDA "
+                        "error consumed: %s; the per-token fallback starts clean\n",
+                sp_last_error(), cudaGetErrorString(se), cudaGetErrorString(le));
+        g4_budget_note("batched prefill (failed)", bp_need);
+    }
     /* ADR-013: the cleanup itself is inside the bracket. 'prefill_batched:end' passes
      * and the NEXT request's first CUDA call reports an illegal access, with no
      * instrumented phase in between — so the ~20 cudaFree calls above are a prime
