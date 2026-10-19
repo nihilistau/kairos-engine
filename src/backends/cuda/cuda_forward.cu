@@ -2439,7 +2439,7 @@ typedef struct g4_moe_scratch_s {
     float *cin_h, *cout_h; int ccapE;
     float *cgu_h, *csx_h, *cinsx_h; signed char *cq_h, *cinq_h;   /* v2 bit-exact round trip */
     float *logd_h;   /* phase D: pinned [NE] router logits for n_tok == 1 (graph-capturable D2H) */
-    /* host-free layer P2.2 (hf_p2 = 2 only): the list-driven shadow's own device buffers, sized
+    /* host-free layer P2.2/P2.3 (hf_p2 = 2 or 1): the list-driven path's own device buffers, sized
      * by moe_grp_prealloc beside the grouped ones: gate_up [8][2FFE], GELU [8][FFE], int8 input
      * E + [8][FFE], block scales E/16 + [8][FFE/16], outputs [16][E], the shadow acc [E]. */
     float *hf_gu, *hf_h, *hf_out, *hf_sx, *hf_acc; signed char *hf_qx; int hfcapE, hfcapF;
@@ -5771,6 +5771,39 @@ __global__ void k_hf22_stage(const int *src, int *dst, int n) {
     const int i = threadIdx.x;
     if (i < n) dst[i] = __ldcv(&src[i]);
 }
+/* HOST-FREE LAYER P2.3 (hf_p2 = 1, serve): publish[L], one block, issued eagerly at the top of MID
+ * right after B[L] (map R5, option (a): the kernel copies what the host needs into mapped memory
+ * ITSELF, so the host never relies on a copy engine's writes being visible when a later kernel's
+ * flag is). Every thread writes its share, fences at system scope, then the block barrier; thread 0
+ * then writes the stamp and ctr, fences again, and writes pub last. The host spins on pub == seq
+ * (equality: a stale publish carries an older seq and can never satisfy a newer wait).
+ *   - spec_src (k_hf_spec's mapped row L, 16 ints) -> spec_dev (the scratch's device copy, what the
+ *     hit GEMVs read; k_hf22_stage's job in P2.2) AND -> pspec (mapped), so the host sees exactly the
+ *     row the GPU computed from;
+ *   - log[0..NE) (the router logits, device) -> plog (mapped);
+ *   - in[0..E) (pre_ffw_norm_2's output, the experts' input, device) -> in_pub (mapped).
+ * seq is the host's monotonic sequence number, passed by value (the host never reads a counter
+ * back, so an abandoned publish cannot desynchronise a mirror). */
+__global__ void k_hf23_publish(const int *spec_src, int *spec_dev, int *pspec,
+                               const float *log, int NE, float *plog,
+                               const float *in, int E, float *in_pub,
+                               unsigned long long *t_pub, unsigned int *ctr, unsigned int *pub,
+                               unsigned int seq) {
+    const int t = threadIdx.x;
+    if (t < 16) { const int v = __ldcv(&spec_src[t]); spec_dev[t] = v; ((volatile int *)pspec)[t] = v; }
+    for (int i = t; i < NE; i += blockDim.x) ((volatile float *)plog)[i] = log[i];
+    for (int i = t; i < E; i += blockDim.x) ((volatile float *)in_pub)[i] = in[i];
+    __threadfence_system();
+    __syncthreads();
+    if (t == 0) {
+        unsigned long long ts;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
+        *(volatile unsigned long long *)t_pub = ts;
+        *(volatile unsigned int *)ctr = seq;
+        __threadfence_system();
+        *(volatile unsigned int *)pub = seq;
+    }
+}
 /* k_moe_combine_ord's loop and arithmetic, list-driven. The list and the CPU rows may be mapped
  * host memory written by the host, so every read of them is ld.global.cv (__ldcv), never a cached
  * line. In P2.2's parity flow they are device copies (a DMA from the pinned mapped block, stream-
@@ -6071,6 +6104,7 @@ static int                 g_hf = -1;
 static int                *g_ec_map_dev = NULL;
 static int                *g_hf_spec_h = NULL, *g_hf_spec_d = NULL;   /* [G4_HF_MAXL][16] */
 #define G4_HF_MAXL 64
+#define G4_HF23_MAXNE 1024   /* P2.3: the published logits' capacity (k_hf_spec is one block of NE) */
 static long long           g_hf_layers = 0, g_hf_set = 0, g_hf_ord = 0, g_hf_res = 0;
 static int hf_on(void) {
     if (g_hf < 0) { const char *e = getenv("SP_G4_HF_P1"); g_hf = (e && *e == '1') ? 1 : 0; }
@@ -6080,7 +6114,7 @@ static int hf_on(void) {
  * No behaviour change. SP_G4_HF_P2: 0 off (default), 1 serve, 2 parity; read once.
  *   - P2.0 builds neither serving nor parity. With 1 or 2 it allocates the mapped block below
  *     (hf2_init, at weight build), whose handshake words, combine list and CPU rows are for
- *     P2.3/P2.4; nothing reads them yet.
+ *     P2.3/P2.4. (Since P2.2, 2 runs the parity shadow; since P2.3, 1 SERVES: see hf23_mid.)
  *   - With 2 it also times the decode MID on the GPU: k_hf2_stamp writes %globaltimer at the end
  *     of B[L] (captured into the segment graph with a fixed per-L destination, as k_hf_spec is),
  *     just before the grouped resident GEMVs, and just after k_moe_combine_ord (P2.1 adds a fourth,
@@ -6097,11 +6131,20 @@ struct g4_hf2 {
     /* P2.1: a fourth stamp, "hits finished": right after the grouped resident down-projection,
      * before any CPU-row upload or the combine. Splits the MID span into GPU work and GPU wait. */
     unsigned long long t_hits_out[G4_HF_MAXL];
+    /* P2.3 (hf_p2 = 1): what k_hf23_publish copies for the host - the speculation row the hit
+     * GEMVs read, the router logits - and its %globaltimer stamp per layer. ms->in's copy is the
+     * E floats after the rows (g_hf2_in_h). */
+    int                pspec[16];
+    float              plog[G4_HF23_MAXNE];
+    unsigned long long t_pub[G4_HF_MAXL];
 };
 #define G4_HF2_ROWS_OFF ((sizeof(g4_hf2) + 255) & ~(size_t)255)   /* rows[8][E] floats follow */
+#define G4_HF2_IN_OFF(E) (G4_HF2_ROWS_OFF + (((size_t)8 * (size_t)(E) * sizeof(float) + 255) & ~(size_t)255))
 static int     g_hf2_mode = -1;
 static g4_hf2 *g_hf2_h = NULL, *g_hf2_d = NULL;
 static float  *g_hf2_rows_h = NULL, *g_hf2_rows_d = NULL;
+static float  *g_hf2_in_h = NULL, *g_hf2_in_d = NULL;   /* P2.3: the published ms->in, [g_hf2_E] */
+static int     g_hf2_E = 0;
 static int hf2_on(void) {
     if (g_hf2_mode < 0) { const char *e = getenv("SP_G4_HF_P2");
         g_hf2_mode = (e && (e[0] == '1' || e[0] == '2')) ? e[0] - '0' : 0; }
@@ -6109,7 +6152,7 @@ static int hf2_on(void) {
 }
 static void hf2_init(int E) {
     if (!hf2_on() || g_hf2_h || E <= 0) return;
-    const size_t bytes = G4_HF2_ROWS_OFF + (size_t)8 * (size_t)E * sizeof(float);
+    const size_t bytes = G4_HF2_IN_OFF(E) + (size_t)E * sizeof(float);   /* P2.3: + the published ms->in */
     void *h = NULL, *d = NULL;
     if (cudaHostAlloc(&h, bytes, cudaHostAllocMapped) != cudaSuccess
         || cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
@@ -6123,10 +6166,14 @@ static void hf2_init(int E) {
     g_hf2_h = (g4_hf2 *)h; g_hf2_d = (g4_hf2 *)d;
     g_hf2_rows_h = (float *)((char *)h + G4_HF2_ROWS_OFF);
     g_hf2_rows_d = (float *)((char *)d + G4_HF2_ROWS_OFF);
-    fprintf(stderr, "    [g4-hf2] P2.0 (SP_G4_HF_P2=%d): mapped block %zu B; %s. Serving is not built: "
-                    "output unchanged\n", g_hf2_mode, bytes,
+    g_hf2_in_h = (float *)((char *)h + G4_HF2_IN_OFF(E));
+    g_hf2_in_d = (float *)((char *)d + G4_HF2_IN_OFF(E));
+    g_hf2_E = E;
+    fprintf(stderr, "    [g4-hf2] P2 (SP_G4_HF_P2=%d): mapped block %zu B; %s\n", g_hf2_mode, bytes,
             g_hf2_mode == 2 ? "GPU timing of the decode MID ON (printed every 256 tokens); "
-                              "P2.2 list-driven shadow + bitwise parity ON" : "timing off");
+                              "P2.2 list-driven shadow + bitwise parity ON; today's MID serves"
+                            : "P2.3 SERVES eligible decode layers (publish, speculative hits, list-driven "
+                              "combine; no MID sync); the rest run today's MID");
     fflush(stderr);
 }
 static inline int hf2_timing(int L) { return g_hf2_mode == 2 && g_hf2_d && L >= 0 && L < G4_HF_MAXL; }
@@ -6626,7 +6673,8 @@ static void moe_admit_enqueue(int L, int e, int NE, int E, int FFE) {
     std::lock_guard<std::mutex> lk(g_admq_mtx);
     if (g_admq_n < 64) { int *q = g_admq[g_admq_n++]; q[0] = L; q[1] = e; q[2] = NE; q[3] = E; q[4] = FFE; }
 }
-/* st: the decode stream (MID's). Only P2.1's g_ev_evict uses it. */
+/* st: the decode stream (MID's). Only P2.1's g_ev_evict uses it. Today's MID calls this at its
+ * top (before its sync); P2.3's hf23_mid calls it after its combine launch, behind the hit GEMVs. */
 static void moe_admit_flush(cudaStream_t st) {
     int n, q[64][5];
     { std::lock_guard<std::mutex> lk(g_admq_mtx); n = g_admq_n; memcpy(q, g_admq, sizeof(int) * 5 * (size_t)n); g_admq_n = 0; }
@@ -7011,7 +7059,7 @@ static int moe_cpu_rt_ensure(void) {
  * round-trip stream, under the grouped gate's own static conditions. Same buffers, same sizes,
  * same kernels: only WHEN they are allocated moves. MID keeps its first-use allocation as the
  * fallback, so a skipped or failed prealloc behaves exactly as before. */
-/* P2.2 (hf_p2 = 2): the list-driven shadow's buffers (see g4_moe_scratch). Zeroed once, so the
+/* P2.2/P2.3 (hf_p2 = 2 or 1): the list-driven buffers (see g4_moe_scratch). Zeroed once, so the
  * rows a block skipped (spec slot < 0) hold finite values for the 8-row GELU and quant, which run
  * over them; those rows are never read by the combine. 0 = sized, -1 = failed (all freed). */
 static void moe_hf_release(g4_moe_scratch *ms) {
@@ -7044,14 +7092,16 @@ static int moe_hf_alloc(g4_moe_scratch *ms, int E, int FFE) {
     cudaGetLastError();
     moe_hf_release(ms);
     ms->hf_failed = 1;
-    fprintf(stderr, "    [g4-hf2] P2.2: shadow buffers unavailable for this scratch - its layers count as skipped\n"); fflush(stderr);
+    fprintf(stderr, "    [g4-hf2] P2: list-driven buffers unavailable for this scratch - its layers count as "
+                    "skipped (P2.2) or ineligible (P2.3)\n"); fflush(stderr);
     return -1;
 }
 static void moe_grp_prealloc(cudaStream_t st, g4_moe_scratch *ms, int E, int FFE,
                              int use_int8, int cpu_mode) {
-    /* P2.2: with hf_p2 = 2 the shadow's buffers belong to the same "sized" (hf2_on() is 0 or 1
-     * otherwise, so this term is 1 and the hot-path test is unchanged) */
-    const int hf_sized = (hf2_on() != 2) || ms->hf_failed || (ms->hfcapE >= E && ms->hfcapF >= FFE);
+    /* P2.2/P2.3: with hf_p2 = 2 (the shadow) or 1 (P2.3 serves from the same buffers) they belong
+     * to the same "sized" (hf2_on() is 0 otherwise, so this term is 1 and the hot-path test is
+     * unchanged) */
+    const int hf_sized = (hf2_on() == 0) || ms->hf_failed || (ms->hfcapE >= E && ms->hfcapF >= FFE);
     const int sized = (ms->gcapE >= E && ms->gcapF >= FFE);
     if (sized && hf_sized && (!cpu_mode || (g_cpu_rt_st && g_cpu_rt_ev))) return;      /* the hot path */
     static int grp_env = -1;
@@ -7100,6 +7150,7 @@ static int hf22_mutant_rank(void) {
                                           "(combine list in rank order; parity must differ)\n"); fflush(stderr); } }
     return g_hf22_mut;
 }
+static void hf2_hits_launch(cudaStream_t st, g4_moe_scratch *ms, int E, int FFE);
 static int hf22_launch(cudaStream_t st, g4_moe_scratch *ms, int L, int E, int FFE, int NE, int NU,
                        int use_int8, int cpu_mode, int cpu_in_ok) {
     if (g_hf2_mode != 2 || !g_hf2_h || !g_hf_spec_d || !g_hf_spec_h || !g_ec_dmap_dev) return 0;
@@ -7113,11 +7164,19 @@ static int hf22_launch(cudaStream_t st, g4_moe_scratch *ms, int L, int E, int FF
     if (ms->hfcapE < E || ms->hfcapF < FFE || !ms->hf_gu || !ms->hf_spec || !ms->hf_list) { g_hf22_skip++; return 0; }
     /* another forward in this layer's window shares the spec row and P2's list: no shadow */
     if (!hf_win_valid()) { g_hf22_skip++; g_hf22_conc++; return 0; }
+    /* the speculation row, copied once into device memory: the GEMV blocks read that copy */
+    k_hf22_stage<<<1, 32, 0, st>>>(g_hf_spec_d + (size_t)L * 16, ms->hf_spec, 16);
+    hf2_hits_launch(st, ms, E, FFE);
+    return 1;
+}
+/* The list-driven hit experts (P2.2's shadow and P2.3's serve), on st, after ms->hf_spec holds this
+ * layer's speculation row in device memory: quant(in) -> grp_hf gate_up -> 8-row GELU -> 8-row
+ * quant -> grp_hf down -> ms->hf_out rows 0..7 (row r = speculation rank r; a block whose slot is
+ * < 0 exits, and its row is never read by the combine). */
+static void hf2_hits_launch(cudaStream_t st, g4_moe_scratch *ms, int E, int FFE) {
     const int npE = E, npF = FFE;
     signed char *qxE = ms->hf_qx, *qxF = ms->hf_qx + npE;
     float *sxE = ms->hf_sx, *sxF = ms->hf_sx + (npE >> 4);
-    /* the speculation row, copied once into device memory: the GEMV blocks read that copy */
-    k_hf22_stage<<<1, 32, 0, st>>>(g_hf_spec_d + (size_t)L * 16, ms->hf_spec, 16);
     const int *spec = ms->hf_spec;
     k_quant_act_int8<<<1, 256, 0, st>>>(ms->in, E, npE, qxE, sxE);
     { dim3 gr((unsigned)((2 * FFE + 7) / 8), (unsigned)G4G_MAX);
@@ -7132,7 +7191,6 @@ static int hf22_launch(cudaStream_t st, g4_moe_scratch *ms, int L, int E, int FF
       k_gemv_q4b_dp4a_grp_hf<<<gr, 256, 0, st>>>(spec, g_ec_down_codes, g_w.slot_down_bytes,
                                                  g_ec_down_bs, g_w.slot_down_bs_n, g_w.slot_down_ro,
                                                  FFE >> 5, FFE, qxF, npF, sxF, npF >> 4, ms->hf_out, E, E); }
-    return 1;
 }
 /* (c)'s extra CPU row: today's CPU-path v3 chain for expert e, from cin_h, into dst. 0 = done. */
 static int hf22_cpu_expert(g4_moe_scratch *ms, int L, int e, int E, int FFE, float *dst) {
@@ -7229,6 +7287,379 @@ static void hf22_parity(cudaStream_t st, g4_moe_scratch *ms, int L, int E, int F
                         "(GPU rows %lld, CPU rows %lld, extra CPU rows %lld)\n", L, bad, E, rel, rg, rc, rx);
         fflush(stderr);
     }
+}
+
+/* P1's parity count for one decode layer: the speculation row sp ([0..NU) ids, [8..8+NU) slots)
+ * against the exact host top-NU idx. Today's MID passes k_hf_spec's mapped row (after its sync);
+ * P2.3 passes the row k_hf23_publish copied, the one its hit GEMVs read. Counters only. */
+static void hf1_parity_count(int L, int NE, int NU, const int *sp, const int *idx) {
+    int set_bad = 0, ord_bad = 0, res_bad = 0;
+    for (int k = 0; k < NU; k++) {
+        if (sp[k] != idx[k]) ord_bad = 1;
+        int f = -1;
+        for (int j = 0; j < NU; j++) if (sp[j] == idx[k]) { f = j; break; }
+        if (f < 0) { set_bad = 1; continue; }
+        const int host_slot = g_ec_dmap ? ((volatile int *)g_ec_dmap)[(long long)L * NE + idx[k]]
+                                        : g_ec_map[(long long)L * NE + idx[k]];
+        if ((sp[8 + f] >= 0) != (host_slot >= 0)) res_bad = 1;
+    }
+    g_hf_layers++; g_hf_set += set_bad; g_hf_ord += ord_bad; g_hf_res += res_bad;
+    if (set_bad && g_hf_set <= 10) {
+        fprintf(stderr, "    [g4-hf] P1 set disagreement at L=%d: spec", L);
+        for (int k = 0; k < NU; k++) fprintf(stderr, " %d", sp[k]);
+        fprintf(stderr, " | host");
+        for (int k = 0; k < NU; k++) fprintf(stderr, " %d", idx[k]);
+        fprintf(stderr, "\n");
+    }
+    if (g_hf_layers % (256LL * 30) == 0)
+        fprintf(stderr, "    [g4-hf] P1 parity: %lld decode layers, top-%d set disagrees %lld, "
+                        "order %lld, residency moved %lld\n",
+                g_hf_layers, NU, g_hf_set, g_hf_ord, g_hf_res);
+}
+
+/* ── HOST-FREE LAYER P2.3: "P2-lite" SERVES (hf_p2 = 1; plan Task P2.3) ─────────────────────────
+ * Per eligible decode layer on the segment-graph path, MID becomes (hf23_mid):
+ *   GPU, all on st, issued right after B[L]: k_hf23_publish[L] (the speculation row -> the scratch's
+ *     device copy AND mapped; the NE router logits and the E floats of ms->in -> mapped; fence.sys;
+ *     t_pub; ctr = pub = seq) -> the hit GEMVs (hf2_hits_launch, k_gemv_q4b_dp4a_grp_hf on the
+ *     staged row; P2.2's kernels) -> stamp t_hits_out; then ONE cudaStreamQuery(st), so WDDM
+ *     submits the batch (map R13).
+ *   host: spins on the mapped pub == seq, bounded at 100 ms. No cudaStreamSynchronize: today's MID
+ *     sync is gone on this path. Then, from the PUBLISHED copies only:
+ *       - moe_topk_host on the published logits (unchanged; selection and weights stay on the host);
+ *       - act[] = the true top-NU in ascending expert id; w[k] = bktw * dsc, today's host float
+ *         product; an expert the published speculation row names at rank r with slot >= 0 was
+ *         computed by the GPU (row r); every other one is a CPU row 8 + j (map R7: the row, not
+ *         the host map, says what the GPU computed);
+ *       - bookkeeping in today's order (misses, then hits, ascending e); the g_ec_use stamp is
+ *         skipped when the slot has changed owner since the speculation read it (hazard D);
+ *       - the CPU experts (today's v3 chain, verbatim) on the PUBLISHED ms->in, into P2's rows;
+ *       - list + rows written, then one DMA each into the scratch (P2.2's fix: no zero-copy reads in
+ *         a hot kernel), then k_moe_combine_ord_hf into ms->acc (zeroed in PRE): today's loop, same
+ *         order, same w, same bits;
+ *       - stamp t_comb_out; THEN moe_admit_flush (moved from MID's top, so it no longer sits between
+ *         publish and combine), then step C as today (g_adm_ready, enqueue this layer's misses).
+ * Fallback, otherwise today's MID for the layer: ineligible (the static conditions below, the
+ * scratch not preallocated, hf_failed), concurrent (another forward in the window, G4FwdGuard), or
+ * a timeout - then a full sync, and today's MID for this layer and the rest of the token.
+ * Counted, and printed every 256 decode tokens:
+ *   "[g4-hf2] P2.3 serve: layers N, served S, fallback F (timeouts T, concurrent C, ineligible I),
+ *    publish->host p50/p99 us, wait for host X ms/token"
+ * T counts LAYERS (the one that timed out and the rest of its token), so N = S + F. publish->host is
+ * the host's sighting time minus the publish kernel's %globaltimer stamp; the two clocks have
+ * different epochs, so each token's fastest layer is taken as the offset and the percentiles are
+ * over the excess above it (they read "how much later than the best layer of the same token").
+ * "wait for host" is the GPU's t_hits_out -> t_comb_out per token, P2.1's definition.
+ * MUTANTS, test-only (unmapped, so serve.py strips them):
+ *   SP_G4_HF_P2_MUTANT_D2H_LOGITS=1 - the host reads the D2H'd logits (ms->logd_h, B[L]'s captured
+ *     copy) instead of the published ones, without a sync (map R5). It also compares the two on
+ *     every layer and prints how many differed: the only place a stale D2H can be seen at all.
+ *   SP_G4_HF_P2_MUTANT_FALLBACK=N - every Nth layer that would serve takes the timeout fallback
+ *     after its publish is seen: exercises the sync-and-today's-path route on the bench. */
+#define G4_HF23_BOUND_MS 100
+#define G4_HF23_WIN 8192
+static std::mutex          g_hf23_mtx;          /* the counters and samples below */
+static std::atomic<unsigned int> g_hf23_seq(0);
+static long long g_hf23_n = 0, g_hf23_served = 0, g_hf23_to = 0, g_hf23_conc = 0, g_hf23_inel = 0;
+static long long g_hf23_toev = 0, g_hf23_staled = 0, g_hf23_tok = 0, g_hf23_tl = 0;
+static double    g_hf23_wait_ns = 0.0;
+static int       g_hf23_pend = -1;              /* the last served layer whose stamps are unread */
+static long long g_hf23_tokd[G4_HF_MAXL]; static int g_hf23_tokd_n = 0;   /* this token's raw differences */
+static long long g_hf23_win[G4_HF23_WIN]; static int g_hf23_win_n = 0;    /* excess over the token's min */
+static long long g_hf23_mut_n = 0, g_hf23_mut_diff = 0;
+static int       g_hf23_mut = -1, g_hf23_fbn = -1;
+static long long g_hf23_fbc = 0;
+static thread_local int g_hf23_tok_fb = 0;      /* a timeout this token: today's MID until the next L == 0 */
+static thread_local int g_hf23_prev_today = 0;  /* this thread's previous MID synced (today's path) */
+static int hf23_mutant_d2h(void) {
+    if (g_hf23_mut < 0) { const char *e = getenv("SP_G4_HF_P2_MUTANT_D2H_LOGITS");
+        g_hf23_mut = (e && *e == '1') ? 1 : 0;
+        if (g_hf23_mut) { fprintf(stderr, "    [g4-hf2] P2.3: MUTANT SP_G4_HF_P2_MUTANT_D2H_LOGITS=1 (the host reads "
+                                          "B[L]'s D2H'd logits, unsynced, instead of the published copy)\n"); fflush(stderr); } }
+    return g_hf23_mut;
+}
+static int hf23_mutant_fallback(void) {
+    if (g_hf23_fbn < 0) { const char *e = getenv("SP_G4_HF_P2_MUTANT_FALLBACK");
+        g_hf23_fbn = (e && *e) ? atoi(e) : 0; if (g_hf23_fbn < 0) g_hf23_fbn = 0;
+        if (g_hf23_fbn) { fprintf(stderr, "    [g4-hf2] P2.3: MUTANT SP_G4_HF_P2_MUTANT_FALLBACK=%d (every %dth "
+                                          "served layer takes the timeout fallback)\n", g_hf23_fbn, g_hf23_fbn); fflush(stderr); } }
+    return g_hf23_fbn;
+}
+static int hf23_cmp_ll(const void *a, const void *b) {
+    const long long x = *(const long long *)a, y = *(const long long *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+/* caller holds g_hf23_mtx: account the last served layer's GPU stamps (a later sync or a later
+ * publish sighting covers them) */
+static void hf23_take_stamps_locked(void) {
+    if (g_hf23_pend < 0 || !g_hf2_h) return;
+    volatile g4_hf2 *h = g_hf2_h; const int p = g_hf23_pend;
+    const unsigned long long ho = h->t_hits_out[p], co = h->t_comb_out[p];
+    if (ho && co >= ho) g_hf23_wait_ns += (double)(co - ho);
+    h->t_hits_out[p] = 0; h->t_comb_out[p] = 0;
+    g_hf23_pend = -1;
+}
+/* caller holds g_hf23_mtx: the token's raw differences become excesses over its fastest layer */
+static void hf23_token_close_locked(void) {
+    if (g_hf23_tokd_n > 0) {
+        long long mn = g_hf23_tokd[0];
+        for (int i = 1; i < g_hf23_tokd_n; i++) if (g_hf23_tokd[i] < mn) mn = g_hf23_tokd[i];
+        for (int i = 0; i < g_hf23_tokd_n && g_hf23_win_n < G4_HF23_WIN; i++) g_hf23_win[g_hf23_win_n++] = g_hf23_tokd[i] - mn;
+    }
+    g_hf23_tokd_n = 0;
+}
+/* every MID with hf_p2 = 1 starts here: the layer count, the token boundary and the print */
+static void hf23_layer_begin(int L) {
+    std::lock_guard<std::mutex> lk(g_hf23_mtx);
+    if (g_hf23_prev_today) hf23_take_stamps_locked();   /* today's MID synced since */
+    if (L == 0) {
+        g_hf23_tok_fb = 0;
+        if (g_hf23_tl > 0) {
+            g_hf23_tl = 0; g_hf23_tok++;
+            hf23_token_close_locked();
+            if (g_hf23_tok % 256 == 0) {
+                double p50 = 0.0, p99 = 0.0;
+                if (g_hf23_win_n > 0) {
+                    qsort(g_hf23_win, (size_t)g_hf23_win_n, sizeof(long long), hf23_cmp_ll);
+                    p50 = (double)g_hf23_win[(g_hf23_win_n - 1) / 2] / 1e3;
+                    p99 = (double)g_hf23_win[(size_t)((double)(g_hf23_win_n - 1) * 0.99)] / 1e3;
+                }
+                fprintf(stderr, "    [g4-hf2] P2.3 serve: layers %lld, served %lld, fallback %lld (timeouts %lld, "
+                                "concurrent %lld, ineligible %lld), publish->host p50/p99 %.1f/%.1f us, "
+                                "wait for host %.2f ms/token\n",
+                        g_hf23_n, g_hf23_served, g_hf23_to + g_hf23_conc + g_hf23_inel, g_hf23_to, g_hf23_conc,
+                        g_hf23_inel, p50, p99, g_hf23_wait_ns / 1e6 / (double)g_hf23_tok);
+                fprintf(stderr, "    [g4-hf2] P2.3 detail: %lld tokens, timeout events %lld, hit slots that changed "
+                                "owner (use stamp skipped) %lld, publish->host samples %d\n",
+                        g_hf23_tok, g_hf23_toev, g_hf23_staled, g_hf23_win_n);
+                if (g_hf23_mut == 1)
+                    fprintf(stderr, "    [g4-hf2] P2.3 MUTANT D2H_LOGITS: the D2H'd logits differed from the "
+                                    "published copy in %lld of %lld layers\n", g_hf23_mut_diff, g_hf23_mut_n);
+                fflush(stderr);
+                g_hf23_win_n = 0;
+            }
+        }
+    }
+    g_hf23_n++; g_hf23_tl++;
+}
+/* a layer that runs today's MID (nothing of P2.3's in flight, or already synced): 0 */
+static int hf23_today(long long *ctr) {
+    std::lock_guard<std::mutex> lk(g_hf23_mtx);
+    (*ctr)++;
+    g_hf23_prev_today = 1;
+    return 0;
+}
+/* P2.3 publish -> hits -> spin -> service. 1 = served (MID is done; the combine is on st),
+ * 0 = run today's MID for this layer (anything P2.3 launched has been synced), -1 = error. */
+static int hf23_mid(cudaStream_t st, g4_moe_scratch *ms, int L, int E, int FFE, int NE, int NU,
+                    int use_int8, int cpu_mode, int cpu_in_ok) {
+    hf23_layer_begin(L);
+    /* ---- eligibility, otherwise today's MID ---- */
+    static int trace_ = -1, grp2_ = -1;
+    if (trace_ < 0) { const char *e = getenv("SP_MOE_TRACE"); trace_ = (e && *e == '1') ? 1 : 0; }
+    if (grp2_ < 0)  { const char *e = getenv("SP_G4_MOE_GROUPED"); grp2_ = (e && e[0] == '2') ? 1 : 0; }
+    if (!g_hf2_h || !g_hf2_d || !g_hf2_in_h || E > g_hf2_E || !g_hf_spec_d || !g_hf_spec_h
+        || !hf2_dmap_on() || !g_ec_dmap_dev || trace_ || grp2_
+        || NU < 1 || NU > 8 || NE > G4_HF23_MAXNE || L < 0 || L >= G4_HF_MAXL
+        || !(cpu_mode == 1 && cpu_in_ok && g_mufu_ok) || !use_int8 || !g_adm_ready
+        || g_ec_slots < 4 * G4G_MAX || g_w.slot_gup_prec != 4 || g_w.slot_down_prec != 4
+        || !g_w.slot_gup_bs_n || !g_w.slot_down_bs_n || (E & 31) != 0 || (FFE & 31) != 0 || FFE > 4096
+        || !g_ec_gup_codes || !g_ec_down_codes || !g_ec_gup_bs || !g_ec_down_bs
+        || g_w.slot_gup_nblk != (E >> 5) || g_w.slot_down_nblk != (FFE >> 5)
+        || ms->hf_failed || ms->hfcapE < E || ms->hfcapF < FFE || !ms->hf_gu || !ms->hf_out
+        || !ms->hf_spec || !ms->hf_list || !ms->idx_h || !ms->wt_h || !ms->bkt || !ms->bkt_n || !ms->bktw
+        || !g_w.dexps_scale_host || !g_w.dexps_scale_host[L])
+        return hf23_today(&g_hf23_inel);
+    if (g_hf23_tok_fb) return hf23_today(&g_hf23_to);            /* a timeout earlier in this token */
+    if (!hf_win_valid()) return hf23_today(&g_hf23_conc);       /* another forward in this layer's window */
+    /* ---- GPU: publish[L], the hit GEMVs, one stream query ---- */
+    const unsigned int seq = g_hf23_seq.fetch_add(1) + 1;
+    k_hf23_publish<<<1, 256, 0, st>>>(g_hf_spec_d + (size_t)L * 16, ms->hf_spec, g_hf2_d->pspec,
+                                      ms->log, NE, g_hf2_d->plog, ms->in, E, g_hf2_in_d,
+                                      &g_hf2_d->t_pub[L], &g_hf2_d->ctr, &g_hf2_d->pub, seq);
+    hf2_hits_launch(st, ms, E, FFE);
+    k_hf2_stamp<<<1, 1, 0, st>>>(&g_hf2_d->t_hits_out[L]);
+    {   const cudaError_t q = cudaStreamQuery(st);           /* WDDM: submit what is queued */
+        if (q != cudaSuccess && q != cudaErrorNotReady) {
+            char eb[160]; snprintf(eb, sizeof eb, "gemma4-MoE: P2.3 launch at L=%d : %s", L, cudaGetErrorString(q));
+            fprintf(stderr, "    [g4-moe] %s\n", eb); fflush(stderr); sp_set_error(eb); return -1; } }
+    /* ---- host: the bounded spin on pub == seq ---- */
+    volatile g4_hf2 *h = g_hf2_h;
+    const moe_clk::time_point t0 = moe_clk::now();
+    int seen = 0;
+    for (unsigned it = 1;; it++) {
+        if (h->pub == seq) { seen = 1; break; }
+        _mm_pause();
+        if ((it & 63) == 0 && moe_clk::now() - t0 > std::chrono::milliseconds(G4_HF23_BOUND_MS)) {
+            seen = (h->pub == seq); break; }
+    }
+    const moe_clk::time_point t_seen = moe_clk::now();
+    int forced = 0;
+    if (seen && hf23_mutant_fallback()) { std::lock_guard<std::mutex> lk(g_hf23_mtx); forced = (++g_hf23_fbc % g_hf23_fbn) == 0; }
+    if (!seen || forced) {
+        /* the fallback: a full sync (B[L]'s D2Hs are then visible to today's MID), today's MID for
+         * this layer and the rest of the token */
+        const cudaError_t ce = cudaStreamSynchronize(st);
+        if (ce != cudaSuccess) {
+            char eb[192]; snprintf(eb, sizeof eb, "gemma4-MoE: fault by P2.3 fallback sync at L=%d : %s", L, cudaGetErrorString(ce));
+            fprintf(stderr, "    [g4-moe] %s\n", eb); fflush(stderr); sp_set_error(eb); return -1; }
+        g_hf23_tok_fb = 1;
+        std::lock_guard<std::mutex> lk(g_hf23_mtx);
+        g_hf23_toev++; g_hf23_to++; g_hf23_prev_today = 1;
+        if (g_hf23_toev <= 5) {
+            fprintf(stderr, "    [g4-hf2] P2.3: %s at L=%d (seq %u; pub %u after the sync) - today's MID for the "
+                            "rest of this token\n", forced ? "forced fallback (mutant)" : "publish not seen within "
+                            "the 100 ms bound", L, seq, (unsigned)h->pub);
+            fflush(stderr);
+        }
+        return 0;
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    /* re-check the window (hf22_parity's practice): a forward that entered after the launches may
+     * have replayed its own segB[L] (k_hf_spec, same row) before this publish. The published row
+     * would still be one self-consistent snapshot, but there is no need to rely on that: sync,
+     * and today's MID serves this layer. */
+    if (!hf_win_valid()) {
+        if (cudaStreamSynchronize(st) != cudaSuccess) { cudaGetLastError(); sp_set_error("gemma4-MoE: P2.3 sync"); return -1; }
+        return hf23_today(&g_hf23_conc);
+    }
+    /* ---- host: service from the published copies ---- */
+    int spf[16];
+    for (int i = 0; i < 16; i++) spf[i] = h->pspec[i];
+    int sp_e[8], sp_s[8];
+    for (int r = 0; r < 8; r++) { sp_e[r] = r < NU ? spf[r] : -1; sp_s[r] = r < NU ? spf[8 + r] : -1; }
+    {   const unsigned long long tp = h->t_pub[L];
+        const long long tsn = (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(t_seen.time_since_epoch()).count();
+        std::lock_guard<std::mutex> lk(g_hf23_mtx);
+        hf23_take_stamps_locked();                           /* the previous served layer's (before publish[L]) */
+        if (tp && g_hf23_tokd_n < G4_HF_MAXL) g_hf23_tokd[g_hf23_tokd_n++] = tsn - (long long)tp; }
+    const float *lg = (const float *)g_hf2_h->plog;
+    float mlog[G4_HF23_MAXNE];
+    if (hf23_mutant_d2h() && ms->logd_h) {                  /* MUTANT: B[L]'s D2H'd copy, unsynced */
+        const volatile float *dl = (const volatile float *)ms->logd_h;
+        for (int i = 0; i < NE; i++) mlog[i] = dl[i];
+        const int differs = memcmp(mlog, lg, (size_t)NE * sizeof(float)) != 0;
+        { std::lock_guard<std::mutex> lk(g_hf23_mtx); g_hf23_mut_n++; g_hf23_mut_diff += differs; }
+        lg = mlog;
+    }
+    moe_topk_host(lg, NE, NU, ms->idx_h, ms->wt_h);
+    if (g_hf_spec_h && hf_on() && hf_win_valid()) hf1_parity_count(L, NE, NU, spf, ms->idx_h);
+    memset(ms->bkt_n, 0, (size_t)NE * sizeof(int));
+    for (int k = 0; k < NU; k++) {
+        const int e = ms->idx_h[k];
+        if (e < 0 || e >= NE) {                              /* today's message, on the logits served */
+            int n_nan = 0, n_inf = 0;
+            for (int i = 0; i < NE; i++) {
+                if (lg[i] != lg[i]) n_nan++;
+                else if (lg[i] > 3.0e38f || lg[i] < -3.0e38f) n_inf++;
+            }
+            char eb_[288];
+            snprintf(eb_, sizeof eb_,
+                     "gemma4-MoE: router produced no usable expert at L=%d t=0 k=%d "
+                     "(idx=%d) — %d/%d logits NaN, %d inf, head=[%g %g %g %g] (P2.3, published logits). "
+                     "idx=-1 means the top-k never fired, which means the router GEMM "
+                     "upstream is bad, NOT the bounds check here",
+                     L, k, e, n_nan, NE, n_inf, (double)lg[0], (double)lg[1], (double)lg[2], (double)lg[3]);
+            fprintf(stderr, "    [g4-moe] %s\n", eb_); fflush(stderr);
+            sp_set_error(eb_); return -1;
+        }
+        const int slot = ms->bkt_n[e]++;
+        ms->bkt [(size_t)e + slot] = 0;                      /* n_tok == 1: bkt[e * n_tok + slot] = t */
+        ms->bktw[(size_t)e + slot] = ms->wt_h[k];
+    }
+    int nact = 0, act[G4G_MAX];
+    for (int e = 0; e < NE; e++) if (ms->bkt_n[e]) {
+        if (nact >= G4G_MAX) { nact = -1; break; }
+        act[nact++] = e;
+    }
+    if (nact <= 0) {                                         /* cannot happen at n_tok == 1; be safe */
+        if (cudaStreamSynchronize(st) != cudaSuccess) { cudaGetLastError(); sp_set_error("gemma4-MoE: P2.3 sync"); return -1; }
+        return hf23_today(&g_hf23_inel);
+    }
+    const float *dsc = g_w.dexps_scale_host[L];
+    float w_[G4G_MAX]; int row_[G4G_MAX], oncpu[G4G_MAX] = {0}, ncpu = 0;
+    for (int k = 0; k < nact; k++) {
+        const int e = act[k];
+        w_[k] = ms->bktw[(size_t)e] * dsc[e];               /* today's wt.w[k], the same host float product */
+        int r = -1;
+        for (int t = 0; t < NU; t++) if (sp_e[t] == e) { r = t; break; }
+        if (r >= 0 && sp_s[r] >= 0) row_[k] = r;            /* the GPU computed it: rank row r */
+        else { row_[k] = -1; oncpu[k] = 1; ncpu++; }
+    }
+    /* bookkeeping, today's order: the misses (moe_ready_now's miss branch), then the hits
+     * (moe_resident's hit branch), each in ascending e */
+    {   G4_MOE_SHARED_LOCK();
+        for (int k = 0; k < nact; k++) if (oncpu[k]) {
+            const long long key = (long long)L * NE + act[k];
+            if (g_ev_hlt > 0.0) { ++g_ec_clock; moe_ev_touch(key); }
+        }
+        for (int k = 0; k < nact; k++) if (!oncpu[k]) {
+            const long long key = (long long)L * NE + act[k];
+            const int slot = sp_s[row_[k]];
+            g_ec_hit++;
+            const unsigned long long c = ++g_ec_clock;
+            if (slot < g_ec_slots && g_ec_key[slot] == (int)key) g_ec_use[slot] = c;
+            else g_hf23_staled++;                            /* hazard D: the slot changed owner */
+            moe_ev_touch(key);
+            if (((g_ec_hit + g_ec_miss) & 0x3FFFF) == 0) {
+                fprintf(stderr, "    [g4-moe] expert cache: %.1f%% hit (%lld hit / %lld miss)\n",
+                        100.0 * (double)g_ec_hit / (double)(g_ec_hit + g_ec_miss), g_ec_hit, g_ec_miss);
+                fflush(stderr);
+            }
+        }
+    }
+    /* the CPU experts: today's v3 chain, verbatim, on the PUBLISHED ms->in, into P2's rows */
+    int cjn = 0;
+    if (ncpu) {
+        const int npF = FFE;
+        static thread_local float hbuf[4096];
+        sp_moe_cpu_quant(g_hf2_in_h, E, (int8_t *)ms->cinq_h, ms->cinsx_h);
+        for (int k = 0; k < nact; k++) if (oncpu[k]) {
+            const int j = cjn, e = act[k];
+            const sp_frob_packed_tensor *pg = g_w.gup_pt[L], *pd = g_w.down_pt[L];
+            const uint8_t  *gcod = pg->codes + (size_t)pg->row_off[(size_t)e * (size_t)g_w.slot_gup_rows];
+            const uint16_t *gbs  = pg->bscale + (size_t)e * g_w.slot_gup_bs_n;
+            const uint8_t  *dcod = pd->codes + (size_t)pd->row_off[(size_t)e * (size_t)g_w.slot_down_rows];
+            const uint16_t *dbs  = pd->bscale + (size_t)e * g_w.slot_down_bs_n;
+            float *gu = ms->cgu_h + (size_t)j * 2 * FFE;
+            int8_t *hq = (int8_t *)ms->cq_h + (size_t)j * npF;
+            float *hs = ms->csx_h + (size_t)j * (npF >> 4);
+            if (sp_moe_cpu_gemv(gcod, gbs, E, 2 * FFE, (const int8_t *)ms->cinq_h, ms->cinsx_h, gu) ||
+                sp_moe_cpu_gelu(gu, FFE, hbuf) || sp_moe_cpu_quant(hbuf, FFE, hq, hs) ||
+                sp_moe_cpu_gemv(dcod, dbs, FFE, E, hq, hs, g_hf2_rows_h + (size_t)j * E)) {
+                sp_set_error("gemma4-MoE: CPU expert (v3) failed"); return -1; }
+            g_cpu_n++;
+            row_[k] = G4G_MAX + j;
+            cjn++;
+        }
+        g_cpu_layers++;
+    }
+    /* the list (ascending e over the true top-NU), then one DMA each, then the combine */
+    for (int k = 0; k < nact; k++) { h->list.w[k] = w_[k]; h->list.row[k] = row_[k]; }
+    h->list.n = nact;
+    _mm_sfence();
+    if (cudaMemcpyAsync(ms->hf_list, (const void *)&g_hf2_h->list, sizeof(g4_hf2_list), cudaMemcpyHostToDevice, st) != cudaSuccess
+        || (cjn > 0 && cudaMemcpyAsync(ms->hf_out + (size_t)G4G_MAX * E, g_hf2_rows_h, (size_t)cjn * E * sizeof(float),
+                                       cudaMemcpyHostToDevice, st) != cudaSuccess)) {
+        cudaGetLastError(); sp_set_error("gemma4-MoE: P2.3 list/rows upload"); return -1; }
+    k_moe_combine_ord_hf<<<(unsigned)((E + 255) / 256), 256, 0, st>>>(ms->acc, (const g4_hf2_list *)ms->hf_list,
+                                                                     ms->hf_out, ms->hf_out + (size_t)G4G_MAX * E, E);
+    k_hf2_stamp<<<1, 1, 0, st>>>(&g_hf2_d->t_comb_out[L]);
+    {   std::lock_guard<std::mutex> lk(g_hf23_mtx);
+        g_hf23_served++; g_hf23_pend = L; g_hf23_prev_today = 0; }
+    /* admission, AFTER the combine is on the stream: the previous layer's queue (its evictions
+     * invalidate in g_ec_dmap and order their copies behind this layer's hit GEMVs via g_ev_evict),
+     * then step C as today for this layer's misses */
+    moe_admit_flush(st);
+    if (ncpu) {
+        cudaEventRecord(g_adm_ready, st);
+        for (int k = 0; k < nact; k++) if (oncpu[k]) moe_admit_enqueue(L, act[k], NE, E, FFE);
+    }
+    if (g_cpu_layers && (g_cpu_layers % 3000) == 0 && ncpu) {
+        fprintf(stderr, "    [g4-moe] CPU path: %lld experts over %lld layers; admitted %lld, admission skipped %lld\n",
+                g_cpu_n, g_cpu_layers, g_adm_n, g_adm_skip); fflush(stderr);
+    }
+    return 1;
 }
 
 static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ffL,
@@ -7397,6 +7828,13 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     /* P2.0 stamp (a), B[L]'s last node: captured into segB[L] with this fixed destination */
     if (ph == 1 && hf2_timing(L)) k_hf2_stamp<<<1, 1, 0, st>>>(&g_hf2_d->t_b_end[L]);
     if (ph == 1) return 0;               /* PRE ends at the D2Hs; the sync belongs to MID */
+    /* P2.3 (hf_p2 = 1): serve this decode layer without MID's sync (hf23_mid). 0 = today's MID
+     * below runs this layer, exactly as with hf_p2 = 0 (anything P2.3 launched is synced by then). */
+    if (ph == 2 && n_tok == 1 && g_hf2_mode == 1) {
+        const int r23 = hf23_mid(st, ms, L, E, FFE, NE, NU, use_int8, cpu_mode, cpu_in_ok);
+        if (r23 < 0) return -1;
+        if (r23 > 0) return 0;           /* MID done: the combine is on st; TAIL recombines */
+    }
     /* P2.2 (hf_p2 = 2): the list-driven shadow's hit GEMVs, right after B[L], before the flush
      * (whose evictions then order their copies behind these readers) and before MID's sync */
     int hf22_on = 0;
@@ -7431,31 +7869,8 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
         /* (P2.1: the spec row is also allocated for P2 alone, so P1's parity is gated on hf_on();
          *  with P2's device table on, "resident" means resident in g_ec_dmap, the table the
          *  speculation read.) */
-        if (n_tok == 1 && g_hf_spec_h && hf_on() && NU <= 8 && L < G4_HF_MAXL && hf_win_valid()) {
-            const int *sp = g_hf_spec_h + (size_t)L * 16;
-            int set_bad = 0, ord_bad = 0, res_bad = 0;
-            for (int k = 0; k < NU; k++) {
-                if (sp[k] != ms->idx_h[k]) ord_bad = 1;
-                int f = -1;
-                for (int j = 0; j < NU; j++) if (sp[j] == ms->idx_h[k]) { f = j; break; }
-                if (f < 0) { set_bad = 1; continue; }
-                const int host_slot = g_ec_dmap ? ((volatile int *)g_ec_dmap)[(long long)L * NE + ms->idx_h[k]]
-                                                : g_ec_map[(long long)L * NE + ms->idx_h[k]];
-                if ((sp[8 + f] >= 0) != (host_slot >= 0)) res_bad = 1;
-            }
-            g_hf_layers++; g_hf_set += set_bad; g_hf_ord += ord_bad; g_hf_res += res_bad;
-            if (set_bad && g_hf_set <= 10) {
-                fprintf(stderr, "    [g4-hf] P1 set disagreement at L=%d: spec", L);
-                for (int k = 0; k < NU; k++) fprintf(stderr, " %d", sp[k]);
-                fprintf(stderr, " | host");
-                for (int k = 0; k < NU; k++) fprintf(stderr, " %d", ms->idx_h[k]);
-                fprintf(stderr, "\n");
-            }
-            if (g_hf_layers % (256LL * 30) == 0)
-                fprintf(stderr, "    [g4-hf] P1 parity: %lld decode layers, top-%d set disagrees %lld, "
-                                "order %lld, residency moved %lld\n",
-                        g_hf_layers, NU, g_hf_set, g_hf_ord, g_hf_res);
-        }
+        if (n_tok == 1 && g_hf_spec_h && hf_on() && NU <= 8 && L < G4_HF_MAXL && hf_win_valid())
+            hf1_parity_count(L, NE, NU, g_hf_spec_h + (size_t)L * 16, ms->idx_h);
         /* ── EXPERT-ROUTE TRACE (SP_MOE_TRACE=1) ─────────────────────────────────
          * The measurement that decides whether MTP speculative decode can pay on
          * this model. Speculation wins when verifying k drafts costs ~one forward —
@@ -7744,8 +8159,12 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                     /* DEFERRED (phase D): issuing ~4 copies per miss here cost the host ~110 us
                      * per miss while the GPU waited for the next layer's launches. Queue them;
                      * they are issued at the next router sync, after the next layer's graphs
-                     * are already on the stream. g_adm_ready still marks THIS point, and nothing
-                     * enqueued between here and the flush reads a cache slot. */
+                     * are already on the stream. g_adm_ready still marks THIS point. Today's MID
+                     * enqueues nothing between here and its flush that reads a cache slot. With
+                     * hf_p2 = 1 the next layer may be served by hf23_mid instead, whose hit GEMVs
+                     * DO read slots and are queued before its flush (after its combine): that is
+                     * safe only because the flush then invalidates in g_ec_dmap and orders each
+                     * copy behind g_ev_evict at the stream's tail (P2.1), which hf23_mid requires. */
                     cudaEventRecord(g_adm_ready, st);
                     for (int k = 0; k < nact; k++) if (oncpu[k] == 1) moe_admit_enqueue(L, act[k], NE, E, FFE);
                 }
