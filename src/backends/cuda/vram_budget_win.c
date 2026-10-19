@@ -54,7 +54,25 @@ int sp_vram_budget_mib(const unsigned char luid[8], long long *budget_mib, long 
     *usage_mib = (long long)(q.CurrentUsage >> 20);
     return 0;
 }
+/* SYSTEM COMMIT (2026-10-19, the same afternoon). The VRAM budget above was not what failed:
+ * three of her boots died with ~2 GB of VRAM headroom because the Windows COMMIT limit (RAM
+ * plus pagefile) was nearly spent. Her stack holds ~22 GB of commit, and VRAM allocations
+ * reserve backing commit too. When it runs out, cudaMalloc and cuBLAS launches fail "out of
+ * memory" with VRAM free. GlobalMemoryStatusEx reports it: ullTotalPageFile is the commit
+ * limit, ullAvailPageFile what is left. */
+int sp_commit_headroom_mib(long long *limit_mib, long long *avail_mib) {
+    MEMORYSTATUSEX m;
+    m.dwLength = sizeof(m);
+    if (!GlobalMemoryStatusEx(&m)) return -1;
+    *limit_mib = (long long)(m.ullTotalPageFile >> 20);
+    *avail_mib = (long long)(m.ullAvailPageFile >> 20);
+    return 0;
+}
 #else
+int sp_commit_headroom_mib(long long *limit_mib, long long *avail_mib) {
+    (void)limit_mib; (void)avail_mib;
+    return -1;
+}
 int sp_vram_budget_mib(const unsigned char luid[8], long long *budget_mib, long long *usage_mib) {
     (void)luid; (void)budget_mib; (void)usage_mib;
     return -1;

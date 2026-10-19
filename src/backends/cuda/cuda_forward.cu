@@ -8779,15 +8779,20 @@ static int g4_budget(long long *budget_mib, long long *usage_mib) {
     }
     return (have == 1) ? sp_vram_budget_mib(luid, budget_mib, usage_mib) : -1;
 }
+/* ...and the limit that actually failed that afternoon: system commit (vram_budget_win.c). */
+extern "C" int sp_commit_headroom_mib(long long *limit_mib, long long *avail_mib);
 static void g4_budget_note(const char *where, size_t need_b) {
-    long long b = -1, u = -1;
+    long long b = -1, u = -1, cl = -1, ca = -1;
+    char commit[96] = "";
+    if (sp_commit_headroom_mib(&cl, &ca) == 0)
+        snprintf(commit, sizeof commit, "; commit headroom %lld MiB of a %lld MiB limit", ca, cl);
     if (g4_budget(&b, &u) == 0)
         fprintf(stderr, "    [g4-kv] VRAM budget at %s: budget %lld MiB, usage %lld MiB, "
-                        "headroom %lld MiB, batched scratch %zu MiB\n",
-                where, b, u, b - u, need_b >> 20);
+                        "headroom %lld MiB, batched scratch %zu MiB%s\n",
+                where, b, u, b - u, need_b >> 20, commit);
     else
         fprintf(stderr, "    [g4-kv] VRAM budget at %s: unknown (DXGI unavailable), "
-                        "batched scratch %zu MiB\n", where, need_b >> 20);
+                        "batched scratch %zu MiB%s\n", where, need_b >> 20, commit);
     fflush(stderr);
 }
 
@@ -8884,11 +8889,12 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
         if (s->PL) per_tok += (size_t)(2*s->NL*s->PL + s->PL + Ebuf);
         const size_t need = per_tok * (size_t)n * sizeof(float);
         bp_need = need;
-        /* Say the budget the first time, and whenever the headroom is within 512 MiB of this
-         * batch's scratch: the regime the 2026-10-19 cold-boot failures would have been in, if
-         * the guess is right. Silent otherwise, so a normal evening adds one line. */
-        { static int first = 1; long long bb = -1, uu = -1;
-          const int tight = (g4_budget(&bb, &uu) == 0) && ((long long)(need >> 20) + 512 > bb - uu);
+        /* Say the budget the first time, and whenever VRAM headroom is within 512 MiB of this
+         * batch's scratch or COMMIT headroom within 2 GiB of it (commit was what the 2026-10-19
+         * failures ran out of). Silent otherwise, so a normal evening adds one line. */
+        { static int first = 1; long long bb = -1, uu = -1, cl = -1, ca = -1;
+          const int tight = ((g4_budget(&bb, &uu) == 0) && ((long long)(need >> 20) + 512 > bb - uu))
+                         || ((sp_commit_headroom_mib(&cl, &ca) == 0) && ((long long)(need >> 20) + 2048 > ca));
           if (first || tight) g4_budget_note(first ? "batched prefill (first)" : "batched prefill (tight)", need);
           first = 0; }
         size_t freeb = 0, totalb = 0;
