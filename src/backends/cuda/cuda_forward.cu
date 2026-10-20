@@ -10330,6 +10330,209 @@ static int g4_attn_v2(void) {
     return v;
 }
 
+/* ── PREFILL ATTENTION AS TWO TENSOR-CORE GEMMS (SP_G4_ATTN_PF_GEMM), 2026-10-20 ─────────────
+ * nsys, a 4,494-token prefill: 4.80 s of 14.3 s in attention. The tiled kernels launch one block
+ * per (query, head), walk the keys alone with the softmax on thread 0, and re-read each KV head
+ * once per query head that shares it. This path does the same arithmetic as
+ *     S = Q K^T (fp16 operands, fp32 accumulate)  ->  masked softmax (fp32)  ->  O = P V
+ * per block of QB queries and per KV head, with the GEMMs batched over that head's query heads.
+ * Same masks as k_attn_from_tiled_v2_T: query j is at t = pos0 + j and sees keys
+ * [max(0, t - win + 1), t]. Q and P become fp16 operands, the gemm_f16 precision, so it is
+ * parity-checked (=2), not assumed. 1 = serve, 2 = the tiled kernel serves and this runs beside it.
+ * Scratch is S (fp32) and P (fp16) for one KV head's queries, capped by QB shrinking. */
+static int g4_attn_pfgemm(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("SP_G4_ATTN_PF_GEMM");
+        v = (e && *e) ? atoi(e) : 0;
+        if (v < 0 || v > 2) v = 0;
+        if (v) { fprintf(stderr, "    [g4-kv] prefill attention: %s\n",
+                         v == 2 ? "GEMM PARITY (tiled serves, the GEMM path runs beside it)"
+                                : "GEMM (tensor-core S = QK^T, softmax, O = PV) serves");
+                 fflush(stderr); }
+    }
+    return v;
+}
+/* rows [lo, lo+nr) of a KV cache (row stride kvd) -> contiguous fp16 */
+template <typename KV>
+__global__ void k_pf_rows_to_h(const KV *src, int lo, int nr, int kvd, __half *dst) {
+    const size_t n = (size_t)nr * kvd;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+        dst[i] = __float2half(kv_ld(src, (size_t)lo * kvd + i));
+}
+/* one block per (head-in-group g, query row r): mask, scale, softmax over the nk keys, P as fp16.
+ * S/P are [group][QB][nk] (row-major per query row). */
+__global__ void k_pf_softmax(const float *S, __half *P, int nk, int QB, int qpos0, int kv_lo,
+                             int win, float ascale) {
+    const int r = blockIdx.x, g = blockIdx.y;
+    const float *s = S + ((size_t)g * QB + r) * nk;
+    __half *p = P + ((size_t)g * QB + r) * nk;
+    const int t = qpos0 + r;
+    const int lo = (win >= 0 && t - win + 1 > 0) ? t - win + 1 : 0;   /* absolute */
+    const int c0 = lo - kv_lo, c1 = t - kv_lo;                          /* valid columns, inclusive */
+    __shared__ float red[32];
+    float mx = -3.0e38f;
+    for (int c = threadIdx.x; c < nk; c += blockDim.x)
+        if (c >= c0 && c <= c1) mx = fmaxf(mx, s[c] * ascale);
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : -3.0e38f;
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (threadIdx.x == 0) red[0] = v;
+    }
+    __syncthreads();
+    mx = red[0];
+    __syncthreads();
+    float sm = 0.0f;
+    for (int c = threadIdx.x; c < nk; c += blockDim.x)
+        if (c >= c0 && c <= c1) sm += expf(s[c] * ascale - mx);
+    for (int o = 16; o > 0; o >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sm;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (threadIdx.x == 0) red[0] = v;
+    }
+    __syncthreads();
+    const float inv = 1.0f / red[0];
+    for (int c = threadIdx.x; c < nk; c += blockDim.x)
+        p[c] = __float2half((c >= c0 && c <= c1) ? expf(s[c] * ascale - mx) * inv : 0.0f);
+}
+/* ONE scratch pool for both instantiations (fp16 cache and fp32 comb/flat). Function-local statics
+ * in a template are per instantiation, so the first cut held two full sets: ~140 MB more VRAM at
+ * peak, and in parity mode a 5k-token prefill fell under the batched-prefill floor and declined. */
+static __half *g_pf_qh = nullptr, *g_pf_kh = nullptr, *g_pf_vh = nullptr, *g_pf_ph = nullptr;
+static float  *g_pf_sf = nullptr;
+static size_t  g_pf_cq = 0, g_pf_ck = 0, g_pf_cs = 0;
+/* the GEMM path into `out` ([n x qd] fp32). 0 = done; -1 = declined (the caller serves the tiled
+ * kernel), said once with the reason. */
+template <typename KV>
+static int g4_pfgemm(const float *dq, const KV *K, const KV *V, int pos0, int qd, int kvd, int hd,
+                     int grp, float ascale, int win, float *out, int n, int nh, cudaStream_t st) {
+    __half *&qh = g_pf_qh, *&kh = g_pf_kh, *&vh = g_pf_vh, *&ph = g_pf_ph; float *&sf = g_pf_sf;
+    size_t &cq = g_pf_cq, &ck = g_pf_ck, &cs = g_pf_cs; static int warned = 0;
+    const size_t SCAP = (size_t)64 << 20;                          /* S + P bytes per KV head */
+    const int nkvh = grp > 0 ? nh / grp : 0;
+    const char *why = nullptr;
+    if (nkvh <= 0 || nh % grp || nkvh * hd != kvd || nh * hd != qd) why = "head layout";
+    const int ctx_hi = pos0 + n;                                   /* keys [0, ctx_hi) may be read */
+    int QB = 256;
+    if (!why) {
+        for (;;) {
+            const int span = (win >= 0) ? (QB + win) : ctx_hi;
+            const int nk = span < ctx_hi ? span : ctx_hi;
+            if ((size_t)grp * QB * nk * 6 <= SCAP || QB <= 16) break;
+            QB >>= 1;
+        }
+    }
+    const int nk_max = (win >= 0) ? ((QB + win) < ctx_hi ? (QB + win) : ctx_hi) : ctx_hi;
+    const size_t need_q = (size_t)n * qd, need_kv = sizeof(KV) == 2 ? 0 : (size_t)nk_max * kvd,
+                 need_s = (size_t)grp * QB * nk_max;
+    auto grow = [&](void **p, size_t &cap, size_t need, size_t el) -> int {
+        if (cap >= need) return 0;
+        if (*p) cudaFree(*p);
+        *p = nullptr; cap = 0;
+        if (cudaMalloc(p, need * el) != cudaSuccess) { cudaGetLastError(); return -1; }
+        cap = need; return 0;
+    };
+    if (!why && grow((void **)&qh, cq, need_q, sizeof(__half))) why = "Q scratch";
+    /* pairs share one capacity, so a pair grows together or not at all */
+    auto grow2 = [&](void **a, size_t ea, void **b, size_t eb, size_t &cap, size_t need) -> int {
+        if (cap >= need && *a && *b) return 0;
+        if (*a) cudaFree(*a);
+        if (*b) cudaFree(*b);
+        *a = *b = nullptr; cap = 0;
+        if (cudaMalloc(a, need * ea) != cudaSuccess || cudaMalloc(b, need * eb) != cudaSuccess) {
+            cudaGetLastError(); if (*a) cudaFree(*a); if (*b) cudaFree(*b); *a = *b = nullptr; return -1; }
+        cap = need; return 0;
+    };
+    if (!why && need_kv && grow2((void **)&kh, sizeof(__half), (void **)&vh, sizeof(__half), ck, need_kv)) why = "K/V scratch";
+    if (!why && grow2((void **)&sf, sizeof(float), (void **)&ph, sizeof(__half), cs, need_s)) why = "S/P scratch";
+    if (why) {
+        if (!warned) { fprintf(stderr, "    [g4-kv] PREFILL GEMM ATTN declined (%s: n=%d qd=%d kvd=%d hd=%d grp=%d) — "
+                                       "the tiled kernel serves\n", why, n, qd, kvd, hd, grp); fflush(stderr); warned = 1; }
+        return -1;
+    }
+    cublasHandle_t cb = g_w.cublas;
+    cublasSetStream(cb, st);
+    k_f32_to_f16<<<512, 256, 0, st>>>(dq, qh, need_q);
+    const float one = 1.0f, zero = 0.0f;
+    for (int q0 = 0; q0 < n; q0 += QB) {
+        const int qb = (n - q0) < QB ? (n - q0) : QB;
+        const int t_lo = pos0 + q0, t_hi = pos0 + q0 + qb;          /* query positions [t_lo, t_hi) */
+        const int kv_lo = (win >= 0 && t_lo - win + 1 > 0) ? t_lo - win + 1 : 0;
+        const int nk = t_hi - kv_lo;
+        const __half *Kb, *Vb; int ldk;
+        if (sizeof(KV) == 2) { Kb = (const __half *)K + (size_t)kv_lo * kvd; Vb = (const __half *)V + (size_t)kv_lo * kvd; }
+        else {
+            k_pf_rows_to_h<KV><<<512, 256, 0, st>>>(K, kv_lo, nk, kvd, kh);
+            k_pf_rows_to_h<KV><<<512, 256, 0, st>>>(V, kv_lo, nk, kvd, vh);
+            Kb = kh; Vb = vh;
+        }
+        ldk = kvd;
+        for (int kv = 0; kv < nkvh; kv++) {
+            /* S^T (nk x qb, col-major, ld nk) = K_kv (nk x hd) . Q_g^T (hd x qb), batched over g */
+            cublasStatus_t e1 = cublasGemmStridedBatchedEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, nk, qb, hd, &one,
+                Kb + (size_t)kv * hd, CUDA_R_16F, ldk, 0,
+                qh + (size_t)q0 * qd + (size_t)kv * grp * hd, CUDA_R_16F, qd, hd,
+                &zero, sf, CUDA_R_32F, nk, (long long)nk * qb, grp,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            k_pf_softmax<<<dim3((unsigned)qb, (unsigned)grp), 256, 0, st>>>(sf, ph, nk, qb, t_lo, kv_lo, win, ascale);
+            /* O_g^T (hd x qb, ld qd) = V_kv^T (hd x nk) . P_g^T (nk x qb), batched over g */
+            cublasStatus_t e2 = cublasGemmStridedBatchedEx(cb, CUBLAS_OP_N, CUBLAS_OP_N, hd, qb, nk, &one,
+                Vb + (size_t)kv * hd, CUDA_R_16F, ldk, 0,
+                ph, CUDA_R_16F, nk, (long long)nk * qb,
+                &zero, out + (size_t)q0 * qd + (size_t)kv * grp * hd, CUDA_R_32F, qd, hd, grp,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (e1 != CUBLAS_STATUS_SUCCESS || e2 != CUBLAS_STATUS_SUCCESS) {
+                fprintf(stderr, "    [g4-kv] PREFILL GEMM ATTN: cublas failed (%d, %d) — output INVALID for this layer\n",
+                        (int)e1, (int)e2); fflush(stderr);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+/* parity for the GEMM path: run it into scratch beside the served output, print the worst relL2
+ * per layer kind (global = win < 0, SWA otherwise) on a new worst. */
+template <typename KV>
+static void g4_pfgemm_parity(const float *dq, const KV *K, const KV *V, int pos0, int qd, int kvd,
+                             int hd, int grp, float ascale, int win, const float *served, int n,
+                             int nh, int L, cudaStream_t st) {
+    static float *scr = nullptr; static size_t cap = 0;
+    static unsigned *dcmp = nullptr; static double *dsum = nullptr;
+    static double worst[2] = {0.0, 0.0};
+    const size_t need = (size_t)n * qd;
+    if (cap < need) {
+        if (scr) cudaFree(scr);
+        if (cudaMalloc((void **)&scr, need * sizeof(float)) != cudaSuccess) { cudaGetLastError(); scr = nullptr; cap = 0; return; }
+        cap = need;
+    }
+    if (!dcmp && cudaMalloc((void **)&dcmp, 2 * sizeof(unsigned)) != cudaSuccess) return;
+    if (!dsum && cudaMalloc((void **)&dsum, 2 * sizeof(double)) != cudaSuccess) return;
+    if (g4_pfgemm<KV>(dq, K, V, pos0, qd, kvd, hd, grp, ascale, win, scr, n, nh, st)) return;
+    cudaMemsetAsync(dcmp, 0, 2 * sizeof(unsigned), st);
+    cudaMemsetAsync(dsum, 0, 2 * sizeof(double), st);
+    k_attn_parity_cmp<<<256, 256, 0, st>>>(served, scr, need, dcmp, dsum);
+    unsigned hb[2] = {0, 0}; double hs[2] = {0.0, 0.0};
+    cudaMemcpyAsync(hb, dcmp, 2 * sizeof(unsigned), cudaMemcpyDeviceToHost, st);
+    cudaMemcpyAsync(hs, dsum, 2 * sizeof(double), cudaMemcpyDeviceToHost, st);
+    if (cudaStreamSynchronize(st) != cudaSuccess) return;
+    float mabs; memcpy(&mabs, &hb[0], 4);
+    const double rl2 = hs[1] > 0.0 ? sqrt(hs[0] / hs[1]) : 0.0;
+    const int kind = win < 0 ? 0 : 1;
+    if (rl2 > worst[kind]) {
+        worst[kind] = rl2;
+        fprintf(stderr, "    [g4-kv] PREFILL GEMM ATTN PARITY new worst (%s): relL2 %.3e  max|d| %.3e  "
+                        "(L=%d n=%d pos0=%d hd=%d grp=%d win=%d)\n", kind ? "swa" : "global", rl2,
+                (double)mabs, L, n, pos0, hd, grp, win);
+        fflush(stderr);
+    }
+}
+
 /* ONE DOOR for the tiled prefill attention. Three call sites launch it — the fp16 cache,
  * the fp32 cache, and the SWA comb under the ring — and without this each would need its own
  * copy of the v1/v2/parity choice. That is the shape of bug this file keeps paying for, and
@@ -10342,10 +10545,14 @@ static void g4_prefill_attn(const float *dq, const KV *K, const KV *V, int pos0,
     const size_t shm1 = (size_t)(PT + hd) * sizeof(float);
     const size_t shm2 = (size_t)(PT + hd + hd) * sizeof(float);   /* v2 also stages the query */
     const int mode = g4_attn_v2();
+    const int pg = g4_attn_pfgemm();
+    if (pg == 1 && g4_pfgemm<KV>(dq, K, V, pos0, qd, kvd, hd, grp, ascale, win, dao, n, nh, st) == 0)
+        return;
 
     if (mode == 1) {
         k_attn_from_tiled_v2_T<KV><<<n * nh, bd, shm2, st>>>(
             dq, K, V, pos0, qd, kvd, hd, grp, ascale, win, dao, PT);
+        if (pg == 2) g4_pfgemm_parity<KV>(dq, K, V, pos0, qd, kvd, hd, grp, ascale, win, dao, n, nh, L, st);
         return;
     }
     /* V1 ALWAYS RUNS INTO `dao`, in every mode including parity — so what she is served is
@@ -10411,10 +10618,14 @@ static void g4_prefill_attn_flat(const float *dq, const float *K, const float *V
     int bd2 = ((bd1 + 31) / 32) * 32; if (bd2 > 1024) bd2 = 1024;
     const size_t shm1 = (size_t)n_tok * sizeof(float);
     const size_t shm2 = (size_t)(n_tok + hd) * sizeof(float);       /* + the staged query */
+    const int pg = g4_attn_pfgemm();
+    if (pg == 1 && g4_pfgemm<float>(dq, K, V, 0, qd, kvd, hd, grp, ascale, win, dao, n_tok, nh, st) == 0)
+        return;
 
     if (mode == 1) {
         k_attn_v2<<<n_tok * nh, bd2, shm2, st>>>(
             dq, K, V, n_tok, qd, kvd, hd, grp, ascale, win, dao);
+        if (pg == 2) g4_pfgemm_parity<float>(dq, K, V, 0, qd, kvd, hd, grp, ascale, win, dao, n_tok, nh, L, st);
         return;
     }
     k_attn<<<n_tok * nh, bd1, shm1, st>>>(       /* V1 is what is SERVED, in every mode */
