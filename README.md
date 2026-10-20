@@ -604,7 +604,7 @@ armed on someone else's hardware. It also means you have to ask for it.
 | `SP_G4_MOE_OVERLAP_PREFILL` | `0` | `1` | the same pipeline for the batched prefill (needs `SP_G4_MOE_OVERLAP`); output identical |
 | `SP_G4_ATTN_SPLIT` | `0` (tiled) | `1` | split-K decode attention. `2` = parity: tiled served |
 | `SP_G4_ATTN_PF_GEMM` | `0` (tiled) | `1` | prefill attention as tensor-core GEMMs. `2` = parity: tiled served |
-| `SP_G4_DEQ_H8` | `0` | `0` (measured, bit-identical; not yet armed) | eight-wide Q4 -> fp16 dequant for the prefill GEMMs, bit-identical. `2` = bitwise parity |
+| `SP_G4_DEQ_H8` | `0` | `1` (since 2026-10-21) | eight-wide Q4 -> fp16 dequant for the prefill GEMMs, bit-identical. `2` = bitwise parity |
 | `SP_G4_HF_P1`, `SP_G4_HF_P2` | `0` | P1 `1`, P2 `0` | the host-free layer's device top-8 / slot table (P1) and its serving path (P2, paused: correct, not faster) |
 
 Kairos maps each of these from its profile, so arming them is a profile edit rather than an
