@@ -7262,6 +7262,14 @@ static void g4_nan_probe(const char *tag, int L, const float *d, cudaStream_t st
  * already stages each expert once for the whole token set, so it has little left to hide.
  * Decode is where n_tok == 1 makes "once per expert per layer" mean "once per TOKEN".
  *
+ * THAT ASSUMPTION WAS MEASURED WRONG (2026-10-20, docs/BENCH-2026-10-20-apex-break-even-and-
+ * prefill-profile.md). Once per expert per layer is still ~120 of 128 experts per chunk, and
+ * nsys put a 4,494-token prefill at 4.44 s of expert copies overlapped with exactly 0.00 s of
+ * kernels, of a 14.3 s window. SP_G4_MOE_OVERLAP_PREFILL=1 lets the same two-pass pipeline run
+ * for n_tok > 1: same experts, same order, same kernels, so the output is unchanged. The
+ * active set is then up to NE, so G4_MOE_OVL_MAX is NE-sized, and the 4x-active-set guard below
+ * still decides (1,925 slots against ~120 active).
+ *
  * THE TWO HAZARDS, BOTH REAL:
  *   1. A copy must not overwrite a cache slot that earlier work is still reading. A single
  *      stream made that impossible by construction and this removes that guarantee, so the
@@ -7272,11 +7280,21 @@ static void g4_nan_probe(const char *tag, int L, const float *d, cudaStream_t st
  *      evict a slot another expert in the same layer is about to use. Resolving stamps each
  *      slot most-recently-used as it goes, and the guard below refuses to enable overlap
  *      unless the cache holds at least four times the active set. */
-#define G4_MOE_OVL_MAX 32
+#define G4_MOE_OVL_MAX 128
 static cudaStream_t g_moe_cps  = NULL;
 static cudaEvent_t  g_moe_ev[G4_MOE_OVL_MAX];
 static cudaEvent_t  g_moe_ready = NULL;
 static int          g_moe_overlap = -1;          /* -1 untried, 0 off, 1 on */
+static int          g_moe_ovl_prefill = -1;      /* SP_G4_MOE_OVERLAP_PREFILL: the pipeline for n_tok > 1 */
+static int moe_overlap_prefill_on(void) {
+    if (g_moe_ovl_prefill < 0) {
+        const char *e = getenv("SP_G4_MOE_OVERLAP_PREFILL");
+        g_moe_ovl_prefill = (e && *e == '1') ? 1 : 0;
+        if (g_moe_ovl_prefill) { fprintf(stderr, "    [g4-moe] overlap: PREFILL too (SP_G4_MOE_OVERLAP_PREFILL=1; "
+                                                 "needs SP_G4_MOE_OVERLAP=1)\n"); fflush(stderr); }
+    }
+    return g_moe_ovl_prefill;
+}
 
 #define G4_MOE_BKT_MAXE 256
 static int moe_overlap_on(void) {
@@ -8078,6 +8096,13 @@ static float *g_pf_log_h = NULL;                           /* pinned [PF_MAXL * 
 static unsigned char g_pf_valid[PF_MAXL];                  /* row L has a D2H behind it */
 static long long g_pf_tok = 0, g_pf_routed = 0, g_pf_miss = 0, g_pf_m8 = 0, g_pf_m12 = 0, g_pf_m16 = 0;
 static long long g_pf_r8 = 0, g_pf_up8 = 0, g_pf_use8 = 0, g_pf_up16 = 0, g_pf_use16 = 0;
+/* the narrower rules (2026-10-20, second cut): per predicted RANK r, the misses at rank r and the
+ * uploads at rank r (non-resident) with how many were used; and per probability THRESHOLD (the
+ * predicted softmax weight), the same three. Cumulative sums give "top-k" for any k <= 16. */
+#define PF_NTH 4
+static const float g_pf_th[PF_NTH] = { 0.02f, 0.05f, 0.10f, 0.20f };
+static long long g_pf_mr[16], g_pf_ur[16], g_pf_uu[16];
+static long long g_pf_tm[PF_NTH], g_pf_tu[PF_NTH], g_pf_tuse[PF_NTH];
 static inline int pf_on(void) {
     if (g_pf_on < 0) { const char *e = getenv("SP_G4_PF_ORACLE"); g_pf_on = (e && *e == '1') ? 1 : 0;
         if (g_pf_on) { fprintf(stderr, "    [g4-pf] PREFETCH ORACLE ON (SP_G4_PF_ORACLE=1): "
@@ -8121,7 +8146,25 @@ static void pf_score(int L, int NE, int NU, const int *idx) {
         const int res = g_ec_map[(long long)L * NE + e] >= 0;
         g_pf_routed++;
         if (rank < 8) g_pf_r8++;
-        if (!res) { g_pf_miss++; if (rank < 8) g_pf_m8++; if (rank < 12) g_pf_m12++; if (rank < 16) g_pf_m16++; }
+        if (!res) { g_pf_miss++; if (rank < 8) g_pf_m8++; if (rank < 12) g_pf_m12++; if (rank < 16) g_pf_m16++;
+                    if (rank < 16) g_pf_mr[rank]++; }
+    }
+    {   /* thresholds on the predicted softmax weight, over all NE experts */
+        float mx = p[0];
+        for (int e = 1; e < NE; e++) if (p[e] > mx) mx = p[e];
+        double z = 0.0;
+        for (int e = 0; e < NE; e++) z += exp((double)(p[e] - mx));
+        for (int e = 0; e < NE; e++) {
+            const double pr = exp((double)(p[e] - mx)) / z;
+            if (pr < g_pf_th[0]) continue;
+            const int res = g_ec_map[(long long)L * NE + e] >= 0;
+            int used = 0;
+            for (int k = 0; k < NU; k++) if (idx[k] == e) { used = 1; break; }
+            for (int t = 0; t < PF_NTH; t++) {
+                if (pr < g_pf_th[t]) break;
+                if (!res) { g_pf_tu[t]++; g_pf_tuse[t] += used; if (used) g_pf_tm[t]++; }
+            }
+        }
     }
     for (int r = 0; r < nt; r++) {
         const int e = top[r];
@@ -8130,6 +8173,7 @@ static void pf_score(int L, int NE, int NU, const int *idx) {
         for (int k = 0; k < NU; k++) if (idx[k] == e) { used = 1; break; }
         if (r < 8) { g_pf_up8++; g_pf_use8 += used; }
         g_pf_up16++; g_pf_use16 += used;
+        g_pf_ur[r]++; g_pf_uu[r] += used;
     }
     if (L == g_pf_NL - 1 && (++g_pf_tok % 256) == 0) {
         const double T = (double)g_pf_tok, m = g_pf_miss > 0 ? (double)g_pf_miss : 1.0;
@@ -8140,6 +8184,20 @@ static void pf_score(int L, int NE, int NU, const int *idx) {
                 100.0 * g_pf_m16 / m, g_pf_routed ? 100.0 * g_pf_r8 / g_pf_routed : 0.0,
                 g_pf_up8 / T, g_pf_up8 ? 100.0 * g_pf_use8 / g_pf_up8 : 0.0,
                 g_pf_up16 / T, g_pf_up16 ? 100.0 * g_pf_use16 / g_pf_up16 : 0.0);
+        if ((g_pf_tok % 768) == 0) {
+            /* top-k for k = 1..6 and the thresholds: misses covered, uploads/token, useful share */
+            char buf[1024]; int o = 0; long long cm = 0, cu = 0, cuse = 0;
+            for (int k = 0; k < 6; k++) {
+                cm += g_pf_mr[k]; cu += g_pf_ur[k]; cuse += g_pf_uu[k];
+                o += snprintf(buf + o, sizeof buf - o, " top-%d %.1f%%/%.2f/%.0f%%;", k + 1,
+                              100.0 * cm / m, cu / T, cu ? 100.0 * cuse / cu : 0.0);
+            }
+            for (int t = 0; t < PF_NTH; t++)
+                o += snprintf(buf + o, sizeof buf - o, " p>=%.2f %.1f%%/%.2f/%.0f%%;", g_pf_th[t],
+                              100.0 * g_pf_tm[t] / m, g_pf_tu[t] / T,
+                              g_pf_tu[t] ? 100.0 * g_pf_tuse[t] / g_pf_tu[t] : 0.0);
+            fprintf(stderr, "    [g4-pf] narrow rules (misses covered / uploads per token / useful):%s\n", buf);
+        }
         fflush(stderr);
     }
 }
@@ -8469,7 +8527,8 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
      * See the block at moe_overlap_on for the two hazards and what holds them. */
     int ovl_n = 0, ovl_e[G4_MOE_OVL_MAX], ovl_cp[G4_MOE_OVL_MAX];
     DevTensor ovl_gu[G4_MOE_OVL_MAX], ovl_dw[G4_MOE_OVL_MAX];
-    int ovl = (n_tok == 1) && moe_overlap_on() && g_ec_slots > 0 && !(cpu_mode && cpu_in_ok);
+    int ovl = (n_tok == 1 || moe_overlap_prefill_on()) && moe_overlap_on() && g_ec_slots > 0
+              && !(cpu_mode && cpu_in_ok);
     if (ovl) {
         for (int e = 0; e < NE && ovl; e++) if (ms->bkt_n[e]) {
             if (ovl_n >= G4_MOE_OVL_MAX) { ovl = 0; break; }   /* more active than slots here */
