@@ -3384,6 +3384,169 @@ __global__ void k_attn_decode_win_tiled_v2_T(const float *q, const KV *Kc, const
         ao[(size_t)h * HD + i] = acc[i] * inv;
 }
 
+/* ── SPLIT-K DECODE ATTENTION (flash-decoding), 2026-10-20 ────────────────────────────────
+ * The tiled kernels above launch ONE BLOCK PER QUERY HEAD: 16 blocks on a 30-SM card, each
+ * walking its positions alone, with thread 0 running the softmax serially over every tile, and
+ * every KV head read once per query head that shares it (2x on the SWA layers, 8x on the
+ * globals). The 09-28 profile put decode attention at 5.69 ms/token at ~4k depth, against
+ * ~0.8 ms of unique KV bytes at this card's bandwidth.
+ *
+ * Three changes, nothing else:
+ *   1. grid = (KV head, chunk of positions), so the card fills (~64 blocks for both layer
+ *      types) and the globals' long context is walked in parallel;
+ *   2. a block serves ALL the query heads of its KV head, so each K/V row is loaded once;
+ *   3. the softmax is a warp-shuffle reduction, not thread 0 alone.
+ * Each block writes an UNNORMALISED partial (m, l, acc[HD]) per head; k_attn_split_combine
+ * merges them. Same online-softmax recurrence as the tiled kernels — a different reduction
+ * ORDER, so it is parity-checked (SP_G4_ATTN_SPLIT=2), not assumed.
+ *
+ * GRAPH-SAFE THE SAME WAY THE TILED KERNEL IS: the grid is fixed and each block derives its
+ * chunk from the DEVICE dpos, so a segment graph that bakes the launch replays correctly at
+ * every depth. The ring remap (slot = p % Wring) is the tiled kernel's, unchanged. */
+#define G4_SPLIT_T     64      /* positions per sub-tile inside a chunk */
+#define G4_SPLIT_MAXG  8       /* query heads per KV head (the globals' 16/2) */
+#define G4_SPLIT_MAXR  4       /* head-dim elements per thread: HD <= 4*blockDim */
+#define G4_SPLIT_BD    256
+template <typename KV>
+__global__ void __launch_bounds__(G4_SPLIT_BD)
+k_attn_decode_split_T(const float *q, const KV *Kc, const KV *Vc, const int *dpos,
+                      int KVD, int HD, int group, float ascale, int win, int Wring, int NS,
+                      float *pm, float *pl, float *pacc) {
+    extern __shared__ float shm[];
+    float *qs = shm;                                   /* [group*HD] the queries, staged once */
+    float *sc = qs + (size_t)group * HD;               /* [group*T]  scores, then weights */
+    int   *sl = (int *)(sc + (size_t)group * G4_SPLIT_T);   /* [T] ring slot per position */
+    __shared__ float m_run[G4_SPLIT_MAXG], l_run[G4_SPLIT_MAXG], alpha[G4_SPLIT_MAXG];
+
+    const int kvh = blockIdx.x, split = blockIdx.y;
+    const int ctx = *dpos + 1;
+    const int pos = ctx - 1;
+    const int s0 = (win >= 0 && pos - win + 1 > 0) ? pos - win + 1 : 0;
+    const int len = ctx - s0;
+    const int CH = (len + NS - 1) / NS;
+    const int c0 = s0 + split * CH;
+    const int c1 = (c0 + CH) < ctx ? (c0 + CH) : ctx;
+
+    const float *qh = q + (size_t)kvh * group * HD;   /* heads kvh*group .. +group-1 are contiguous */
+    for (int i = threadIdx.x; i < group * HD; i += blockDim.x) qs[i] = qh[i];
+    if (threadIdx.x < G4_SPLIT_MAXG) { m_run[threadIdx.x] = -3.0e38f; l_run[threadIdx.x] = 0.0f; }
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31, warp = (int)(threadIdx.x >> 5);
+    const int nwarps = (int)(blockDim.x >> 5);
+    float acc[G4_SPLIT_MAXR][G4_SPLIT_MAXG];
+    #pragma unroll
+    for (int r = 0; r < G4_SPLIT_MAXR; r++)
+        #pragma unroll
+        for (int g = 0; g < G4_SPLIT_MAXG; g++) acc[r][g] = 0.0f;
+
+    for (int t0 = c0; t0 < c1; t0 += G4_SPLIT_T) {
+        const int n = (c1 - t0) < G4_SPLIT_T ? (c1 - t0) : G4_SPLIT_T;
+        /* scores: one warp per key, lanes split the head dim; one K load serves every head */
+        for (int j = warp; j < n; j += nwarps) {
+            const int p = t0 + j;
+            const int slot = Wring > 0 ? (p % Wring) : p;
+            const KV *kh = Kc + (size_t)slot * KVD + (size_t)kvh * HD;
+            float a[G4_SPLIT_MAXG];
+            #pragma unroll
+            for (int g = 0; g < G4_SPLIT_MAXG; g++) a[g] = 0.0f;
+            for (int i = lane; i < HD; i += 32) {
+                const float kv = kv_ld(kh, i);
+                #pragma unroll
+                for (int g = 0; g < G4_SPLIT_MAXG; g++)
+                    if (g < group) a[g] += qs[g * HD + i] * kv;
+            }
+            #pragma unroll
+            for (int g = 0; g < G4_SPLIT_MAXG; g++) {
+                if (g >= group) break;
+                float v = a[g];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+                if (lane == 0) sc[g * G4_SPLIT_T + j] = v * ascale;
+            }
+            if (lane == 0) sl[j] = slot;
+        }
+        __syncthreads();
+        /* online softmax, one warp per head, parallel over the sub-tile */
+        for (int g = warp; g < group; g += nwarps) {
+            float mx = -3.0e38f;
+            for (int j = lane; j < n; j += 32) mx = fmaxf(mx, sc[g * G4_SPLIT_T + j]);
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+            const float m_new = fmaxf(m_run[g], mx);
+            float sm = 0.0f;
+            for (int j = lane; j < n; j += 32) {
+                const float e = expf(sc[g * G4_SPLIT_T + j] - m_new);
+                sc[g * G4_SPLIT_T + j] = e; sm += e;
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, off);
+            if (lane == 0) {
+                const float al = expf(m_run[g] - m_new);       /* first sub-tile: e^-inf = 0 */
+                alpha[g] = al; l_run[g] = l_run[g] * al + sm; m_run[g] = m_new;
+            }
+        }
+        __syncthreads();
+        /* weighted V: a thread owns head-dim elements, one V load serves every head */
+        #pragma unroll
+        for (int r = 0; r < G4_SPLIT_MAXR; r++) {
+            const int i = threadIdx.x + r * blockDim.x;
+            if (i >= HD) break;
+            float sv[G4_SPLIT_MAXG];
+            #pragma unroll
+            for (int g = 0; g < G4_SPLIT_MAXG; g++) sv[g] = 0.0f;
+            const KV *vb = Vc + (size_t)kvh * HD + i;
+            #pragma unroll 4
+            for (int j = 0; j < n; j++) {
+                const float v = kv_ld(vb, (size_t)sl[j] * KVD);
+                #pragma unroll
+                for (int g = 0; g < G4_SPLIT_MAXG; g++)
+                    if (g < group) sv[g] += sc[g * G4_SPLIT_T + j] * v;
+            }
+            #pragma unroll
+            for (int g = 0; g < G4_SPLIT_MAXG; g++)
+                if (g < group) acc[r][g] = acc[r][g] * alpha[g] + sv[g];
+        }
+        __syncthreads();
+    }
+    /* the partial, UNNORMALISED: an empty chunk writes m=-inf, l=0, acc=0 and weighs nothing */
+    for (int g = 0; g < group; g++) {
+        const size_t idx = (size_t)(kvh * group + g) * NS + split;
+        if (threadIdx.x == 0) { pm[idx] = m_run[g]; pl[idx] = l_run[g]; }
+        #pragma unroll
+        for (int r = 0; r < G4_SPLIT_MAXR; r++) {
+            const int i = threadIdx.x + r * blockDim.x;
+            if (i >= HD) break;
+            float v = 0.0f;
+            #pragma unroll
+            for (int gg = 0; gg < G4_SPLIT_MAXG; gg++) if (gg == g) v = acc[r][gg];
+            pacc[idx * HD + i] = v;
+        }
+    }
+}
+
+/* Merge the NS partials of each head: out = sum_s e^(m_s-M) acc_s / sum_s e^(m_s-M) l_s. */
+__global__ void k_attn_split_combine(const float *pm, const float *pl, const float *pacc,
+                                     int NS, int HD, float *ao) {
+    const int h = blockIdx.x;
+    const float *m = pm + (size_t)h * NS, *l = pl + (size_t)h * NS;
+    float M = -3.0e38f;
+    for (int s = 0; s < NS; s++) M = fmaxf(M, m[s]);
+    float L = 0.0f;
+    for (int s = 0; s < NS; s++) L += expf(m[s] - M) * l[s];
+    const float inv = 1.0f / L;
+    for (int i = threadIdx.x; i < HD; i += blockDim.x) {
+        float o = 0.0f;
+        for (int s = 0; s < NS; s++) o += expf(m[s] - M) * pacc[((size_t)h * NS + s) * HD + i];
+        ao[(size_t)h * HD + i] = o * inv;
+    }
+}
+
+static inline size_t g4_split_shm(int group, int hd) {
+    return ((size_t)group * hd + (size_t)group * G4_SPLIT_T) * sizeof(float)
+         + (size_t)G4_SPLIT_T * sizeof(int);
+}
+
 /* The tiled kernel's shared-memory footprint, in ONE place. Three call sites launch this
  * kernel and each used to spell the arithmetic out; a fourth term (the ring-slot array) is
  * exactly the kind of change that lands in two of three and is then a silent out-of-bounds
@@ -3418,6 +3581,71 @@ static int g4_attn_tile(void) {
         }
     }
     return t;
+}
+
+/* Split-K decode attention, once per process. 0 = off (the tiled kernel serves, unchanged);
+ * 1 = the split kernel serves; 2 = PARITY: the tiled kernel serves, the split kernel runs
+ * beside it and the worst relL2 is printed. Parity syncs per layer, so it forces the
+ * per-step path (no segment graphs) — a measurement mode, never a serving one. */
+static int g4_attn_split(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("SP_G4_ATTN_SPLIT");
+        v = (e && *e) ? atoi(e) : 0;
+        if (v < 0 || v > 2) v = 0;
+        if (v) { fprintf(stderr, "    [g4-kv] decode attention: %s\n",
+                         v == 2 ? "SPLIT-K PARITY (tiled serves, split runs beside it)"
+                                : "SPLIT-K (flash-decoding) serves");
+                 fflush(stderr); }
+    }
+    return v;
+}
+
+/* Launch the split kernel + combine into `out`. Returns 0, or -1 when this shape or moment
+ * cannot take it (the caller then runs the tiled kernel — said once, never silently).
+ * The partial scratch is allocated ONCE at its ceiling and never moves: segment graphs bake
+ * the pointer, so a grow-on-demand buffer would be a stale pointer in every replay. */
+template <typename KV>
+static int g4_attn_split_launch(const float *dq, const KV *Kuse, const KV *Vuse, const int *dpos,
+                                int nh, int hd, int kvd, int grp, int win, int ring,
+                                float *out, cudaStream_t st) {
+    static float *buf = nullptr; static size_t cap = 0; static int failed = 0;
+    const char *why = nullptr;
+    if (grp < 1 || grp > G4_SPLIT_MAXG || nh % grp) why = "group";
+    else if (hd > G4_SPLIT_MAXR * G4_SPLIT_BD) why = "head dim";
+    else if (g4_split_shm(grp, hd) > 48u * 1024u) why = "shared memory";
+    const int nkvh = grp >= 1 ? nh / grp : 0;
+    int NS = nkvh > 0 ? (64 + nkvh - 1) / nkvh : 1;
+    if (NS > 32) NS = 32;
+    if (NS < 1) NS = 1;
+    const size_t need = (size_t)nh * NS * ((size_t)hd + 2);
+    if (!why && !buf && !failed) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(st, &cs) != cudaSuccess) { cudaGetLastError(); cs = cudaStreamCaptureStatusActive; }
+        if (cs == cudaStreamCaptureStatusNone) {
+            cap = (size_t)nh * 32 * ((size_t)G4_SPLIT_MAXR * G4_SPLIT_BD + 2);   /* the ceiling */
+            if (cudaMalloc((void **)&buf, cap * sizeof(float)) != cudaSuccess) {
+                cudaGetLastError(); buf = nullptr; cap = 0; failed = 1; }
+        }
+    }
+    if (!why && !buf) why = failed ? "scratch alloc failed" : "first call inside a graph capture";
+    if (!why && need > cap) why = "scratch ceiling";
+    if (why) {
+        static int warned = 0;
+        if (!warned) { fprintf(stderr, "[g4-kv] SPLIT-K declined (%s: nh=%d hd=%d grp=%d) — the tiled "
+                                       "kernel serves this layer\n", why, nh, hd, grp); fflush(stderr); warned = 1; }
+        return -1;
+    }
+    float *pm = buf, *pl = buf + (size_t)nh * NS, *pacc = buf + 2 * (size_t)nh * NS;
+    k_attn_decode_split_T<KV><<<dim3((unsigned)nkvh, (unsigned)NS), G4_SPLIT_BD, g4_split_shm(grp, hd), st>>>(
+        dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, ring, NS, pm, pl, pacc);
+    k_attn_split_combine<<<nh, G4_SPLIT_BD, 0, st>>>(pm, pl, pacc, NS, hd, out);
+    { static int warned = 0;
+      if (!warned) { cudaError_t le = cudaGetLastError();
+        if (le != cudaSuccess) { fprintf(stderr, "[g4-kv] SPLIT-K LAUNCH FAILED: %s (nkvh=%d NS=%d shm=%zu) "
+            "— output is INVALID from here\n", cudaGetErrorName(le), nkvh, NS, g4_split_shm(grp, hd));
+            warned = 1; } } }
+    return 0;
 }
 
 /* ═══════════ XBAR-P1: Inception Probe payload I/O ═══════════
@@ -5462,6 +5690,49 @@ extern "C" int gemma4_kv_steer(sp_g4_kv *s, const float *vec, float alpha) {
  * reads the DEVICE dpos pointer, so a graph captured at one position replays
  * bit-identically at any later position (the same invariant gemma4_decode_cuda's
  * one-shot graph relies on). do_head: run out_norm+tied head+softcap+argmax. */
+/* SP_G4_ATTN_SPLIT=2: the split kernel into scratch beside the served output in s->dao, and
+ * the difference. Per layer per token, so it prints only on a new worst, per layer KIND
+ * (global vs SWA): the two shapes take different chunk counts, and one worst hides the other. */
+template <typename KV>
+static void g4_attn_split_parity(sp_g4_kv *s, const KV *Kuse, const KV *Vuse, const int *dpos,
+                                 int nh, int hd, int kvd, int grp, int win, int ring,
+                                 cudaStream_t st) {
+    static float *dsc = nullptr; static size_t cap = 0;
+    static unsigned *dcmp = nullptr; static double *dsum = nullptr;
+    static double worst[2] = {0.0, 0.0};
+    static unsigned long long calls = 0;
+    const size_t need = (size_t)nh * (size_t)hd;
+    if (cap < need) {
+        if (dsc) cudaFree(dsc);
+        if (cudaMalloc((void **)&dsc, need * sizeof(float)) != cudaSuccess) { dsc = nullptr; cap = 0; return; }
+        cap = need;
+    }
+    if (!dcmp && cudaMalloc((void **)&dcmp, 2 * sizeof(unsigned)) != cudaSuccess) return;
+    if (!dsum && cudaMalloc((void **)&dsum, 2 * sizeof(double)) != cudaSuccess) return;
+    { cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;      /* a sync inside a capture */
+      if (cudaStreamIsCapturing(st, &cs) != cudaSuccess) { cudaGetLastError(); return; }   /* kills it */
+      if (cs != cudaStreamCaptureStatusNone) return; }
+    if (g4_attn_split_launch<KV>(s->dq, Kuse, Vuse, dpos, nh, hd, kvd, grp, win, ring, dsc, st)) return;
+    cudaMemsetAsync(dcmp, 0, 2 * sizeof(unsigned), st);
+    cudaMemsetAsync(dsum, 0, 2 * sizeof(double), st);
+    k_attn_parity_cmp<<<64, 256, 0, st>>>(s->dao, dsc, need, dcmp, dsum);
+    unsigned hb[2] = {0, 0}; double hs[2] = {0.0, 0.0};
+    cudaMemcpyAsync(hb, dcmp, 2 * sizeof(unsigned), cudaMemcpyDeviceToHost, st);
+    cudaMemcpyAsync(hs, dsum, 2 * sizeof(double), cudaMemcpyDeviceToHost, st);
+    if (cudaStreamSynchronize(st) != cudaSuccess) return;
+    float mabs; memcpy(&mabs, &hb[0], 4);
+    const double rl2 = hs[1] > 0.0 ? sqrt(hs[0] / hs[1]) : 0.0;
+    const int kind = win < 0 ? 0 : 1;
+    calls++;
+    if (rl2 > worst[kind]) {
+        worst[kind] = rl2;
+        fprintf(stderr, "    [g4-kv] SPLIT-K PARITY new worst (%s): relL2 %.3e  max|d| %.3e  "
+                        "(hd=%d grp=%d win=%d ring=%d ctx=%d, call %llu)\n",
+                kind ? "swa" : "global", rl2, (double)mabs, hd, grp, win, ring, s->dpos_host + 1, calls);
+        fflush(stderr);
+    }
+}
+
 /* ADR-012: the decode attention launch, ONE body, instantiated per the layer's cache type.
  * Extracted verbatim from g4_kv_launch_full so the fp32 and fp16 paths cannot pick different
  * kernels, different shared-memory sizes, or different windows — there is exactly one place
@@ -5504,6 +5775,10 @@ static void g4_attn_launch(sp_g4_kv *s, const KV *Kuse, const KV *Vuse,
         warned = 1; } }
     const int TL = s->bx_on ? 0 : g4_attn_tile();
     if (TL) {
+        const int split = g4_attn_split();
+        if (split == 1 && g4_attn_split_launch<KV>(s->dq, Kuse, Vuse, dpos, nh, hd, kvd, grp, win,
+                                                   ring, s->dao, st) == 0)
+            return;
         const int mode = g4_attn_v2();
         /* v2 needs full warps: all 32 lanes share one key, so 0xffffffff is only the right
          * mask when no warp is partial. hd is 256 or 512 here, so bd already is — rounded
@@ -5513,6 +5788,7 @@ static void g4_attn_launch(sp_g4_kv *s, const KV *Kuse, const KV *Vuse,
         if (mode == 1) {
             k_attn_decode_win_tiled_v2_T<KV><<<nh, bd2, g4_tiled_shm_v2(TL, hd), st>>>(
                 s->dq, Kuse, Vuse, dpos, kvd, hd, grp, 1.0f, win, s->dao, TL, ring);
+            if (split == 2) g4_attn_split_parity<KV>(s, Kuse, Vuse, dpos, nh, hd, kvd, grp, win, ring, st);
             return;
         }
         k_attn_decode_win_tiled_T<KV><<<nh, bd, g4_tiled_shm(TL, hd), st>>>(   /* SERVED */
@@ -5522,6 +5798,7 @@ static void g4_attn_launch(sp_g4_kv *s, const KV *Kuse, const KV *Vuse,
             if (le != cudaSuccess) { fprintf(stderr, "[g4-kv] TILED ATTN LAUNCH FAILED: %s "
                 "(nh=%d bd=%d shm=%zu TL=%d ring=%d) — output is INVALID from here\n",
                 cudaGetErrorName(le), nh, bd, g4_tiled_shm(TL, hd), TL, ring); warned = 1; } } }
+        if (split == 2) g4_attn_split_parity<KV>(s, Kuse, Vuse, dpos, nh, hd, kvd, grp, win, ring, st);
         if (mode != 2) return;
 
         /* Decode parity. The output is one query — nh*hd floats — so the comparison is
@@ -9038,7 +9315,8 @@ static int g4_kv_step_seg(sp_g4_kv *s, int *handled) {
     static int env_block = -1;
     if (env_block < 0) {
         const char *a = getenv("SP_DUMP_KV_DECODE"), *b = getenv("SP_BX_KTIME"), *c = getenv("SP_G4_NAN_PROBE");
-        env_block = (a && *a == '1') || (b && *b == '1') || (c && *c == '1') || moe_timing_on() || moe_bisect_on();
+        env_block = (a && *a == '1') || (b && *b == '1') || (c && *c == '1') || moe_timing_on() || moe_bisect_on()
+                    || g4_attn_split() == 2;   /* split-K parity syncs per layer: not graph-bakeable */
     }
     if (env_block || s->cap_active || s->inj_active || s->feat_active || s->steer_active || s->bx_on
         || s->qcap_active || s->cpu_tail > 0 || s->cpu_tail_full > 0 || g_hd_f) return 0;
