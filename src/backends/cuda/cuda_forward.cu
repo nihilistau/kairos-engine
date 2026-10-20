@@ -8057,6 +8057,93 @@ static int hf23_mid(cudaStream_t st, g4_moe_scratch *ms, int L, int E, int FFE, 
     return 1;
 }
 
+/* ── PREFETCH ORACLE (SP_G4_PF_ORACLE=1), 2026-10-20 — measurement only, output unchanged ────
+ * Could layer L+1's misses be uploaded during layer L? Only if L+1's experts can be named a
+ * layer early. The cheap predictor ("pre-gating"): apply layer L+1's router — its prep norm,
+ * its [E] scale, its Wrouter — to layer L's attn_out, which exists at L's router time, a whole
+ * layer ahead. This instrument runs that GEMV beside L's real router, D2Hs the logits into row
+ * L+1 of a pinned table, and at L+1's MID, after the exact top-k, scores them:
+ *   - of L+1's MISSES (not resident at routing), how many sit in the predicted top-8/12/16;
+ *   - of everything L+1 routed, how many sit in the predicted top-8;
+ *   - the cost: how many of the predicted top-8/16 were NOT resident (the uploads a prefetch
+ *     would issue), and how many of those L+1 then routed (useful uploads).
+ * Printed every 256 decode tokens. Decode only (n_tok == 1). Graph-safe: the GEMV and the D2H
+ * have fixed scratch and a fixed destination, so a segment graph captures and replays them.
+ * The extra GEMV reuses the packed-activation scratch strictly after L's router has consumed
+ * it, in stream order. Nothing it writes is read by the forward. */
+#define PF_MAXL 64
+static int    g_pf_on = -1, g_pf_NL = 0, g_pf_NE = 0, g_pf_failed = 0;
+static float *g_pf_rin_d = NULL, *g_pf_log_d = NULL;      /* [E], [NE] device scratch */
+static float *g_pf_log_h = NULL;                           /* pinned [PF_MAXL * NE] */
+static unsigned char g_pf_valid[PF_MAXL];                  /* row L has a D2H behind it */
+static long long g_pf_tok = 0, g_pf_routed = 0, g_pf_miss = 0, g_pf_m8 = 0, g_pf_m12 = 0, g_pf_m16 = 0;
+static long long g_pf_r8 = 0, g_pf_up8 = 0, g_pf_use8 = 0, g_pf_up16 = 0, g_pf_use16 = 0;
+static inline int pf_on(void) {
+    if (g_pf_on < 0) { const char *e = getenv("SP_G4_PF_ORACLE"); g_pf_on = (e && *e == '1') ? 1 : 0;
+        if (g_pf_on) { fprintf(stderr, "    [g4-pf] PREFETCH ORACLE ON (SP_G4_PF_ORACLE=1): "
+                                       "router_{L+1} on layer L's attn_out, scored at L+1\n"); fflush(stderr); } }
+    return g_pf_on;
+}
+/* scratch, once, outside any capture; 0 = not available (skip this layer) */
+static int pf_ensure(int E, int NE, cudaStream_t st) {
+    if (g_pf_log_h) return NE == g_pf_NE;
+    if (g_pf_failed) return 0;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(st, &cs) != cudaSuccess) { cudaGetLastError(); return 0; }
+    if (cs != cudaStreamCaptureStatusNone) return 0;
+    if (cudaMalloc((void **)&g_pf_rin_d, (size_t)E * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **)&g_pf_log_d, (size_t)NE * sizeof(float)) != cudaSuccess ||
+        cudaMallocHost((void **)&g_pf_log_h, (size_t)PF_MAXL * NE * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError(); g_pf_failed = 1; g_pf_log_h = NULL;
+        fprintf(stderr, "    [g4-pf] scratch allocation failed — the oracle is off\n"); fflush(stderr);
+        return 0;
+    }
+    g_pf_NE = NE; memset(g_pf_valid, 0, sizeof g_pf_valid);
+    return 1;
+}
+/* at L's MID, after the exact top-k: score row L (predicted during layer L-1) */
+static void pf_score(int L, int NE, int NU, const int *idx) {
+    const float *p = g_pf_log_h + (size_t)L * NE;
+    int top[16]; int nt = 0;                                /* the predicted top-16, by logit */
+    for (int e = 0; e < NE; e++) {
+        int k;
+        if (nt < 16) k = nt++;
+        else if (p[e] > p[top[15]]) k = 15;                 /* ties keep the lower id, as top-k does */
+        else continue;
+        while (k > 0 && p[e] > p[top[k - 1]]) { top[k] = top[k - 1]; k--; }
+        top[k] = e;
+    }
+    for (int k = 0; k < NU; k++) {
+        const int e = idx[k];
+        if (e < 0 || e >= NE) continue;
+        int rank = 16;
+        for (int r = 0; r < nt; r++) if (top[r] == e) { rank = r; break; }
+        const int res = g_ec_map[(long long)L * NE + e] >= 0;
+        g_pf_routed++;
+        if (rank < 8) g_pf_r8++;
+        if (!res) { g_pf_miss++; if (rank < 8) g_pf_m8++; if (rank < 12) g_pf_m12++; if (rank < 16) g_pf_m16++; }
+    }
+    for (int r = 0; r < nt; r++) {
+        const int e = top[r];
+        if (g_ec_map[(long long)L * NE + e] >= 0) continue;          /* resident: no upload */
+        int used = 0;
+        for (int k = 0; k < NU; k++) if (idx[k] == e) { used = 1; break; }
+        if (r < 8) { g_pf_up8++; g_pf_use8 += used; }
+        g_pf_up16++; g_pf_use16 += used;
+    }
+    if (L == g_pf_NL - 1 && (++g_pf_tok % 256) == 0) {
+        const double T = (double)g_pf_tok, m = g_pf_miss > 0 ? (double)g_pf_miss : 1.0;
+        fprintf(stderr, "    [g4-pf] prefetch oracle: %lld tokens; misses/token %.2f (scored layers 1..%d); "
+                        "misses in predicted top-8 %.1f%%, top-12 %.1f%%, top-16 %.1f%%; routed in predicted "
+                        "top-8 %.1f%%; uploads/token top-8 %.2f (useful %.1f%%), top-16 %.2f (useful %.1f%%)\n",
+                g_pf_tok, g_pf_miss / T, g_pf_NL - 1, 100.0 * g_pf_m8 / m, 100.0 * g_pf_m12 / m,
+                100.0 * g_pf_m16 / m, g_pf_routed ? 100.0 * g_pf_r8 / g_pf_routed : 0.0,
+                g_pf_up8 / T, g_pf_up8 ? 100.0 * g_pf_use8 / g_pf_up8 : 0.0,
+                g_pf_up16 / T, g_pf_up16 ? 100.0 * g_pf_use16 / g_pf_up16 : 0.0);
+        fflush(stderr);
+    }
+}
+
 static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ffL,
                         int n_tok, float eps, int use_int8,
                         float *dx, float *dnx, float *dg, float *dup, float *ddn,
@@ -8149,6 +8236,16 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
                                              1.0f / sqrtf((float)E), ms->rin);
     MBK("router_prep");
     AMMD(&g_w.Wrouter[L], ms->rin, ms->log, n_tok);   /* [NE x n_tok] col-major */
+    /* prefetch oracle (SP_G4_PF_ORACLE=1): router_{L+1} on this layer's attn_out, into row L+1 */
+    if (n_tok == 1 && pf_on() && L + 1 < g_pf_NL && L + 1 < PF_MAXL && g_w.router_scale[L + 1]
+        && pf_ensure(E, NE, st)) {
+        k_moe_router_prep<<<1, 256, 0, st>>>(dx, g_w.router_scale[L + 1], E, eps,
+                                             1.0f / sqrtf((float)E), g_pf_rin_d);
+        AMMD(&g_w.Wrouter[L + 1], g_pf_rin_d, g_pf_log_d, 1);
+        cudaMemcpyAsync(g_pf_log_h + (size_t)(L + 1) * NE, g_pf_log_d, (size_t)NE * sizeof(float),
+                        cudaMemcpyDeviceToHost, st);
+        g_pf_valid[L + 1] = 1;
+    }
     /* P1: speculate. Not while another forward is in this layer's window (hf_win_valid): it would
      * share the row. Under a capture (ph 1 = segB, or a whole-step graph) it is always recorded,
      * since the graph outlives this check; the replaying forward's own window gates its readers. */
@@ -8276,6 +8373,9 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
          *  speculation read.) */
         if (n_tok == 1 && g_hf_spec_h && hf_on() && NU <= 8 && L < G4_HF_MAXL && hf_win_valid())
             hf1_parity_count(L, NE, NU, g_hf_spec_h + (size_t)L * 16, ms->idx_h);
+        /* prefetch oracle: row L was predicted during layer L-1; MID's sync above landed it */
+        if (n_tok == 1 && pf_on() && L >= 1 && L < PF_MAXL && g_pf_log_h && g_pf_valid[L] && g_ec_slots > 0)
+            pf_score(L, NE, NU, ms->idx_h);
         /* ── EXPERT-ROUTE TRACE (SP_MOE_TRACE=1) ─────────────────────────────────
          * The measurement that decides whether MTP speculative decode can pay on
          * this model. Speculation wins when verifying k drafts costs ~one forward —
@@ -8814,6 +8914,7 @@ static int g4_ffn_block(sp_g4_kv *s, int L, int ffL) {
         sp_set_error("gemma4-MoE: SP_BYTEEXACT not implemented for the expert branch");
         return -1;
     }
+    g_pf_NL = s->NL;                     /* the prefetch oracle's last scored layer */
     return g4_ffn_apply(g_w.cublas, g_w.stream, L, s->E, ffL, 1, s->eps,
                         s->use_int8, s->dx, s->dnx, s->dg, s->dup, s->ddn,
                         s->dscr, s->dqx, s->dsx,
