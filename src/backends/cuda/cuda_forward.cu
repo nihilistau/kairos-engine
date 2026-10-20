@@ -6401,6 +6401,8 @@ static unsigned short     *g_ec_gup_bs    = NULL, *g_ec_down_bs    = NULL;
 static int                *g_ec_key = NULL;   /* [slots] -> L*NE+e, or -1 (empty)  */
 static unsigned long long *g_ec_use = NULL;   /* [slots] LRU stamp                 */
 static int                *g_ec_map = NULL;   /* [NL*NE] -> slot, or -1            */
+static int                 g_ec_nl  = 0;      /* NL, recorded at cache init (the prefill prefetch) */
+static int                 g_ec_ne  = 0;      /* NE, recorded at cache init (the prefill lane) */
 /* HOST-FREE LAYER, P1 (2026-10-19; docs/DESIGN-2026-09-29-host-free-layer.md). Measurement
  * only, no behaviour change. SP_G4_HF_P1=1:
  *   - g_ec_map is allocated MAPPED PINNED, so the GPU reads the live slot table zero-copy
@@ -6693,7 +6695,42 @@ static void moe_ev_touch(long long key) {   /* caller holds the MoE lock and has
     }
     g_ec_ks[key] += g_ev_unit;
 }
+/* ── THE PREFILL LANE (SP_G4_MOE_PF_LANE = slots, 2026-10-21) ──────────────────────────────────
+ * A 2,048-token prefill chunk touches ~3,600 of the 3,840 experts through a 1,925-slot cache, so
+ * recency eviction cycles: almost everything the chunk loads evicts something the next chunk
+ * (or the decode after it) would have hit. nsys: 23.4 GB copied for a 4,859-token prefill on an
+ * x8 link, copy-bound. With a lane, a BATCHED PREFILL miss may evict only from the top `lane`
+ * slots, so the rest of the cache (what decode warmed) holds still across chunks and is hit by
+ * every chunk; decode keeps the ordinary policy over the whole cache, and the lane's leftovers
+ * score low and go first. A lane victim is never an expert of the layer being resolved (its
+ * compute has not run yet); earlier layers' compute is already ordered before the copy stream
+ * by the overlap's ready event, and on the plain path by the single stream. Empty slots
+ * anywhere fill first. Same experts, same weights, same kernels: output unchanged. */
+static int g_moe_lane = -1;      /* slots in the lane; 0 = off */
+static int g_moe_lane_L = -1;    /* the layer a batched prefill is resolving, or -1 */
+static int moe_lane(void) {
+    if (g_moe_lane < 0) {
+        const char *e = getenv("SP_G4_MOE_PF_LANE");
+        int v = (e && *e) ? atoi(e) : 0;
+        if (v < 0) v = 0;
+        if (v && g_ec_slots > 0 && v > g_ec_slots / 2) v = g_ec_slots / 2;
+        if (v && g_ec_slots <= 0) return 0;              /* cache not up yet: decide later */
+        g_moe_lane = v;
+        if (v) { fprintf(stderr, "    [g4-moe] prefill lane: batched-prefill misses evict only from the top %d of %d slots "
+                                 "(SP_G4_MOE_PF_LANE)\n", v, g_ec_slots); fflush(stderr); }
+    }
+    return g_moe_lane;
+}
 static int moe_ev_victim(void) {            /* caller holds the MoE lock */
+    if (g_moe_lane_L >= 0 && g_moe_lane > 0 && g_ec_ne > 0) {
+        for (int i = 0; i < g_ec_slots; i++) if (g_ec_key[i] < 0) return i;   /* empties first */
+        int lv = -1; unsigned long long lb = ~0ull;
+        for (int i = g_ec_slots - g_moe_lane; i < g_ec_slots; i++) {
+            if (g_ec_key[i] / g_ec_ne == g_moe_lane_L) continue;   /* this layer still reads it */
+            if (g_ec_use[i] < lb) { lb = g_ec_use[i]; lv = i; }
+        }
+        if (lv >= 0) return lv;
+    }
     int victim = 0; unsigned long long best = ~0ull;
     for (int i = 0; i < g_ec_slots; i++) {
         if (g_ec_key[i] < 0) return i;
@@ -6812,6 +6849,7 @@ static void moe_cache_init(int NL, int NE, size_t gup_b, size_t gup_bsn,
     if (g_ec_pev) for (int i = 0; i < slots; i++)
         if (cudaEventCreateWithFlags(&g_ec_pev[i], cudaEventDisableTiming) != cudaSuccess) g_ec_pev[i] = NULL;
     for (long long i = 0; i < all; i++) g_ec_map[i] = -1;
+    g_ec_nl = NL; g_ec_ne = NL > 0 ? (int)(all / NL) : 0;
     g_ec_slots = slots;
     if (g_ec_dmap) {    /* P2.1: the publication queue, then seed (an empty cache: nothing resident yet) */
         g_ec_unpub = (int *)malloc((size_t)slots * sizeof(int));
@@ -7323,6 +7361,40 @@ static cudaEvent_t  g_moe_ev[G4_MOE_OVL_MAX];
 static cudaEvent_t  g_moe_ready = NULL;
 static int          g_moe_overlap = -1;          /* -1 untried, 0 off, 1 on */
 static int          g_moe_ovl_prefill = -1;      /* SP_G4_MOE_OVERLAP_PREFILL: the pipeline for n_tok > 1 */
+/* ── CROSS-LAYER PREFILL PREFETCH (SP_G4_MOE_PREFETCH_PREFILL, 2026-10-21) ──────────────────────
+ * nsys, a 4,859-token prefill with everything armed: 5.79 s window, kernels 2.89 s, expert copies
+ * 4.07 s of which only 1.60 s overlapped. The overlap pipeline can hide a layer's copies only
+ * behind that layer's own compute, because layer L+1's routing is not known until layer L is
+ * done. In prefill it is known in practice: a chunk of n tokens touches 128*(1-(15/16)^n)
+ * experts of every layer (98% at n = 64, ~120 of 128 at n = 2048). So once layer L's kernels
+ * are all queued, every NON-RESIDENT expert of layer L+1 is resolved on the copy stream, each with
+ * its own event, and the copy stream never idles at a layer boundary. Layer L+1 waits on each
+ * expert's own event before computing it, in both the overlap and the plain path. Events are
+ * double-buffered by layer parity, so L+1 waiting and L+2 being prefetched never share one.
+ * Same experts, same order, same kernels: the output is unchanged. Hazards: a prefetch victim
+ * is never one of layer L's experts (just resolved, so inside the recency guard), and the copy
+ * stream already waited on the compute stream's queued work at L's pass 1. */
+#define G4_PF_MIN_TOK 64
+static int          g_moe_pf_on = -1;
+static cudaEvent_t  g_moe_pf_ev[2][G4_MOE_OVL_MAX];
+static unsigned char g_moe_pf_has[2][G4_MOE_OVL_MAX];
+static int          g_moe_pf_for[2] = { -1, -1 };
+static long long    g_moe_pf_n = 0, g_moe_pf_layers = 0;
+static int moe_prefetch_prefill_on(void) {
+    if (g_moe_pf_on < 0) {
+        const char *e = getenv("SP_G4_MOE_PREFETCH_PREFILL");
+        g_moe_pf_on = (e && *e == '1') ? 1 : 0;
+        for (int b = 0; g_moe_pf_on && b < 2; b++)
+            for (int i = 0; i < G4_MOE_OVL_MAX; i++)
+                if (cudaEventCreateWithFlags(&g_moe_pf_ev[b][i], cudaEventDisableTiming) != cudaSuccess) {
+                    cudaGetLastError(); g_moe_pf_on = 0;
+                    fprintf(stderr, "    [g4-moe] prefill prefetch: event create failed - off\n"); break; }
+        if (g_moe_pf_on) { fprintf(stderr, "    [g4-moe] prefill prefetch: layer L+1's experts copy during layer L "
+                                           "(SP_G4_MOE_PREFETCH_PREFILL=1; needs the prefill overlap, n_tok >= %d)\n",
+                                   G4_PF_MIN_TOK); fflush(stderr); }
+    }
+    return g_moe_pf_on;
+}
 static int moe_overlap_prefill_on(void) {
     if (g_moe_ovl_prefill < 0) {
         const char *e = getenv("SP_G4_MOE_OVERLAP_PREFILL");
@@ -8559,6 +8631,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     /* expert-major: stage ONCE, then one GEMM over that expert's whole token set */
     const float *dsc = g_w.dexps_scale_host[L];   /* [NE], per EXPERT (trap #2) */
 
+    g_moe_lane_L = (n_tok > 1 && g_ec_slots > 0 && moe_lane() > 0) ? L : -1;   /* the prefill lane */
     /* PASS 1 of the overlap: resolve every active expert and let its miss-copy start on the
      * copy stream, so that by the time expert 1 has finished computing, 2..8 have landed.
      * See the block at moe_overlap_on for the two hazards and what holds them. */
@@ -8875,6 +8948,9 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
             if (ovl_cp[ovl_i]) cudaStreamWaitEvent(st, g_moe_ev[ovl_i], 0);
             ovl_i++;
         } else if (moe_resident(L, e, NE, E, FFE, st, &gu, &dw)) return -1;
+        /* prefetched during layer L-1: wait for THIS expert's copy only */
+        if (g_moe_pf_for[L & 1] == L && e < G4_MOE_OVL_MAX && g_moe_pf_has[L & 1][e])
+            cudaStreamWaitEvent(st, g_moe_pf_ev[L & 1][e], 0);
         if (_mtm) { g_moe_stage_ms += moe_ms_since(_mt_st); _mt_st = moe_clk::now(); }
 
         k_moe_gather_rows<<<(unsigned)(((size_t)cnt*E + 255) / 256), 256, 0, st>>>(
@@ -8889,6 +8965,26 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     }
     if (_mtm) g_moe_expert_ms += moe_ms_since(_mt_exp);
     MBK("expert_loop");
+    g_moe_lane_L = -1;
+    /* cross-layer prefill prefetch: layer L+1's non-resident experts. AFTER this layer's kernels
+     * are all queued, not between pass 1 and them: each cudaMemcpyAsync costs the host ~80 us
+     * on WDDM, so ~70 of them in front of the launches left the GPU idle (measured: 5.75 ->
+     * 6.65 s on a 4.2k prefill). Here the host issues them while the GPU computes layer L. */
+    if (ovl && n_tok >= G4_PF_MIN_TOK && L + 1 < g_ec_nl && NE <= G4_MOE_OVL_MAX && moe_prefetch_prefill_on()) {
+        const int b = (L + 1) & 1, nl1 = L + 1;
+        memset(g_moe_pf_has[b], 0, sizeof g_moe_pf_has[b]);
+        for (int e = 0; e < NE; e++) {
+            if (g_ec_map[(long long)nl1 * NE + e] >= 0) continue;      /* resident already */
+            DevTensor pgu, pdw;
+            if (moe_resident(nl1, e, NE, E, FFE, g_moe_cps, &pgu, &pdw)) return -1;
+            cudaEventRecord(g_moe_pf_ev[b][e], g_moe_cps);
+            g_moe_pf_has[b][e] = 1; g_moe_pf_n++;
+        }
+        g_moe_pf_for[b] = nl1; g_moe_pf_layers++;
+        if ((g_moe_pf_layers % 3000) == 0) {
+            fprintf(stderr, "    [g4-moe] prefill prefetch: %lld layers, %lld experts prefetched (%.1f/layer)\n",
+                    g_moe_pf_layers, g_moe_pf_n, (double)g_moe_pf_n / (double)g_moe_pf_layers); fflush(stderr); }
+    }
     if (grp_ == 2 && n_tok == 1 && ms->gacc && ms->gcapE >= E) {
         /* PARITY: both combines exist now; compare them BITWISE. Diagnostic mode only — this
          * is a D2H + sync per layer. */

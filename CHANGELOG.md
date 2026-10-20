@@ -48,7 +48,21 @@ All bench numbers: 4,204-token prompt, greedy, a fresh daemon per arm, interleav
   4.2k prefill 6.40 -> 5.95 s (n=9, 3 rounds), a 5k one-shot 8.3 -> 7.7 s; bitwise parity 0 of
   2.69e11 weights differ over 86,001 calls; the output hash is identical in every run.
 
+### 2026-10-21
+
+- **The prefill lane** (`SP_G4_MOE_PF_LANE` = N slots). During a batched prefill, misses evict only from
+  the top N slots of the expert cache, never from the layer being resolved, while empties fill first. The rest
+  of the cache, what decode warmed, holds still across chunks. 256 slots, 3 rounds, n=9: 4.2k prefill
+  5.96 -> 5.40 s, and **the decode right after it 34.3 -> 26.8 ms/token**. Output identical. 512 slots is
+  worse on prefill.
+
 ### Measured and not built
+
+- **Cross-layer prefill prefetch** (`SP_G4_MOE_PREFETCH_PREFILL`, test-only, built 2026-10-21): copy layer
+  L+1's non-resident experts during layer L. Output unchanged, but **slower** (4.2k prefill 5.73 -> 6.45 s):
+  it copied 32.6 GB instead of 23.4 GB, because a prefill chunk cycles ~3,600 experts through a 1,925-slot cache
+  and every speculative copy evicts a later hit. With prefill now copy-bound on an x8 link, bytes matter
+  more than overlap.
 
 - **The GPU link is PCIe 3.0 x8** on this machine (`nvidia-smi` `pcie.link.width.current = 8`,
   max 16). A pinned 3.35 MB expert copy is 0.54 ms (6.16 GB/s, `tools/moe_cpu_bench/xfer_bench.cu`).

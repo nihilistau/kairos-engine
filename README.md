@@ -244,6 +244,7 @@ behind knobs that default off, with the numbers written beside them.
 | **Device-side MoE top-k** — remove the per-layer host sync | The sync is **99.9% GPU drain**; the host routing is **0.53%** of the branch. The rewrite buys half a percent |
 | **Host-free layer P2** (`SP_G4_HF_P2`, 2026-10-19/20) — the GPU launches its resident experts from its own top-8, no host sync | **Correct, not faster**: 15,360 layers served, 0 fallbacks, 24.7 vs 26.6 tok/s. The host tail it targeted was mostly CPU expert compute (~7 ms/token at 2 threads), not round-trip overhead. Paused after P2.3 |
 | **Next-layer prefetch** (`SP_G4_PF_ORACLE`, an instrument only) | Layer L+1's router on layer L's attention output names ~60% of L+1's misses in its top-8, at ~31-37 uploads/token, two-thirds unused. Worth ~1.5 ms/token at most on this link; not built |
+| **Cross-layer prefill prefetch** (`SP_G4_MOE_PREFETCH_PREFILL`, 2026-10-21) — copy layer L+1's experts during layer L | Output unchanged, **slower** (5.73 -> 6.45 s on a 4.2k prefill): 32.6 GB copied instead of 23.4. A chunk cycles ~3,600 experts through 1,925 slots, so speculative copies evict later hits; on an x8 link bytes beat overlap |
 | **`SP_MOE_BUCKET_PIN` with the prefill copy overlap** | Cancels the overlap's gain (16.46 vs 13.95 s on a 4.2k prefill); stays off |
 | **Raising the expert cache** | 3–4% on 2026-09-11, because 33% residency was believed to yield ~95.5% hits. **Corrected 2026-09-28:** measured decode hit rate is 83-87%, and once the copies were no longer hidden by other costs, 4 -> 5 -> 6 GB bought +10% and +13%. Upstream ran 5.5 GB after two TDR hangs on 09-29, and is back at **6.0 GB since 2026-10-20** (28.19 vs 30.05 ms/token, every round). 6.5 GB does not fit beside a 5k-token prefill |
 
@@ -508,6 +509,7 @@ fresh daemon per arm, on the 4,204-token bench prompt unless it says otherwise:
 | prefill copy overlap | `SP_G4_MOE_OVERLAP_PREFILL=1` | 16.43 s prefill | **13.95 s** (n=9) | identical, 27 runs |
 | prefill attention as tensor-core GEMMs | `SP_G4_ATTN_PF_GEMM=1` | 13.79 s prefill | **6.49 s** (n=9); 9k with the ring 40.7 -> **13.6 s** | near-tie words move; parity 5.7e-04 |
 | eight-wide Q4 -> fp16 dequant | `SP_G4_DEQ_H8=1` | 6.40 s prefill | **5.95 s** (n=9) | bit-identical: 0 of 2.69e11 weights differ |
+| the prefill lane, 256 slots (2026-10-21) | `SP_G4_MOE_PF_LANE=256` | 5.96 s prefill; 34.3 ms/tok decode after | **5.40 s**; **26.8 ms/tok** (n=9) | identical |
 
 **Decode, bench at ~4.2k: 27.3 -> 35.5 tok/s. Prefill, 4,204 tokens: 16.4 s -> 5.95 s (2.8x).**
 Upstream, on the companion's own ~9k prefix, the persona snapshot capture went 55 s -> 15 s.
@@ -604,6 +606,7 @@ armed on someone else's hardware. It also means you have to ask for it.
 | `SP_G4_MOE_OVERLAP_PREFILL` | `0` | `1` | the same pipeline for the batched prefill (needs `SP_G4_MOE_OVERLAP`); output identical |
 | `SP_G4_ATTN_SPLIT` | `0` (tiled) | `1` | split-K decode attention. `2` = parity: tiled served |
 | `SP_G4_ATTN_PF_GEMM` | `0` (tiled) | `1` | prefill attention as tensor-core GEMMs. `2` = parity: tiled served |
+| `SP_G4_MOE_PF_LANE` | `0` | `256` (since 2026-10-21) | batched-prefill misses evict only from the top N cache slots; prefill -9% and the decode right after it -22% at 256, output identical |
 | `SP_G4_DEQ_H8` | `0` | `1` (since 2026-10-21) | eight-wide Q4 -> fp16 dequant for the prefill GEMMs, bit-identical. `2` = bitwise parity |
 | `SP_G4_HF_P1`, `SP_G4_HF_P2` | `0` | P1 `1`, P2 `0` | the host-free layer's device top-8 / slot table (P1) and its serving path (P2, paused: correct, not faster) |
 
