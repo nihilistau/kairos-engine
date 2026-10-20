@@ -1492,6 +1492,43 @@ __global__ void k_dequant_arena_q4b_h(const unsigned char *codes, const unsigned
     out[(size_t)j * cols + i] = __float2half((float)code * s);
 }
 
+/* THE SAME DEQUANT, EIGHT WEIGHTS PER THREAD (SP_G4_DEQ_H8, 2026-10-20). nsys on a 4,494-token
+ * prefill: k_dequant_arena_q4b_h 1.56 s in 19,361 calls, ~81 us each, about 74 GB/s of fp16
+ * written on a 336 GB/s card. One thread per weight means a 1-byte load that two threads share,
+ * a block-scale load that 32 threads share, and a 2-byte store. Here a thread takes 8 adjacent
+ * weights: one 4-byte code load (byte loads when the arena row is not 4-aligned), ONE scale
+ * (8 divides the 32-weight block), and one 16-byte store. The arithmetic per weight is the
+ * line above verbatim, `__float2half((float)code * s)`, so the output is bit-identical by
+ * construction; =2 checks that on real weights. Needs cols % 8 == 0 (2816, 1408, 704 here). */
+__global__ void k_dequant_arena_q4b_h8(const unsigned char *codes, const unsigned long long *row_off,
+                                       const unsigned short *bscale, int bs_nblk,
+                                       int rows, int cols, __half *out) {
+    const int j = blockIdx.x;
+    const int i = (blockIdx.y * blockDim.x + threadIdx.x) * 8;
+    if (j >= rows || i >= cols) return;
+    const unsigned char *rc = codes + row_off[j] + (i >> 1);
+    unsigned int w;
+    if (((unsigned long long)(size_t)rc & 3ull) == 0) w = *(const unsigned int *)rc;
+    else w = (unsigned)rc[0] | ((unsigned)rc[1] << 8) | ((unsigned)rc[2] << 16) | ((unsigned)rc[3] << 24);
+    const float s = __half2float(__ushort_as_half(bscale[(size_t)j * bs_nblk + (i >> 5)]));
+    __align__(16) __half h[8];
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        const unsigned byte = (w >> (8 * (k >> 1))) & 0xFFu;
+        const int nib = (k & 1) ? (int)((byte >> 4) & 0xF) : (int)(byte & 0xF);
+        const int code = (nib ^ 8) - 8;
+        h[k] = __float2half((float)code * s);
+    }
+    *(uint4 *)(out + (size_t)j * cols + i) = *(const uint4 *)h;
+}
+/* bitwise compare of two fp16 buffers: count of differing halves */
+__global__ void k_h16_bitdiff(const __half *a, const __half *b, size_t n, unsigned long long *nd) {
+    unsigned long long c = 0;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+        c += (__half_as_ushort(a[i]) != __half_as_ushort(b[i]));
+    if (c) atomicAdd(nd, c);
+}
+
 /* fp32 -> fp16, elementwise. The activation side: `in * n_tok` values, which is small beside
  * the weights (2,816 x 2,048 against 2,816 x 2,112 for one FFN matrix) and is the only extra
  * pass this path adds. */
@@ -13257,6 +13294,55 @@ static int f16_scratch(size_t nw, size_t nx) {
 __global__ void k_attn_parity_cmp(const float *a, const float *b, size_t n,
                                   unsigned *outmax, double *outsum);
 
+/* SP_G4_DEQ_H8: 0 = the per-weight dequant (as before); 1 = eight per thread; 2 = PARITY, the
+ * per-weight kernel serves and the eight-wide one runs into scratch beside it, and the count of
+ * differing fp16 bit patterns is printed (it must be 0). Once per process. */
+static int g4_deq_h8(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("SP_G4_DEQ_H8");
+        v = (e && *e) ? atoi(e) : 0;
+        if (v < 0 || v > 2) v = 0;
+        if (v) { fprintf(stderr, "    [g4-gemm] Q4 -> fp16 dequant: %s\n",
+                         v == 2 ? "8-WIDE PARITY (per-weight serves; bitwise compare)" : "8 weights per thread");
+                 fflush(stderr); }
+    }
+    return v;
+}
+/* the one door for Q4 -> fp16 weight dequant (both launch sites go through it) */
+static void g4_dequant_h(const DevTensor *W, __half *out, cudaStream_t st) {
+    const int mode = (W->in % 8 == 0) ? g4_deq_h8() : 0;
+    if (mode == 1) {
+        dim3 g8(W->out, (unsigned)((W->in / 8 + 127) / 128));
+        k_dequant_arena_q4b_h8<<<g8, 128, 0, st>>>(W->codes, W->row_off, W->bscale, W->bs_nblk, W->out, W->in, out);
+        return;
+    }
+    dim3 grid(W->out, (W->in + 255) / 256);
+    k_dequant_arena_q4b_h<<<grid, 256, 0, st>>>(W->codes, W->row_off, W->bscale, W->bs_nblk, W->out, W->in, out);
+    if (mode != 2) return;
+    static __half *scr = NULL; static size_t cap = 0; static unsigned long long *dn = NULL;
+    static long long calls = 0, bad = 0; static size_t elems = 0;
+    const size_t n = (size_t)W->out * (size_t)W->in;
+    if (n > ((size_t)32 << 20)) return;                       /* the LM head and the like: skip */
+    if (cap < n) { if (scr) cudaFree(scr);
+        if (cudaMalloc((void **)&scr, n * sizeof(__half)) != cudaSuccess) { cudaGetLastError(); scr = NULL; cap = 0; return; }
+        cap = n; }
+    if (!dn && cudaMalloc((void **)&dn, sizeof(unsigned long long)) != cudaSuccess) { dn = NULL; return; }
+    dim3 g8(W->out, (unsigned)((W->in / 8 + 127) / 128));
+    k_dequant_arena_q4b_h8<<<g8, 128, 0, st>>>(W->codes, W->row_off, W->bscale, W->bs_nblk, W->out, W->in, scr);
+    cudaMemsetAsync(dn, 0, sizeof(unsigned long long), st);
+    k_h16_bitdiff<<<256, 256, 0, st>>>(out, scr, n, dn);
+    unsigned long long h = 0;
+    cudaMemcpyAsync(&h, dn, sizeof h, cudaMemcpyDeviceToHost, st);
+    if (cudaStreamSynchronize(st) != cudaSuccess) return;
+    calls++; bad += (long long)h; elems += n;
+    if (h || (calls % 2000) == 1) {
+        fprintf(stderr, "    [g4-gemm] DEQ H8 PARITY: %lld calls, %.3g weights compared, %lld differing%s\n",
+                calls, (double)elems, bad, h ? " — NOT BIT-IDENTICAL" : "");
+        fflush(stderr);
+    }
+}
+
 /* PARITY for the weight GEMM: run the fp16 path into a scratch Y and compare against the
  * fp32 Y that was ALREADY COMPUTED AND SERVED. Same contract as the attention parity — the
  * shipping path is what reaches her; this only buys a number.
@@ -13279,9 +13365,7 @@ static void g4_gemm_parity(cublasHandle_t h, cudaStream_t st, const DevTensor *W
     if (!dcmp && cudaMalloc((void **)&dcmp, 2 * sizeof(unsigned)) != cudaSuccess) return;
     if (!dsum && cudaMalloc((void **)&dsum, 2 * sizeof(double)) != cudaSuccess) return;
 
-    dim3 grid(W->out, (W->in + 255) / 256);
-    k_dequant_arena_q4b_h<<<grid, 256, 0, st>>>(W->codes, W->row_off, W->bscale,
-                                                W->bs_nblk, W->out, W->in, g_f16_w);
+    g4_dequant_h(W, g_f16_w, st);
     const size_t nx = (size_t)W->in * (size_t)n_tok;
     unsigned xb = (unsigned)((nx + 255) / 256); if (xb > 1024u) xb = 1024u;
     k_f32_to_f16<<<xb, 256, 0, st>>>(dX, g_f16_x, nx);
@@ -13313,8 +13397,7 @@ static int gemm_w(cublasHandle_t h, cudaStream_t st, const DevTensor *W,
         const int f16 = g4_gemm_f16();
         if (f16 == 1 &&
             !f16_scratch((size_t)W->out * (size_t)W->in, (size_t)W->in * (size_t)n_tok)) {
-            k_dequant_arena_q4b_h<<<grid, 256, 0, st>>>(W->codes, W->row_off, W->bscale,
-                                                        W->bs_nblk, W->out, W->in, g_f16_w);
+            g4_dequant_h(W, g_f16_w, st);
             const size_t nx = (size_t)W->in * (size_t)n_tok;
             k_f32_to_f16<<<(unsigned)((nx + 255) / 256 > 1024 ? 1024 : (nx + 255) / 256),
                            256, 0, st>>>(dX, g_f16_x, nx);

@@ -1,6 +1,6 @@
 # STATUS — kairos-engine
 
-**Date:** 2026-09-29  
+**Date:** 2026-10-20  
 **Class:** `LIVE` — the optional native CUDA backend for the **companion** stack.
 
 **Version:** `0.7.1` (0.6.0 was the first tagged cut; 0.7.1 adds `SP_MOE_EVICT_HL` and the handshake probe). Derived from **Shannon-Prime-Engine**, and the
@@ -11,6 +11,24 @@ What it does have is duration. It is the **only** backend of a live companion st
 served that stack continuously for months — which is a different kind of evidence from a
 benchmark, and the one this repository can actually stand behind. Treat uptime claims as the
 operator's experience of it: nothing here publishes an uptime receipt.
+
+## 2026-10-20: decode 35.5 tok/s, prefill 5.95 s
+
+Bench, 4,204-token prompt, interleaved A/Bs, a fresh daemon per arm. Every knob is off by default;
+upstream arms them. The details are in the README's newest section and in `CHANGELOG.md`.
+
+| | 2026-10-19 | 2026-10-20 |
+|---|---:|---:|
+| decode @ ~4.2k | 27.3 tok/s | **35.5 tok/s** (split-K attention, 4 CPU threads, 6.0 GB cache) |
+| prefill, 4,204 tokens | 16.4 s | **5.95 s** (copy overlap, tensor-core attention, 8-wide dequant) |
+| prefill, 9,027 tokens, ring on | 40.7 s | **13.6 s** |
+| `llama.cpp -ncmoe 14` (10-19) | 34.4 tok/s decode, ~340 tok/s prefill | (unchanged) |
+
+- **The host-free layer (P2) was correct and not faster**, and is paused. The host tail it
+  targeted was CPU expert compute, not round-trip overhead.
+- **The GPU link is PCIe 3.0 x8** on this machine (6.16 GB/s pinned). Copy-bound numbers are x8 numbers.
+- **Output:** split-K and the GEMM prefill attention move greedy text at near-tie words (parity
+  1.9e-06 and 5.7e-04). Everything else is byte- or bit-identical.
 
 ## Later on 2026-09-29 (0.7.1): eviction, and the next step
 

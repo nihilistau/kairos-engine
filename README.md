@@ -90,7 +90,7 @@ The per-token expert working set is fixed by the model: top-8 × ~2.84 MB × 30 
 |---|---:|---:|
 | GPU VRAM (resident) | ~336 GB/s | ~2 ms |
 | host RAM, by the CPU | ~50 GB/s | ~14 ms |
-| **over PCIe, to the GPU** | **9.33 GB/s measured** | **~73 ms** |
+| **over PCIe, to the GPU** | **9.33 GB/s measured** (09-11); **6.16 GB/s** pinned on 2026-10-20, with the link negotiated at **x8** | **~73-110 ms** |
 
 PCIe is the worst place to put that traffic, and the cache is what keeps it out: **33% of the
 experts resident buys ~95.5% hits** in steady state, because MoE routing is *skewed* — capacity
@@ -158,7 +158,7 @@ is not the bottleneck it appears to be.
 | | prefill | decode |
 |---|---|---|
 | shape | matrix–matrix, hundreds–thousands of tokens | matrix–vector, one token |
-| attention | tiled, many queries per launch | tiled, one query, ring on SWA layers |
+| attention | tiled, many queries per launch; **since 2026-10-20 optionally two tensor-core GEMMs** (`SP_G4_ATTN_PF_GEMM`) | tiled, one query, ring on SWA layers; **since 2026-10-20 optionally split-K** (`SP_G4_ATTN_SPLIT`) |
 | weight matmul | dequantise Q4 → **fp16 tensor-core GEMM** (`cublasGemmEx`, fp32 accumulate) | **fused int8 `dp4a` GEMV** — reads the Q4 codes straight from VRAM, no scratch |
 | what limits it | attention and the weight GEMMs | expert bandwidth and per-layer launch overhead |
 
@@ -183,7 +183,8 @@ Every number here is from this card — **RTX 2060, 12 GB, Windows/WDDM** — on
 Nothing is estimated, and the negative results are kept because they were expensive.
 
 **Dated, because there is a second table elsewhere.** These are the CUDA **kernel** results of
-2026-09-11/12. The Kairos README carries an earlier and separate experiment — the memory-tiering
+2026-09-11/12, then 09-28/29, then **2026-10-19/20** (the newest section, *the host-free projection
+failed, and what worked instead*, has today's numbers). The Kairos README carries an earlier and separate experiment — the memory-tiering
 work of 09-08/09-10, about where the weights live rather than how the kernels run. The decode
 figures differ between the two files because they are different runs of different work, not
 because either is wrong, and they must not be added together. One pinned workload with every
@@ -241,7 +242,10 @@ behind knobs that default off, with the numbers written beside them.
 |---|---|
 | **Fused Q4×int8 `dp4a` prefill GEMM** (`SP_KV_PREFILL_DP4A`) — the `llama.cpp` approach, already implemented here | **~18% SLOWER** than dequant + `cublasSgemm`, and it quantises activations to int8, which **changes generated text** at temperature 0. `volta_sgemm` is hand-tuned cuBLAS assembly; a custom kernel has to beat that, not merely match the format |
 | **Device-side MoE top-k** — remove the per-layer host sync | The sync is **99.9% GPU drain**; the host routing is **0.53%** of the branch. The rewrite buys half a percent |
-| **Raising the expert cache** | 3–4% on 2026-09-11, because 33% residency was believed to yield ~95.5% hits. **Corrected 2026-09-28:** measured decode hit rate is 83-87%, and once the copies were no longer hidden by other costs, 4 -> 5 -> 6 GB bought +10% and +13%. It is 6 GB now |
+| **Host-free layer P2** (`SP_G4_HF_P2`, 2026-10-19/20) — the GPU launches its resident experts from its own top-8, no host sync | **Correct, not faster**: 15,360 layers served, 0 fallbacks, 24.7 vs 26.6 tok/s. The host tail it targeted was mostly CPU expert compute (~7 ms/token at 2 threads), not round-trip overhead. Paused after P2.3 |
+| **Next-layer prefetch** (`SP_G4_PF_ORACLE`, an instrument only) | Layer L+1's router on layer L's attention output names ~60% of L+1's misses in its top-8, at ~31-37 uploads/token, two-thirds unused. Worth ~1.5 ms/token at most on this link; not built |
+| **`SP_MOE_BUCKET_PIN` with the prefill copy overlap** | Cancels the overlap's gain (16.46 vs 13.95 s on a 4.2k prefill); stays off |
+| **Raising the expert cache** | 3–4% on 2026-09-11, because 33% residency was believed to yield ~95.5% hits. **Corrected 2026-09-28:** measured decode hit rate is 83-87%, and once the copies were no longer hidden by other costs, 4 -> 5 -> 6 GB bought +10% and +13%. Upstream ran 5.5 GB after two TDR hangs on 09-29, and is back at **6.0 GB since 2026-10-20** (28.19 vs 30.05 ms/token, every round). 6.5 GB does not fit beside a 5k-token prefill |
 
 ## Numerical honesty
 
@@ -257,8 +261,11 @@ reaching output:
 | flat prefill attention | `SP_G4_ATTN_V2=2` | 9.86e-07 |
 | decode attention (ring armed) | `SP_G4_ATTN_V2=2` | 2.86e-06 |
 | fp16 tensor-core GEMM | `SP_G4_GEMM_F16=2` | 4.5e-04 |
+| split-K decode attention (2026-10-20; 4.2k / 9k / ring) | `SP_G4_ATTN_SPLIT=2` | 1.9e-06 |
+| prefill attention as tensor-core GEMMs (2026-10-20) | `SP_G4_ATTN_PF_GEMM=2` | 5.7e-04 |
+| eight-wide Q4 dequant (2026-10-20) | `SP_G4_DEQ_H8=2` (bitwise) | **0 of 2.69e11 weights differ** |
 
-The first three are fp32 reduction-order noise (~√256·eps). The fourth is **not** noise — it is
+The fp32 rows are reduction-order noise (~√256·eps). The two fp16 rows are **not** noise — they are
 fp16 operand precision, and it is recorded as a real numerical change rather than waved
 through. Output text was byte-identical on every prompt tried, which is evidence, not proof;
 `=0` disarms either one.
@@ -466,8 +473,9 @@ The next design removes that from the GPU's path, and keeps the output byte-iden
 - **Waiting:** the GPU waits on a mapped flag, not a host sync.
 - **Combine:** it runs in today's order.
 
-The projection is ~43-48 tok/s against `llama.cpp`'s 38.25. (2026-10-19: the number to beat on this card is now `llama.cpp -ncmoe 14` at 34.4 tok/s, with a Q4_K_M GGUF; llama.cpp's new `--moe-cache-mib` path is slower than this engine at every cache size. See STATUS.)The projection is ~43-48 tok/s against `llama.cpp`'s 38.25. It is a projection, and the build
-order in the source tree's `docs/DESIGN-2026-09-29-host-free-layer.md` makes each step a pair of runs.
+The projection is ~43-48 tok/s against `llama.cpp`'s 38.25. (2026-10-19: the number to beat on this card is now `llama.cpp -ncmoe 14` at 34.4 tok/s, with a Q4_K_M GGUF; llama.cpp's new `--moe-cache-mib` path is slower than this engine at every cache size. See STATUS.) It was a projection, and the build order in the source tree's
+`docs/DESIGN-2026-09-29-host-free-layer.md` made each step a pair of runs. **Measured 2026-10-20: it
+did not hold** — see *2026-10-19/20* below.
 
 **An operational warning from the same day.** Twice during these A/Bs the host machine hung. In
 both cases:
@@ -482,6 +490,57 @@ not known. If you bench this engine in a loop on WDDM:
 
 Upstream now runs **5.5 GB with `TdrDelay = 10`**. The full A/B re-ran on that setting without a fault, at a peak of 9.2 GB VRAM.
 
+## 2026-10-19/20: the host-free projection failed, and what worked instead
+
+**The projection above did not hold.** The host-free layer was built through P2.3 (`SP_G4_HF_P2`):
+correct, 15,360 decode layers served with 0 fallbacks, and **slower**, 24.7 against 26.6 tok/s. A host-side
+breakdown of the layer tail (`SP_G4_HF_HOSTTAIL`, test-only) said why: of the ~10 ms/token the GPU
+waited on the host, **~7 ms was the CPU computing missed experts** (~23.5 misses/token at ~0.3 ms
+each, 2 threads). The round trip it was built to remove was under 1 ms. P2 is paused, and the
+next steps were measured one at a time instead. Every row below is an interleaved A/B on a
+fresh daemon per arm, on the 4,204-token bench prompt unless it says otherwise:
+
+| step | knob | before | after | output |
+|---|---|---:|---:|---|
+| split-K decode attention | `SP_G4_ATTN_SPLIT=1` | 36.6 ms/tok | **32.8 ms/tok** (at 9k: 63.2 -> 55.1) | near-tie words move; parity 1.9e-06 |
+| CPU expert threads 2 -> 4 | `SP_G4_MOE_CPU_THREADS=4` | 30.83 ms/tok | **29.30** (n=9, every round) | identical |
+| expert cache 5.5 -> 6.0 GB | `SP_G4_MOE_CACHE_GB=6` | 30.05 ms/tok | **28.19** (n=9, every round) | identical |
+| prefill copy overlap | `SP_G4_MOE_OVERLAP_PREFILL=1` | 16.43 s prefill | **13.95 s** (n=9) | identical, 27 runs |
+| prefill attention as tensor-core GEMMs | `SP_G4_ATTN_PF_GEMM=1` | 13.79 s prefill | **6.49 s** (n=9); 9k with the ring 40.7 -> **13.6 s** | near-tie words move; parity 5.7e-04 |
+| eight-wide Q4 -> fp16 dequant | `SP_G4_DEQ_H8=1` | 6.40 s prefill | **5.95 s** (n=9) | bit-identical: 0 of 2.69e11 weights differ |
+
+**Decode, bench at ~4.2k: 27.3 -> 35.5 tok/s. Prefill, 4,204 tokens: 16.4 s -> 5.95 s (2.8x).**
+Upstream, on the companion's own ~9k prefix, the persona snapshot capture went 55 s -> 15 s.
+
+**What the decode steps say.** Split-K replaced one block per query head (16 blocks on a 30-SM
+card, the softmax on thread 0, each KV head read once per query head that shares it) with a
+grid of (KV head x position chunk), one block serving every query head of its KV head, and a
+combine. More CPU threads only help to 4: past that, most of what they save reappears as the host
+waiting on the GPU. The 6.0 GB cache returned after its 09-29 rollback because the batched
+prefill now checks DXGI headroom and declines instead of overcommitting; 6.5 GB does not fit.
+
+**What the prefill steps say.** An nsys trace of a 4,494-token prefill (14.3 s) put attention at
+4.8 s, expert copies at 4.4 s, and **0.0 s of the copies overlapped with compute**: the copy-stream
+pipeline was decode-only, on the stated assumption that prefill "has little left to hide". It
+now runs for the batched prefill too. Prefill attention became S = QK^T as a batched fp16 GEMM
+(fp32 accumulate), a masked fp32 softmax, then O = PV, per block of queries and per KV head. That
+is the precision trade `SP_G4_GEMM_F16` already made, with its own parity mode.
+
+**The bus, measured again.** `nvidia-smi` reports the link at **PCIe 3.0 x8** (the card supports
+x16): a pinned 3.35 MB expert copy is **0.54 ms, 6.16 GB/s** (`tools/moe_cpu_bench/xfer_bench.cu`).
+On this board the slot shares lanes with an NVMe drive. Every miss upload and prefill copy pays
+for it, so treat the copy-bound numbers on this page as x8 numbers.
+
+**Two ideas measured and not built.** Apex-style load-aware miss assignment (CPU-compute
+low-load misses, copy high-load ones) has its break-even at ~190 tokens per expert here. 70-85%
+of a prefill's staged experts sit below it, but they are only 20-40% of the work, and with the
+copies now overlapped little is left to win. Next-layer prefetch (`SP_G4_PF_ORACLE`, an
+instrument) would cover at most ~50-60% of misses at a high upload cost, ~1.5 ms/token at best on
+this link.
+
+The receipts are in the source tree: `docs/BENCH-2026-10-20-*.md` and
+`docs/DESIGN-2026-09-29-host-free-layer.md` (*The host tail, measured*).
+
 ## Against `llama.cpp`, honestly
 
 **This section said `llama.cpp` "remains faster at prefill" until 2026-09-12, and the combined
@@ -489,6 +548,8 @@ measurement above falsified it.** Prefill is now 304.2 tok/s here against 262.6 
 lead — and the sentence survived only because nobody had run the two kernels together against a
 depth-matched baseline. It is corrected rather than quietly deleted, because a README that
 silently drops its own wrong claims teaches a reader nothing about how much to trust the rest.
+
+**Update 2026-10-20:** on the 4.2k bench, decode is **35.5 tok/s** and a 4,204-token prefill takes **5.95 s** (~707 tok/s). The current `llama.cpp` baseline on this card is `-ncmoe 14` at **34.4 tok/s** decode and ~340 tok/s prefill (2026-10-19, Q4_K_M; see STATUS). So decode is now at parity and prefill ~2.1x ahead. See *2026-10-19/20* above.
 
 **Update 2026-09-29:** decode is now 31.7 tok/s against 38.25, 1.21x rather than 2.37x. See *Decode, 2026-09-28/29* above. The paragraph below is the 09-12 state.
 
@@ -533,12 +594,18 @@ armed on someone else's hardware. It also means you have to ask for it.
 | `SP_G4_GEMM_F16` | `0` (fp32 SGEMM) | `1` | fp16 tensor-core weight GEMM. `2` = parity, fp32 served |
 | `SP_KV_PREFILL_DP4A` | `0` | `0` | fused Q4 prefill GEMM — **off, and measured slower**; see the table above |
 | `SP_MOE_TIMING` | `0` | `0` | per-phase MoE instrumentation: sync / drain / route / stage / launch |
-| `SP_G4_MOE_CACHE_GB` | `[kv] moe_cache_gb` | `5.5` | device expert cache budget. `0` disables the cache. 6.0 measured faster but coincided with two TDR hangs; see above |
+| `SP_G4_MOE_CACHE_GB` | `[kv] moe_cache_gb` | `6.0` | device expert cache budget. `0` disables the cache. 6.0 again since 2026-10-20 (rolled back to 5.5 after the 09-29 TDR hangs); 6.5 does not fit |
 | `SP_G4_MOE_GROUPED` | `0` | `1` | one grouped launch for a decode layer's resident experts. `2` = parity: old loop served, bitwise compare |
-| `SP_G4_MOE_CPU` | `0` | `1` | misses on the CPU, bit-exact (needs AVX-512 VNNI). `2` = parity: GPU served, CPU recomputes. `SP_G4_MOE_CPU_THREADS` (2) |
+| `SP_G4_MOE_CPU` | `0` | `1` | misses on the CPU, bit-exact (needs AVX-512 VNNI). `2` = parity: GPU served, CPU recomputes. `SP_G4_MOE_CPU_THREADS` (upstream 4 since 2026-10-20) |
 | `SP_G4_SEG_GRAPH` | `0` | `1` | per-layer segment CUDA graphs for the MoE decode step |
 | `SP_G4_MOE_BISECT` | `0` | `0` | ADR-013's per-op syncs at layer 0 (were always on until 2026-09-28) |
 | `SP_MOE_EVICT_HL` | `0` (LRU) | `32` | decayed-frequency expert eviction, half-life in decode tokens; +10.6% at 6 GB, +6.2% at 5.5 GB |
+| `SP_G4_MOE_OVERLAP` | `0` | `1` | expert staging on its own stream (decode), so a layer's copies run beside its compute |
+| `SP_G4_MOE_OVERLAP_PREFILL` | `0` | `1` | the same pipeline for the batched prefill (needs `SP_G4_MOE_OVERLAP`); output identical |
+| `SP_G4_ATTN_SPLIT` | `0` (tiled) | `1` | split-K decode attention. `2` = parity: tiled served |
+| `SP_G4_ATTN_PF_GEMM` | `0` (tiled) | `1` | prefill attention as tensor-core GEMMs. `2` = parity: tiled served |
+| `SP_G4_DEQ_H8` | `0` | `0` (measured, bit-identical; not yet armed) | eight-wide Q4 -> fp16 dequant for the prefill GEMMs, bit-identical. `2` = bitwise parity |
+| `SP_G4_HF_P1`, `SP_G4_HF_P2` | `0` | P1 `1`, P2 `0` | the host-free layer's device top-8 / slot table (P1) and its serving path (P2, paused: correct, not faster) |
 
 Kairos maps each of these from its profile, so arming them is a profile edit rather than an
 environment variable — `serve.py` strips every unmapped `SP_*` on purpose, and a knob it does
