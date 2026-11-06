@@ -206,9 +206,11 @@ figures differ between the two files because they are different runs of differen
 because either is wrong, and they must not be added together. One pinned workload with every
 kernel armed and `llama.cpp --n-cpu-moe` on the same row was first measured on 2026-09-12 (*One workload, both kernels, one sitting*, now historical); the current numbers are in the table above.
 
-## Where the time went, and where it goes now
+## Where the time went (2026-09-11, historical)
 
-Profiled with Nsight Systems on a ~4k-token prefill plus 128 generated tokens:
+Profiled with Nsight Systems on a ~4k-token prefill plus 128 generated tokens. These are the
+first kernel results. The current numbers are at the top of *Measured* and in *Against
+`llama.cpp`* below.
 
 | | before | after |
 |---|---:|---:|
@@ -562,25 +564,31 @@ this link.
 The receipts are in the source tree: `docs/BENCH-2026-10-20-*.md` and
 `docs/DESIGN-2026-09-29-host-free-layer.md` (*The host tail, measured*).
 
-## Against `llama.cpp`, honestly
+## Against `llama.cpp`
 
-**This section said `llama.cpp` "remains faster at prefill" until 2026-09-12, and the combined
-measurement above falsified it.** Prefill is now 304.2 tok/s here against 262.6 there — a 1.16×
-lead — and the sentence survived only because nobody had run the two kernels together against a
-depth-matched baseline. It is corrected rather than quietly deleted, because a README that
-silently drops its own wrong claims teaches a reader nothing about how much to trust the rest.
+Current numbers, 2026-10-20, RTX 2060 12 GB, Gemma-4-26B-A4B. The `llama.cpp` baseline is
+`-ncmoe 14` with a Q4_K_M GGUF, the fastest `llama.cpp` setup measured on this card (2026-10-19;
+see STATUS):
 
-**Update 2026-10-20:** on the 4.2k bench, decode is **35.5 tok/s** and a 4,204-token prefill takes **5.95 s** (~707 tok/s). The current `llama.cpp` baseline on this card is `-ncmoe 14` at **34.4 tok/s** decode and ~340 tok/s prefill (2026-10-19, Q4_K_M; see STATUS). So decode is now at parity and prefill ~2.1x ahead. See *2026-10-19/20* above.
+| | kairos-engine | `llama.cpp` `-ncmoe 14` |
+|---|---:|---:|
+| prefill, 4,204 tokens | **5.95 s (~707 tok/s)** | ~340 tok/s |
+| decode at ~4.2k | **35.5 tok/s** | 34.4 tok/s |
 
-**Update 2026-09-29:** decode is now 31.7 tok/s against 38.25, 1.21x rather than 2.37x. See *Decode, 2026-09-28/29* above. The paragraph below is the 09-12 state.
+Decode is level with `llama.cpp`, and prefill is about 2.1× ahead. The point of this engine is
+still not raw speed, though. It is the capability list at the top of this file, on hardware
+that is otherwise too small for the model.
 
-Where `llama.cpp` is genuinely ahead is **decode: 38.25 tok/s against 16.16 at the same depth,
-2.37×.** It is a mature, widely-tuned runtime and this is one person's kernel work, and on the
-part of the job a user waits through most — the tokens arriving one at a time — it wins
-comfortably.
+### How the comparison got here (historical)
 
-What this engine offers is still not "faster than llama.cpp". It is the capability list at the
-top of this file, on hardware that is otherwise too small for the model.
+- **Before 2026-09-12** this section said `llama.cpp` was faster at prefill. The first combined
+  run disproved that: 304.2 tok/s here against 262.6 for `llama.cpp -ncmoe 8`.
+- **2026-09-12:** decode was the gap. `llama.cpp` ran at 38.25 tok/s against this engine's 16.16
+  at the same depth (2.37×). See *One workload, both kernels, one sitting* above.
+- **2026-09-29:** decode reached 31.7 tok/s against the same 38.25 (1.21×). See
+  *Decode, 2026-09-28/29* above.
+- **2026-10-20:** decode 35.5 and prefill 5.95 s, measured against the faster `-ncmoe 14`
+  baseline in the table above.
 
 ---
 
