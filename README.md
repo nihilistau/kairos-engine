@@ -182,13 +182,29 @@ is applied where the model is, not where the client is.
 Every number here is from this card — **RTX 2060, 12 GB, Windows/WDDM** — on the model above.
 Nothing is estimated, and the negative results are kept because they were expensive.
 
+**Current numbers (2026-10-20).** 4,204-token bench prompt, greedy, a fresh daemon per arm.
+`llama.cpp` is `-ncmoe 14` on a Q4_K_M GGUF (2026-10-19), the fastest llama.cpp configuration
+measured on this card.
+
+| | kairos-engine | `llama.cpp -ncmoe 14` |
+|---|---:|---:|
+| decode @ ~4.2k | **35.5 tok/s** | 34.4 tok/s |
+| prefill, 4,204 tokens | **5.95 s (~707 tok/s)** | ~340 tok/s |
+
+Decode is at parity and prefill is ~2.1x ahead. Against the engine of the day before: decode
+27.3 -> 35.5 tok/s, prefill 16.4 s -> 5.95 s (2.8x), and upstream, on the companion's own ~9k
+prefix, the persona snapshot capture went 55 s -> 15 s. How is in *2026-10-19/20* below.
+
+**Every other table in this file is a dated historical record**, kept because it is what was
+measured at the time. Read the date before quoting a number.
+
 **Dated, because there is a second table elsewhere.** These are the CUDA **kernel** results of
 2026-09-11/12, then 09-28/29, then **2026-10-19/20** (the newest section, *the host-free projection
 failed, and what worked instead*, has today's numbers). The Kairos README carries an earlier and separate experiment — the memory-tiering
 work of 09-08/09-10, about where the weights live rather than how the kernels run. The decode
 figures differ between the two files because they are different runs of different work, not
 because either is wrong, and they must not be added together. One pinned workload with every
-kernel armed and `llama.cpp --n-cpu-moe` on the same row is **now measured** — see *One workload, both kernels, one sitting* below.
+kernel armed and `llama.cpp --n-cpu-moe` on the same row was first measured on 2026-09-12 (*One workload, both kernels, one sitting*, now historical); the current numbers are in the table above.
 
 ## Where the time went, and where it goes now
 
@@ -271,7 +287,10 @@ fp16 operand precision, and it is recorded as a real numerical change rather tha
 through. Output text was byte-identical on every prompt tried, which is evidence, not proof;
 `=0` disarms either one.
 
-## One workload, both kernels, one sitting (2026-09-12)
+## One workload, both kernels, one sitting (2026-09-12, historical)
+
+> **Historical.** Superseded by the current numbers at the top of *Measured*: decode has since gone
+> from 16.16 to 35.5 tok/s, and the `llama.cpp` baseline is now `-ncmoe 14` at 34.4.
 
 Everything above this section was **stitched**: the attention result was measured before the
 fp16 GEMM existed and the GEMM result after it, so no reader — and no author — had ever seen
