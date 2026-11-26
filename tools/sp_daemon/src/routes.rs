@@ -8133,3 +8133,204 @@ pub async fn v1_tokenize(
         .chain(tk.turn_stop_ids().iter().copied()).collect();
     Json(TokenizeResp { ids, pieces, stop_ids, vocab_size }).into_response()
 }
+
+// ── /v1/score — TEACHER-FORCED LOG-PROBS ON A SCRATCH SESSION (2026-11-22) ─────────────────
+// For the gemma4-research eval sets (E02/E01b): what does THIS engine, with this profile's
+// routing and kernels, assign to a known sequence? llama-perplexity answers that for a
+// different engine; this answers it for hers.
+//
+// Same doctrine as /v1/oneshot, deliberately the same code shape: its OWN scratch cache
+// (open_scratch: ring-off, one_shot), the resident cache is not read, written or evicted;
+// device_guard, so one forward on the device at a time and a queued foreground turn goes
+// first; the deadline and the SP_ONESHOT_PMAX_MAX ceiling apply exactly as they do there
+// (no new SP_* knob, so nothing new to map in serve.py::build_env).
+//
+// Positions before `score_from` are context: prefilled batched (per-token floor if the batch
+// declines) and not scored. Every scored position comes from the per-token decode step — the
+// byte-identical reference path — so this runs at decode speed. A batched forward that keeps
+// every position's logits would be faster and is a CUDA change; this route is the floor it
+// would be checked against.
+#[cfg(feature = "wire_cuda_backend")]
+fn score_default_from() -> usize { 1 }
+
+#[cfg(feature = "wire_cuda_backend")]
+#[derive(serde::Deserialize)]
+pub struct ScoreRequest {
+    /// Token ids exactly as the model should see them, leading <bos> included.
+    #[serde(default)]
+    pub tokens: Option<Vec<i32>>,
+    /// Or raw text, encoded with the engine tokenizer (the C gemma4 encoder prepends <bos>).
+    #[serde(default)]
+    pub text: Option<String>,
+    /// First position whose token is scored (>= 1). Earlier tokens are context only.
+    #[serde(default = "score_default_from")]
+    pub score_from: usize,
+    /// Also return the top_k log-probs per scored position (0 = none, capped at 64).
+    #[serde(default)]
+    pub top_k: usize,
+    /// Wall-clock budget, 0.0 = the SP_ONESHOT_DEADLINE_S default (600).
+    #[serde(default)]
+    pub deadline_s: f32,
+}
+
+#[cfg(feature = "wire_cuda_backend")]
+#[derive(serde::Serialize)]
+pub struct ScoreResponse {
+    pub n_tokens: usize,
+    pub score_from: usize,
+    /// logprob[j] = ln p(tokens[score_from + j] | tokens[.. score_from + j]), natural log.
+    pub logprob: Vec<f32>,
+    /// How many vocab entries scored strictly higher than the true token (0 = argmax).
+    pub rank: Vec<u32>,
+    /// Entropy of the full predictive distribution at that position, nats.
+    pub entropy: Vec<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top: Option<Vec<Vec<(i32, f32)>>>,
+    pub nll_mean: f64,
+    pub ppl: f64,
+    pub batched_prefix: bool,
+    pub ms: u128,
+}
+
+#[cfg(feature = "wire_cuda_backend")]
+pub async fn v1_score(
+    axum::extract::State(app): axum::extract::State<Arc<AppState>>,
+    axum::Json(req): axum::Json<ScoreRequest>,
+) -> Result<axum::Json<ScoreResponse>, (axum::http::StatusCode, String)> {
+    use axum::http::StatusCode as S;
+    let toks: Vec<i32> = match (&req.tokens, &req.text) {
+        (Some(t), None) => t.clone(),
+        (None, Some(s)) => app.tokenizer.encode(s).map_err(|e| (S::BAD_REQUEST, format!("encode: {e}")))?,
+        _ => return Err((S::BAD_REQUEST, "give exactly one of `tokens` or `text`".into())),
+    };
+    let vocab = app.vocab_size;
+    if toks.len() < 2 {
+        return Err((S::BAD_REQUEST, "need at least 2 tokens".into()));
+    }
+    if let Some(bad) = toks.iter().find(|&&t| t < 0 || t as usize >= vocab) {
+        return Err((S::BAD_REQUEST, format!("token id {bad} outside the vocab ({vocab})")));
+    }
+    let from = req.score_from.max(1);
+    if from >= toks.len() {
+        return Err((S::BAD_REQUEST, format!("score_from {from} >= {} tokens", toks.len())));
+    }
+    let top_k = req.top_k.min(64);
+    let res = task::spawn_blocking(move || -> Result<ScoreResponse, (S, String)> {
+        use sp_daemon::cuda_kvdecode_dispatch as kv;
+        let t0 = std::time::Instant::now();
+        let qm = {
+            let mut sg = app.session.as_ref()
+                .ok_or((S::SERVICE_UNAVAILABLE, "no session".to_string()))?
+                .lock().unwrap();
+            let sraw = sg.raw_ptr() as *mut sp_daemon::ffi_l1::sp_session;
+            (unsafe { sp_daemon::ffi_l1::sp_session_qwen3_model(sraw) }) as *const std::ffi::c_void
+        };
+        if qm.is_null() {
+            return Err((S::SERVICE_UNAVAILABLE, "no model".into()));
+        }
+        let deadline = std::time::Duration::from_secs_f64(if req.deadline_s > 0.0 {
+            req.deadline_s as f64
+        } else {
+            std::env::var("SP_ONESHOT_DEADLINE_S").ok()
+                .and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0).unwrap_or(600.0)
+        });
+        let _gpu = device_guard(&app, "score");
+        if t0.elapsed() > deadline {
+            return Err((S::SERVICE_UNAVAILABLE, "score deadline passed while queued — not starting".into()));
+        }
+        let need = (toks.len() + 8) as i32;
+        let pmax_max: i32 = std::env::var("SP_ONESHOT_PMAX_MAX").ok()
+            .and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(6144);
+        if need > pmax_max {
+            return Err((S::PAYLOAD_TOO_LARGE,
+                        format!("score input too long: {} tok needs {} positions > {} (SP_ONESHOT_PMAX_MAX)",
+                                toks.len(), need, pmax_max)));
+        }
+        let scratch = unsafe { kv::open_scratch(qm, need) }
+            .map_err(|e| (S::INTERNAL_SERVER_ERROR, format!("scratch open: {e}")))?;
+
+        let n_scored = toks.len() - from;
+        let mut lp: Vec<f32> = Vec::with_capacity(n_scored);
+        let mut rank: Vec<u32> = Vec::with_capacity(n_scored);
+        let mut ent: Vec<f32> = Vec::with_capacity(n_scored);
+        let mut tops: Vec<Vec<(i32, f32)>> = Vec::new();
+        let mut batched = false;
+        let mut timed_out = false;
+        let mut fail: Option<String> = None;
+        {
+            let mut logits = vec![0.0f32; vocab];
+            // tokens[..from-1] are pure context; the loop feeds tokens[from-1 .. n-1], and the
+            // logits after feeding tokens[i] are the prediction for tokens[i+1].
+            let head = &toks[..from - 1];
+            if !head.is_empty() {
+                match unsafe { kv::prefill_batched(scratch, head) } {
+                    Ok(()) => batched = true,
+                    Err(e) => {
+                        tracing::info!("SCORE: batched prefill declined ({e}) — per-token floor");
+                        if let Err(e) = unsafe { kv::prefill(scratch, head) } { fail = Some(format!("prefill: {e}")); }
+                    }
+                }
+            }
+            if fail.is_none() {
+                for i in (from - 1)..(toks.len() - 1) {
+                    if t0.elapsed() > deadline { timed_out = true; break; }
+                    if let Err(e) = unsafe { kv::decode_step(scratch, toks[i], &mut logits) } {
+                        fail = Some(format!("decode_step at {i}: {e}")); break;
+                    }
+                    let target = toks[i + 1] as usize;
+                    let mut mx = f32::NEG_INFINITY;
+                    for &x in logits.iter() { if x > mx { mx = x; } }
+                    // log-sum-exp and entropy in f64: H = ln Z - E[x - mx]
+                    let (mut z, mut ez) = (0.0f64, 0.0f64);
+                    for &x in logits.iter() { let d = (x - mx) as f64; let e = d.exp(); z += e; ez += e * d; }
+                    let lz = z.ln();
+                    let lpt = (logits[target] - mx) as f64 - lz;
+                    if !lpt.is_finite() || !mx.is_finite() {
+                        fail = Some(format!("non-finite logits at position {}", i + 1)); break;
+                    }
+                    let tv = logits[target];
+                    rank.push(logits.iter().filter(|&&x| x > tv).count() as u32);
+                    lp.push(lpt as f32);
+                    ent.push((lz - ez / z) as f32);
+                    if top_k > 0 {
+                        // small sorted insertion list: top_k <= 64, vocab ~262k
+                        let mut best: Vec<(usize, f32)> = Vec::with_capacity(top_k + 1);
+                        for (j, &x) in logits.iter().enumerate() {
+                            if best.len() < top_k || x > best[best.len() - 1].1 {
+                                let pos = best.partition_point(|&(_, y)| y >= x);
+                                best.insert(pos, (j, x));
+                                if best.len() > top_k { best.pop(); }
+                            }
+                        }
+                        tops.push(best.into_iter()
+                            .map(|(j, x)| (j as i32, ((x - mx) as f64 - lz) as f32)).collect());
+                    }
+                }
+            }
+        }
+        // ALWAYS, as in oneshot: a scratch that outlives its request is a VRAM leak.
+        unsafe { kv::release_for_model(scratch) };
+
+        if timed_out {
+            return Err((S::SERVICE_UNAVAILABLE,
+                        format!("score deadline ({:.0} s) expired after {} of {} positions",
+                                deadline.as_secs_f64(), lp.len(), n_scored)));
+        }
+        if let Some(e) = fail {
+            return Err((S::INTERNAL_SERVER_ERROR, e));
+        }
+        let nll_mean = -(lp.iter().map(|&x| x as f64).sum::<f64>()) / lp.len().max(1) as f64;
+        let ms = t0.elapsed().as_millis();
+        tracing::info!("SCORE: {} tok, {} scored from {}, prefix {}, nll {:.4}, {} ms — the resident cache was not touched",
+                       toks.len(), lp.len(), from, if batched { "BATCHED" } else { "per-token" }, nll_mean, ms);
+        Ok(ScoreResponse {
+            n_tokens: toks.len(), score_from: from, logprob: lp, rank, entropy: ent,
+            top: if top_k > 0 { Some(tops) } else { None },
+            nll_mean, ppl: nll_mean.exp(), batched_prefix: batched, ms,
+        })
+    }).await;
+    match res {
+        Ok(r) => r.map(axum::Json),
+        Err(e) => Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}"))),
+    }
+}

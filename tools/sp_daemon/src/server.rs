@@ -56,6 +56,8 @@ fn kdiff_route() -> Router<Arc<AppState>> {
 #[cfg(feature = "wire_cuda_backend")]
 fn oneshot_route() -> Router<Arc<AppState>> {
     Router::new().route("/v1/oneshot", post(v1_oneshot))
+        // teacher-forced log-probs on its own scratch (same doctrine as oneshot; 2026-11-22)
+        .route("/v1/score", post(crate::routes::v1_score))
 }
 #[cfg(not(feature = "wire_cuda_backend"))]
 fn oneshot_route() -> Router<Arc<AppState>> {

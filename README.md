@@ -601,6 +601,7 @@ that is otherwise too small for the model.
 | `src/tokenizer/` | the in-tree BPE, so prompts can be pre-tokenized |
 | `include/sp_engine/` | the C ABI the daemon links against |
 | `build-wirecuda.bat` | the build that produces the binary the harness expects |
+| `tools/sp_transcode/` | GGUF -> `.sp-model` + `.sp-tokenizer`, the converter this daemon's models come from (`build-transcode.bat`) |
 
 The math core is a **separate repository** and a submodule:
 [`shannon-prime-system`](https://github.com/nihilistau/shannon-prime-system). Clone with
@@ -692,6 +693,15 @@ Equivalent by hand:
 ```bat
 cargo build --release --features wire_cuda_backend --target-dir target-wirecuda --bin sp-daemon
 ```
+
+The model converter builds on its own, against the math core only:
+
+```bat
+build-transcode.bat
+tools\sp_transcode\build\sp_transcode.exe <model.gguf> <out.sp-model> <out.sp-tokenizer> --q4b --stream --verify
+```
+
+Kairos's Get set up finds it there and runs that command for you.
 
 > The CUDA kernels are compiled by `build-cuda-backend.bat` into a separate library;
 > `build-wirecuda.bat` only links against it. **Editing a `.cu` and re-running just the Rust

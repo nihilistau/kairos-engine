@@ -5,6 +5,25 @@ Windows/WDDM, a PCIe 3.0 link negotiated at **x8**) on Gemma-4-26B-A4B. Every kn
 **off by default** in the daemon; the README's knob table says what upstream production arms.
 Earlier history (2026-09) is in the README's dated sections and in `STATUS.md`.
 
+## 2026-11-26 — the model converter is back; a scoring route; an expert mask
+
+- **`sp_transcode` ships again** (`tools/sp_transcode/`, built by `build-transcode.bat`). It
+  converts a GGUF into the `.sp-model` + `.sp-tokenizer` pair this daemon loads, and this repo
+  had been missing it. It is the 2026-09-02 source (`--q4b`, gemma4-MoE detection, `--stream`),
+  now built against the math core alone. Checked: the HauhauCS 26B-A4B GGUF converted with
+  `--q4b --stream` reproduces the served `.sp-model` byte for byte, except a 16-byte header
+  field (the creation timestamp and its checksum). The tokenizer is byte-identical.
+  `tools/sp_transcode/README.md` has the flags.
+- **`/v1/score`** (2026-11-22): teacher-forced log-probs for eval harnesses. For each position
+  it gives the log-prob of the true next token, its rank, the entropy and optionally the top-k,
+  from the per-token decode step. It runs on its own scratch cache (the resident cache is
+  untouched), under the same deadline and prompt cap as `/v1/oneshot`. It is deterministic
+  across runs and agrees with llama.cpp b11963.
+- **`SP_G4_EXPERT_MASK`** (2026-11-23, research knob, off): a file of `layer expert` pairs the
+  router may never select. The one selection point (decode and batched prefill) skips them and
+  renormalises the survivors. Set but unusable is fatal. In 1,010,640 selections, 0 hit the 88
+  masked experts; with the knob unset the output is byte-identical.
+
 ## 2026-10-20 — decode attention, the CPU and the cache, then prefill
 
 All bench numbers: 4,204-token prompt, greedy, a fresh daemon per arm, interleaved rounds.

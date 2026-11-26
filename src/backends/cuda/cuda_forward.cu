@@ -6217,13 +6217,57 @@ __global__ void k_hf2_stamp(unsigned long long *dst) {
     *(volatile unsigned long long *)dst = t;
 }
 
-static void moe_topk_host(const float *logits, int NE, int NU, int *idx, float *wt) {
+/* ── EXPERT MASK (2026-11-23, gemma4-research: pruning shortlist from X01) ────────────────
+ * SP_G4_EXPERT_MASK = path to a text file of "layer expert" pairs, one per line ('#' starts a
+ * comment). A masked expert is never selected: moe_topk_host skips it, so each token's top-NU
+ * come from the remaining experts and are renormalised exactly as before.
+ *
+ * ONE DOOR. moe_topk_host is the only selection point on the gemma4 MoE path: the per-token
+ * decode (P2.3 serve) and the batched prefill both call it, and the CPU-expert path runs the
+ * lists it writes. The device speculation (k_hf_spec) only PREFETCHES; with a mask set, its
+ * parity counter reports the masked experts as disagreements, which is expected.
+ *
+ * Unset or empty = no mask, byte-identical to before. SET BUT UNUSABLE IS FATAL: a run that
+ * believes it is masked and is not would report "pruning is free" — so an unreadable file, a
+ * malformed line, or a layer left with fewer than 8 selectable experts stops the process. */
+#define G4_MASK_MAXL 64
+#define G4_MASK_MAXE 256
+static unsigned char g_expert_mask[G4_MASK_MAXL][G4_MASK_MAXE];
+static int g_expert_mask_on = -1;   /* -1 unread, 0 off, 1 on */
+static void expert_mask_load(void) {
+    if (g_expert_mask_on >= 0) return;
+    g_expert_mask_on = 0;
+    const char *p = getenv("SP_G4_EXPERT_MASK");
+    if (!p || !*p) return;
+    FILE *f = fopen(p, "r");
+    if (!f) { fprintf(stderr, "    [g4-moe] FATAL: SP_G4_EXPERT_MASK=%s cannot be opened\n", p); fflush(stderr); exit(3); }
+    char line[256]; int n = 0, bad = 0, ln = 0, per[G4_MASK_MAXL] = {0};
+    while (fgets(line, sizeof line, f)) {
+        ln++;
+        char *c = line; while (*c == ' ' || *c == '\t') c++;
+        if (*c == '#' || *c == '\n' || *c == '\r' || *c == 0) continue;
+        int l, e;
+        if (sscanf(c, "%d %d", &l, &e) != 2 || l < 0 || l >= G4_MASK_MAXL || e < 0 || e >= G4_MASK_MAXE) {
+            fprintf(stderr, "    [g4-moe] SP_G4_EXPERT_MASK line %d malformed: %s", ln, line); bad++; continue; }
+        if (!g_expert_mask[l][e]) { g_expert_mask[l][e] = 1; n++; per[l]++; }
+    }
+    fclose(f);
+    for (int l = 0; l < G4_MASK_MAXL; l++)
+        if (per[l] > 120) { fprintf(stderr, "    [g4-moe] FATAL: mask leaves layer %d with %d of 128 experts\n", l, 128 - per[l]); bad++; }
+    if (bad) { fprintf(stderr, "    [g4-moe] FATAL: SP_G4_EXPERT_MASK=%s has %d problem(s); refusing to run half-masked\n", p, bad); fflush(stderr); exit(3); }
+    g_expert_mask_on = 1;
+    fprintf(stderr, "    [g4-moe] EXPERT MASK ON: %d (layer,expert) pairs from %s\n", n, p); fflush(stderr);
+}
+static void moe_topk_host(const float *logits, int NE, int NU, int *idx, float *wt, int L) {
+    expert_mask_load();
+    const unsigned char *msk = (g_expert_mask_on == 1 && L >= 0 && L < G4_MASK_MAXL && NE <= G4_MASK_MAXE) ? g_expert_mask[L] : NULL;
     float mx = logits[0];
     for (int i = 1; i < NE; i++) if (logits[i] > mx) mx = logits[i];
     double sum = 0.0;
     for (int i = 0; i < NE; i++) sum += exp((double)logits[i] - (double)mx);
     for (int k = 0; k < NU; k++) { idx[k] = -1; wt[k] = -1.0f; }
     for (int i = 0; i < NE; i++) {
+        if (msk && msk[i]) continue;                      /* EXPERT MASK: never selectable */
         float p = (float)(exp((double)logits[i] - (double)mx) / sum);
         for (int k = 0; k < NU; k++) {
             /* strict >: ties resolve to the LOWER expert id, matching argmax order */
@@ -8055,7 +8099,7 @@ static int hf23_mid(cudaStream_t st, g4_moe_scratch *ms, int L, int E, int FFE, 
         { std::lock_guard<std::mutex> lk(g_hf23_mtx); g_hf23_mut_n++; g_hf23_mut_diff += differs; }
         lg = mlog;
     }
-    moe_topk_host(lg, NE, NU, ms->idx_h, ms->wt_h);
+    moe_topk_host(lg, NE, NU, ms->idx_h, ms->wt_h, L);
     if (g_hf_spec_h && hf_on() && hf_win_valid()) hf1_parity_count(L, NE, NU, spf, ms->idx_h);
     memset(ms->bkt_n, 0, (size_t)NE * sizeof(int));
     for (int k = 0; k < NU; k++) {
@@ -8530,7 +8574,7 @@ static int g4_ffn_apply(cublasHandle_t cb, cudaStream_t st, int L, int E, int ff
     /* host: top-k per token, bucketed BY EXPERT */
     memset(ms->bkt_n, 0, (size_t)NE * sizeof(int));
     for (int t = 0; t < n_tok; t++) {
-        moe_topk_host(logh + (size_t)t * (size_t)NE, NE, NU, ms->idx_h, ms->wt_h);
+        moe_topk_host(logh + (size_t)t * (size_t)NE, NE, NU, ms->idx_h, ms->wt_h, L);
         /* P1 PARITY: the device speculation against the exact host selection. The MID sync
          * above made the mapped row visible. Residency is compared for the experts both chose;
          * a residency mismatch means the table moved between PRE (the kernel read it) and here
