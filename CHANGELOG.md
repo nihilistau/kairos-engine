@@ -5,7 +5,24 @@ Windows/WDDM, a PCIe 3.0 link negotiated at **x8**) on Gemma-4-26B-A4B. Every kn
 **off by default** in the daemon; the README's knob table says what upstream production arms.
 Earlier history (2026-09) is in the README's dated sections and in `STATUS.md`.
 
-## 2026-11-26 — the model converter is back; a scoring route; an expert mask
+## 2026-11-27 — the flat attention kernel can no longer serve a failed launch
+
+- **`SP_G4_ATTN_TILE=0` above Pmax 12096 now gets the tiled kernel, said once.** The flat
+  decode-attention kernel keeps one float per position in shared memory, and CUDA allows 48 KB
+  per block (static included) unless you opt in, which the engine never did. At Pmax 12288 (exactly
+  48 KB of scores) and above, every launch failed with `cudaErrorInvalidValue`. The daemon logged
+  `FLOAT ATTN LAUNCH FAILED` once and went on decoding from stale attention output: on the
+  26B-A4B at Pmax 20000, "17 plus 73421 is 42". Every flat call site whose shared size scales
+  with positions (the decode dispatch, the per-step paths, the suffix and comb prefill) now asks
+  `g4_attn_tile_for(bytes)`. Where the flat kernel fits it is unchanged, byte for byte.
+- **Segment graphs (`SP_G4_SEG_GRAPH=1`) skip the flat ring kernel.** With `SP_G4_ATTN_TILE=0` and
+  a ring, the SWA layers run `k_attn_decode_ring_T`, whose context length is a host launch
+  argument. A captured graph replayed one token's context for every later token: at Pmax 12096
+  it answered "[laugh] [laugh] [laugh]", and correctly without graphs. That combination now takes
+  the per-step path and says so once.
+- Found from the harness side (Kairos 0.8.97). The shipped `sp.toml` had `attn_tile = 0`, and
+  the harness door (`serve.py`) refuses both combinations for binaries released before this one.
+
 
 - **No build-machine path in the binary.** The live-episode fallback and the nightshift capture
   located `<engine>/_nightshift_live` with `env!("CARGO_MANIFEST_DIR")`, which baked the build

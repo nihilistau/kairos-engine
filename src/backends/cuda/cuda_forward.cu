@@ -3620,6 +3620,36 @@ static int g4_attn_tile(void) {
     return t;
 }
 
+/* ── THE FLAT KERNEL'S CEILING IS NOT THE OPERATOR'S PROBLEM (2026-11-27) ─────────────────
+ * The flat kernels keep a whole score row in dynamic shared memory: one float per position.
+ * Without cudaFuncSetAttribute (never called for them) CUDA allows 48 KB per block INCLUDING
+ * the kernel's static shared (k_attn_decode_win_dyn_T's g_sum). MEASURED on the 2060 with the
+ * 26B-A4B: Pmax 12096 launches; 12288 (exactly 48 KB of scores) fails cudaErrorInvalidValue;
+ * 20000 fails. A failed launch does not fail the turn: the attention output keeps whatever it
+ * held and the model reads it ("17 plus 73421 is 42", runs of digits). The shipped sp.toml did
+ * exactly that with attn_tile = 0 at Pmax 20000, and the only trace was one log line.
+ *
+ * So asking for the flat kernel where it cannot launch now gets the TILED kernel, said once.
+ * attn_tile = 0 still means the flat kernel byte for byte everywhere it can run. Every flat
+ * call site whose shared size scales with positions asks here with the bytes it would ask
+ * CUDA for, so the rule lives in one place. */
+/* 12096 positions: the largest MEASURED to launch (12288 fails; the theoretical edge, 48 KB less
+ * the static g_sum, is between and unmeasured). serve.py's FLAT_ATTN_PMAX_MAX is the same number. */
+#define G4_FLAT_SHM_MAX ((size_t)12096u * sizeof(float))
+static int g4_attn_tile_for(size_t flat_shm) {
+    const int t = g4_attn_tile();
+    if (t || flat_shm <= G4_FLAT_SHM_MAX) return t;
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr, "[g4-kv] attn_tile=0, but the flat attention kernel needs %zu B of shared "
+                        "memory and CUDA allows 48 KB: serving the TILED kernel (tile=1024) instead "
+                        "of a launch that cannot run. Lower pmax to <= %zu to keep the flat kernel.\n",
+                flat_shm, G4_FLAT_SHM_MAX / sizeof(float));
+        fflush(stderr); warned = 1;
+    }
+    return 1024;
+}
+
 /* Split-K decode attention, once per process. 0 = off (the tiled kernel serves, unchanged);
  * 1 = the split kernel serves; 2 = PARITY: the tiled kernel serves, the split kernel runs
  * beside it and the worst relL2 is printed. Parity syncs per layer, so it forces the
@@ -4715,7 +4745,7 @@ extern "C" int gemma4_decode_cuda(const qwen3_model *m, int32_t *seq,
                     if (!Kuse || !Vuse) { sp_set_error("g4 sharer before owner"); goto done; }
                 }
                 {   int bd = hd > 256 ? hd : 256; if (bd > 1024) bd = 1024;
-                    const int TL = g4_attn_tile();
+                    const int TL = g4_attn_tile_for(attn_shm);
                     /* ring=0: this path has no ring cache — slots are linear positions. */
                     if (TL) k_attn_decode_win_tiled_T<float>
                               <<<nh, bd, g4_tiled_shm(TL, hd), st>>>(
@@ -5810,7 +5840,7 @@ static void g4_attn_launch(sp_g4_kv *s, const KV *Kuse, const KV *Vuse,
         fprintf(stderr, "[g4-kv] RING WITH NO WINDOW (ring=%d win=%d) — positions alias onto "
                         "slots and the attention output is WRONG, not slow\n", ring, win);
         warned = 1; } }
-    const int TL = s->bx_on ? 0 : g4_attn_tile();
+    const int TL = s->bx_on ? 0 : g4_attn_tile_for(ring ? 0 : attn_shm);
     if (TL) {
         const int split = g4_attn_split();
         if (split == 1 && g4_attn_split_launch<KV>(s->dq, Kuse, Vuse, dpos, nh, hd, kvd, grp, win,
@@ -9216,7 +9246,7 @@ static int g4_kv_launch_full(sp_g4_kv *s, int do_head) {
             if (!Kuse || !Vuse) { sp_set_error("g4_kv: sharer before owner"); return -1; }
         }
         {   int bd = hd > 256 ? hd : 256; if (bd > 1024) bd = 1024;
-            const int TL = g4_attn_tile();
+            const int TL = g4_attn_tile_for(attn_shm);
             /* ring=0: this path has no ring cache — slots are linear positions. */
             if (TL) k_attn_decode_win_tiled_T<float>
                       <<<nh, bd, g4_tiled_shm(TL, hd), st>>>(
@@ -9654,6 +9684,19 @@ static int g4_kv_step_seg(sp_g4_kv *s, int *handled) {
         const char *a = getenv("SP_DUMP_KV_DECODE"), *b = getenv("SP_BX_KTIME"), *c = getenv("SP_G4_NAN_PROBE");
         env_block = (a && *a == '1') || (b && *b == '1') || (c && *c == '1') || moe_timing_on() || moe_bisect_on()
                     || g4_attn_split() == 2;   /* split-K parity syncs per layer: not graph-bakeable */
+    }
+    /* THE FLAT RING KERNEL IS NOT GRAPH-BAKEABLE (2026-11-27). With attn_tile = 0 the SWA layers
+     * run k_attn_decode_ring_T, whose context length and shared size are HOST launch arguments
+     * (s->dpos_host), not the device dpos this design relies on. Captured once, it replays one
+     * token's context for every later token. MEASURED: Pmax 12096 + attn_tile 0 answered
+     * "17 plus 25 is 42" per-step and "[laugh] [laugh] [laugh]" under segment graphs. */
+    if (s->ring_W > 0 && g4_attn_tile() == 0) {
+        static int warned = 0;
+        if (!warned) { fprintf(stderr, "    [g4-kv] SEGMENT GRAPHS OFF: attn_tile=0 with a ring runs the flat "
+                                       "ring kernel, which takes its context from the host; per-step path\n");
+                       fflush(stderr); warned = 1; }
+        s->seg_mode = 2;
+        return 0;
     }
     if (env_block || s->cap_active || s->inj_active || s->feat_active || s->steer_active || s->bx_on
         || s->qcap_active || s->cpu_tail > 0 || s->cpu_tail_full > 0 || g_hd_f) return 0;
@@ -11319,7 +11362,7 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
             const int src = (L < kvfs) ? L : kvfs-(global?1:2);
             const int h16s = G4_KV_FP16_LAYER(s, src);
             int bd = hd>256?hd:256; if (bd>1024) bd=1024;
-            const int PT = g4_attn_tile();     /* same knob as the decode kernel */
+            const int PT = g4_attn_tile_for((size_t)(P + n) * sizeof(float));  /* same knob as decode */
             if (h16s) {
                 if (PT) g4_prefill_attn<__half>(
                     dq, s->dKh[src], s->dVh[src], P, qd, kvd, hd, grp, ascale, win,
@@ -11338,7 +11381,7 @@ extern "C" int gemma4_kv_prefill_batched_from(sp_g4_kv *s, const int32_t *toks, 
              * so the query row j sits at comb position pre+j and the SW window arithmetic
              * is unchanged (contiguous positions either side of the seam). */
             int bd = hd>256?hd:256; if (bd>1024) bd=1024;
-            const int PT2 = g4_attn_tile();
+            const int PT2 = g4_attn_tile_for((size_t)(pre + n) * sizeof(float));
             if (PT2) g4_prefill_attn<float>(
                 dq, Kuse, Vuse, pre, qd, kvd, hd, grp, ascale, win,
                 dao, n, nh, PT2, L, st);
