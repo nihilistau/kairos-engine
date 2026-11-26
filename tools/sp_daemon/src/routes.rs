@@ -2239,6 +2239,31 @@ pub fn refine_okf_store(app: &Arc<AppState>, root: &str) -> usize {
 // (std::Mutex is not reentrant; taking it here is a self-deadlock). A NEW caller from
 // outside the chat pipeline must take device_guard(app, ...) FIRST — the wedge class
 // this rule closes is documented at borrow_qm.
+/// Where episodes land when no registry says otherwise: `<engine>/_nightshift_live`.
+///
+/// FOUND AT RUNTIME, NOT AT BUILD (2026-11-26). This was `env!("CARGO_MANIFEST_DIR")` walked up
+/// two levels — the BUILD MACHINE's source tree, compiled into the binary. On the machine that
+/// built it that is the right folder (297 episodes live there); on anyone else's it is a path
+/// to someone else's disk, and it put that path (with the builder's username beside it) into a
+/// public release. Now: walk up from the running executable to the crate (the first ancestor
+/// holding `Cargo.toml` and `src/`) and take its grandparent — for a binary in a cargo target
+/// dir under the crate, exactly the folder the old expression named. A binary with no crate
+/// above it (a release zip) keeps `_nightshift_live` beside itself.
+fn nightshift_root() -> std::path::PathBuf {
+    let exe = std::env::current_exe().ok();
+    if let Some(exe) = exe.as_deref() {
+        for a in exe.ancestors().skip(1) {
+            if a.join("Cargo.toml").is_file() && a.join("src").is_dir() {
+                if let Some(engine) = a.parent().and_then(|p| p.parent()) {
+                    return engine.join("_nightshift_live");
+                }
+            }
+        }
+    }
+    exe.as_deref().and_then(|e| e.parent()).unwrap_or_else(|| std::path::Path::new("."))
+        .join("_nightshift_live")
+}
+
 fn capture_live_episode(app: &Arc<AppState>, text: &str) -> bool {
     use sp_daemon::cuda_kvdecode_dispatch as kv;
     let text_nl = format!("{text}\n");
@@ -2265,9 +2290,7 @@ fn capture_live_episode(app: &Arc<AppState>, text: &str) -> bool {
         Ok(reg) if !reg.trim().is_empty() => std::path::Path::new(&reg)
             .parent().unwrap_or_else(|| std::path::Path::new("."))
             .join("eps").join(&name),
-        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().and_then(|p| p.parent()).unwrap_or_else(|| std::path::Path::new("."))
-            .join("_nightshift_live").join(&name),
+        _ => nightshift_root().join(&name),
     };
     let dir_str = dir.to_string_lossy().to_string();
     if std::fs::create_dir_all(&dir).is_err() { return false; }
@@ -6152,12 +6175,7 @@ Tag of the answer (or [NULL]):");
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_millis()).unwrap_or(0);
                             let ep_name = format!("ep_live_m{ep_uniq}");
-                            let engine_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                                .parent().and_then(|p| p.parent())
-                                .unwrap_or_else(|| std::path::Path::new("."));
-                            let dir = engine_root
-                                .join("_nightshift_live")
-                                .join(&ep_name);
+                            let dir = nightshift_root().join(&ep_name);
                             let dir_str = dir.to_string_lossy().to_string();
                             if let Err(e) = std::fs::create_dir_all(&dir) {
                                 tracing::warn!("B4-NIGHTSHIFT: mkdir {dir_str} failed: {e} — no episode appended");
@@ -8332,5 +8350,18 @@ pub async fn v1_score(
     match res {
         Ok(r) => r.map(axum::Json),
         Err(e) => Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod nightshift_root_tests {
+    /// The runtime lookup must name EXACTLY the folder the build-time expression named for a
+    /// binary inside the crate's target dir — her 297 episodes live there (2026-11-26).
+    #[test]
+    fn nightshift_root_matches_the_old_build_time_folder() {
+        let old = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().and_then(|p| p.parent()).unwrap()
+            .join("_nightshift_live");
+        assert_eq!(super::nightshift_root(), old);
     }
 }

@@ -7,6 +7,12 @@ Earlier history (2026-09) is in the README's dated sections and in `STATUS.md`.
 
 ## 2026-11-26 — the model converter is back; a scoring route; an expert mask
 
+- **No build-machine path in the binary.** The live-episode fallback and the nightshift capture
+  located `<engine>/_nightshift_live` with `env!("CARGO_MANIFEST_DIR")`, which baked the build
+  machine's checkout into the executable. `nightshift_root()` now finds it at runtime from the
+  running executable: the crate's grandparent when the binary is in a target dir under the crate
+  (the same folder as before, and a unit test holds that), otherwise beside the executable.
+  `build-release.bat` builds into `target-release` with the build paths remapped out.
 - **`sp_transcode` ships again** (`tools/sp_transcode/`, built by `build-transcode.bat`). It
   converts a GGUF into the `.sp-model` + `.sp-tokenizer` pair this daemon loads, and this repo
   had been missing it. It is the 2026-09-02 source (`--q4b`, gemma4-MoE detection, `--stream`),
