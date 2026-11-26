@@ -1,6 +1,6 @@
 [target.aarch64-linux-android]
-linker = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android21-clang.cmd"
-ar     = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
+linker = "<android-sdk>\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android21-clang.cmd"
+ar     = "<android-sdk>\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
 
 # §3-HX Sprint J.5 — cc-rs deps (ring via rustls/quinn, esaxx-rs via tokenizers)
 # need the NDK clang/clang++/ar resolved per-target. Setting these via [env]
@@ -9,9 +9,9 @@ ar     = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\wind
 # run with tools/sp_daemon as the working dir (see build-android.bat). bindgen
 # is NOT needed on android — build.rs early-returns sp_no_link before it.
 [env]
-CC_aarch64_linux_android  = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android21-clang.cmd"
-CXX_aarch64_linux_android = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android21-clang++.cmd"
-AR_aarch64_linux_android  = "D:\\Files\\Android\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
+CC_aarch64_linux_android  = "<android-sdk>\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android21-clang.cmd"
+CXX_aarch64_linux_android = "<android-sdk>\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android21-clang++.cmd"
+AR_aarch64_linux_android  = "<android-sdk>\\android-ndk-r27d\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
 # Phase 2-L3.FG — bindgen runs on the host but must parse sp_l1.h's <stdint.h>/
 # <stddef.h> against the android sysroot for the aarch64 target. bindgen auto-
 # reads BINDGEN_EXTRA_CLANG_ARGS_<triple>; this supplies the target + sysroot.

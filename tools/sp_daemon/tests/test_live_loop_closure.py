@@ -20,7 +20,7 @@ instruct template). The SSE deltas are concatenated to the answer string.
 
 Usage:
   python test_live_loop_closure.py --host http://127.0.0.1:3001 \
-      --log D:\\F\\shannon-prime-repos\\shannon-prime-system-engine\\_judge_live_serve.log
+      --log <path-to>\\_judge_live_serve.log
 The --log path (the daemon's stdout/stderr capture) is grepped after each turn
 for the KAIROS working-set + judge PICK telemetry.
 """
