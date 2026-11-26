@@ -7,6 +7,7 @@ Earlier history (2026-09) is in the README's dated sections and in `STATUS.md`.
 
 ## 2026-11-27 — the flat attention kernel can no longer serve a failed launch
 
+- **`build-release.bat` always relinks.** `build.rs` does not watch the CUDA kernel library, so a release built after a kernel change could have shipped the old kernels. It now cleans the daemon crate first; dependencies stay cached.
 - **`SP_G4_ATTN_TILE=0` above Pmax 12096 now gets the tiled kernel, said once.** The flat
   decode-attention kernel keeps one float per position in shared memory, and CUDA allows 48 KB
   per block (static included) unless you opt in, which the engine never did. At Pmax 12288 (exactly

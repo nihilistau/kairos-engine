@@ -20,6 +20,10 @@ for %%I in ("%SP_CORE%") do set "_CORE=%%~fI"
 set "RUSTFLAGS=--remap-path-prefix=%USERPROFILE%\.cargo=cargo --remap-path-prefix=%USERPROFILE%\.rustup=rustup --remap-path-prefix=%_ENG%=engine --remap-path-prefix=%_CORE%=core"
 
 cd /d "%~dp0tools\sp_daemon"
+REM ALWAYS RELINK: build.rs does not watch build-host-cuda-backend\sp_cuda_daemon_backend.lib, so after
+REM a kernel rebuild cargo would keep the binary it already linked, with the OLD kernels in it
+REM (2026-11-27). Cleaning only this crate recompiles it and relinks; dependencies stay cached.
+cargo clean --release -p sp-daemon --target-dir target-release || goto :err
 cargo build --release --features wire_cuda_backend --target-dir target-release --bin sp-daemon || goto :err
 echo RELEASE BUILD OK: %~dp0tools\sp_daemon\target-release\release\sp-daemon.exe
 endlocal & exit /b 0
